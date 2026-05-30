@@ -196,12 +196,12 @@ jobs:
           echo "✓ Pytest container cleanup finished"
 
   # ============================================================================
-  # CLEANUP (always runs)
+  # CLEANUP
   # ============================================================================
 
   cleanup-xpu:
     needs: [build-xpu, test-xpu]
-    if: ${{ always() }}
+    if: ${{ needs.build-xpu.result == 'success' && needs.test-xpu.result == 'success' }}
     runs-on: xpu
     env:
       IMAGE_TAG: dynamo-${{ inputs.framework || 'vllm' }}-${{ inputs.target || 'runtime' }}-xpu:${{ github.run_id }}-${{ inputs.source_ref || github.sha }}
