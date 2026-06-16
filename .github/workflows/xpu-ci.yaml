@@ -188,3 +188,4 @@ jobs:
           DOCKER_IMAGE: ${{ needs.build-xpu.outputs.image }}
           DEVICE_NAME: xpu
           ZE_AFFINITY_MASK: '0'
+          IMAGE_PULL_SECRET: runner-registry
