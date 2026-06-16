@@ -219,6 +219,11 @@ runs:
 
           local manifest="./.ci/test/dynamo-smoke/${pod_yaml}"
           CLAIM_TEMPLATE_NAME="${claim_prefix}-${POD_NAME}"
+          # resourceClaims[].name is a pod-local reference that must be a valid
+          # DNS label (<= 63 chars). POD_NAME is already up to 63 chars, so the
+          # claim_prefix can push it over; truncate and strip any trailing dash.
+          CLAIM_TEMPLATE_NAME="${CLAIM_TEMPLATE_NAME:0:63}"
+          CLAIM_TEMPLATE_NAME="$(echo "$CLAIM_TEMPLATE_NAME" | sed -E 's/-+$//')"
 
           # Use provided RESOURCE_TEMPLATE or default for the platform
           local template_to_use="${RESOURCE_TEMPLATE:-$default_template}"
