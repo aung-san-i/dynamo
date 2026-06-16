@@ -38,6 +38,10 @@ inputs:
     description: Name of pre-existing ResourceClaimTemplate to use. Platform defaults - xpu:'onexpu-rdma', nvidia:'onenvidia-rdma', gaudi:'onegaudi-rdma'.
     required: false
     default: ''
+  IMAGE_PULL_SECRET:
+    description: Name of the docker-registry secret (in dynamo-system) used to pull the image from sc09super01-srv.intel.com.
+    required: false
+    default: 'runner-registry'
 
 runs:
   using: composite
@@ -60,6 +64,7 @@ runs:
         HABANA_VISIBLE_DEVICES: ${{ inputs.HABANA_VISIBLE_DEVICES }}
         XPU_PCI_ADDRESSES: ${{ inputs.XPU_PCI_ADDRESSES }}
         RESOURCE_TEMPLATE: ${{ inputs.RESOURCE_TEMPLATE }}
+        IMAGE_PULL_SECRET: ${{ inputs.IMAGE_PULL_SECRET }}
         POD_NAME: ''
       run: |
         set -xe
@@ -232,6 +237,7 @@ runs:
           sed -i "s|{{ POD_NAME }}|$POD_NAME|g" "$manifest"
           sed -i "s|{{ CLAIM_TEMPLATE_NAME }}|$CLAIM_TEMPLATE_NAME|g" "$manifest"
           sed -i "s|{{ RESOURCE_TEMPLATE }}|$template_to_use|g" "$manifest"
+          sed -i "s|{{ IMAGE_PULL_SECRET }}|$IMAGE_PULL_SECRET|g" "$manifest"
           if [ -n "$extra_var_name" ] && [ -n "$extra_var_value" ]; then
             sed -i "s|{{ ${extra_var_name} }}|${extra_var_value}|g" "$manifest"
           fi
