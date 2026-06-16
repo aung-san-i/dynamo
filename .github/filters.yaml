@@ -154,6 +154,9 @@ vllm:
   - 'examples/backends/vllm/**'
   - 'components/src/dynamo/vllm/**'
   - 'container/templates/vllm_*'
+  # XPU dynamo smoke-test pod manifest (deploy-test-xpu in xpu-ci.yaml). Runs a
+  # vllm backend, so a manifest change should re-run the XPU vllm CI.
+  - '.ci/test/dynamo-smoke/**'
   - '!**/*.md'
   - '!**/*.rst'
 
