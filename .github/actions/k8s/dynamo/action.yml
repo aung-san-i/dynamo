@@ -1,0 +1,311 @@
+name: K8s Apply Dynamo
+description: Apply the Dynamo test manifest to the cluster.
+
+inputs:
+  PR_NUMBER:
+    description: 'PR number to merge into main for PR-triggered workflows'
+    required: false
+    type: string
+    default: ''
+  CHECKOUT_COMMIT:
+    description: "The commit SHA or branch to build the Docker image from. Leave empty to use the workflow run's commit SHA."
+    required: false
+    type: string
+    default: ''
+  DOCKER_IMAGE:
+    description: Docker image to use in the manifest.
+    required: true
+  DEVICE_NAME:
+    description: Device name to use in the manifest.
+    required: true
+  ZE_AFFINITY_MASK:
+    description: ZE_AFFINITY_MASK value for Intel GPU pod (e.g. '2'). Leave empty to use the value in the pod YAML.
+    required: false
+    default: '0'
+  CUDA_VISIBLE_DEVICES:
+    description: CUDA_VISIBLE_DEVICES value for NVIDIA GPU pod. Leave empty to use the value in the pod YAML.
+    required: false
+    default: '0'
+  HABANA_VISIBLE_DEVICES:
+    description: HABANA_VISIBLE_DEVICES value for Gaudi pod. Leave empty to use the value in the pod YAML.
+    required: false
+    default: '0'
+  XPU_PCI_ADDRESSES:
+    description: Comma-separated list of PCI addresses for XPU device selection (e.g. '"0000:35:00.0", "0000:39:00.0"'). Used in ResourceClaimTemplate selector.
+    required: false
+    default: '"0000:91:00.0"'
+  RESOURCE_TEMPLATE:
+    description: Name of pre-existing ResourceClaimTemplate to use. Platform defaults - xpu:'onexpu-rdma', nvidia:'onenvidia-rdma', gaudi:'onegaudi-rdma'.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Print workflow inputs
+      shell: bash
+      env:
+        INPUTS_JSON: ${{ toJSON(inputs) }}
+      run: |
+        echo "=== Workflow Call Inputs ==="
+        echo "$INPUTS_JSON" | jq -r 'to_entries[] | "\(.key) = \(.value)"'
+
+    - name: Apply manifest
+      shell: bash
+      env:
+        DOCKER_IMAGE: ${{ inputs.DOCKER_IMAGE }}
+        DEVICE_NAME: ${{ inputs.DEVICE_NAME }}
+        ZE_AFFINITY_MASK: ${{ inputs.ZE_AFFINITY_MASK }}
+        CUDA_VISIBLE_DEVICES: ${{ inputs.CUDA_VISIBLE_DEVICES }}
+        HABANA_VISIBLE_DEVICES: ${{ inputs.HABANA_VISIBLE_DEVICES }}
+        XPU_PCI_ADDRESSES: ${{ inputs.XPU_PCI_ADDRESSES }}
+        RESOURCE_TEMPLATE: ${{ inputs.RESOURCE_TEMPLATE }}
+        POD_NAME: ''
+      run: |
+        set -xe
+        
+        # The repo is checked out at the workspace root via actions/checkout.
+        # Fall back to the legacy "$GITHUB_WORKSPACE/$REPO_NAME" layout if present.
+        if [ -n "${REPO_NAME:-}" ] && [ -d "$GITHUB_WORKSPACE/$REPO_NAME" ]; then
+          cd "$GITHUB_WORKSPACE/$REPO_NAME"
+        else
+          cd "$GITHUB_WORKSPACE"
+        fi
+
+        POD_NAME="dynamo-${DEVICE_NAME}-${DOCKER_IMAGE##*:}"
+        if [ "$POD_NAME" = "dynamo-${DEVICE_NAME}-$DOCKER_IMAGE" ] || [ -z "$POD_NAME" ]; then
+          POD_NAME="dynamo-${DEVICE_NAME}-latest"
+        fi
+
+        POD_NAME="$(echo "$POD_NAME" | tr '[:upper:]' '[:lower:]')"
+        POD_NAME="$(echo "$POD_NAME" | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//')"
+        POD_NAME="${POD_NAME:0:63}"
+        POD_NAME="$(echo "$POD_NAME" | sed -E 's/^-+//; s/-+$//')"
+        if [ -z "$POD_NAME" ]; then
+          POD_NAME="dynamo-${DEVICE_NAME}-latest"
+        fi
+        echo "DYNAMO_POD_NAME=$POD_NAME" >> "$GITHUB_ENV"
+
+        wait_for_pod_running() {
+          local pod_name="$1"
+          local namespace="$2"
+          local attempts=60
+          local sleep_seconds=10
+          local i=1
+
+          while [ "$i" -le "$attempts" ]; do
+            kubectl get pod "$pod_name" -n "$namespace"
+            local phase
+            phase=$(kubectl get pod "$pod_name" -n "$namespace" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            if [ "$phase" = "Running" ] || [ "$phase" = "Succeeded" ]; then
+              return 0
+            fi
+            if [ "$phase" = "Failed" ] || [ "$phase" = "Error" ]; then
+              echo "ERROR: Pod $pod_name in $namespace entered $phase phase."
+              kubectl describe pod "$pod_name" -n "$namespace" || true
+              return 1
+            fi
+            echo "Waiting for pod $pod_name in $namespace to be running (attempt $i/$attempts, phase=$phase)..."
+            sleep "$sleep_seconds"
+            i=$((i + 1))
+          done
+
+          echo "Timeout waiting for pod $pod_name in $namespace to be running."
+          kubectl describe pod "$pod_name" -n "$namespace" || true
+          return 1
+        }
+
+        wait_for_dynamo_and_test() {
+          local pod_name="$1"
+          local namespace="$2"
+
+          echo "Checking pod startup logs..."
+          kubectl logs -n "$namespace" "pod/${pod_name}" --tail=50
+
+          echo ""
+          echo "Waiting for Dynamo frontend health endpoint..."
+          local dynamo_ready=false
+          for attempt in $(seq 1 60); do
+            local phase
+            phase=$(kubectl get pod "$pod_name" -n "$namespace" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            if [ "$phase" = "Failed" ] || [ "$phase" = "Error" ]; then
+              echo "ERROR: Pod $pod_name in $namespace entered $phase phase while waiting for Dynamo frontend health endpoint."
+              kubectl describe pod "$pod_name" -n "$namespace" || true
+              kubectl logs -n "$namespace" "pod/${pod_name}" --tail=200 || true
+              return 1
+            fi
+
+            if kubectl exec "$pod_name" -n "$namespace" -- \
+              curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+              echo "Dynamo frontend is healthy (attempt $attempt)"
+              dynamo_ready=true
+              break
+            fi
+            echo "Attempt $attempt/60: not ready yet, waiting 10s..."
+            sleep 10
+          done
+
+          if [ "$dynamo_ready" != "true" ]; then
+            echo "ERROR: Timeout waiting for Dynamo frontend to become healthy."
+            kubectl logs -n "$namespace" "pod/${pod_name}" --tail=100 || true
+            return 1
+          fi
+
+          echo "Waiting for backend worker to register with frontend..."
+          local backend_ready=false
+          for attempt in $(seq 1 30); do
+            echo "Polling for model registration (attempt $attempt/30)..."
+            if kubectl exec "$pod_name" -n "$namespace" -- \
+              curl -sf http://localhost:8000/v1/models 2>/dev/null | grep -q "Qwen/Qwen3-0.6B"; then
+              echo "Backend worker registered successfully (attempt $attempt)"
+              backend_ready=true
+              break
+            fi
+            echo "Backend not yet registered, waiting 10s..."
+            sleep 10
+          done
+
+          if [ "$backend_ready" != "true" ]; then
+            echo "ERROR: Timeout waiting for backend worker to register (5 minute timeout exceeded)."
+            echo ""
+            echo "=== NATS Log ==="
+            kubectl exec "$pod_name" -n "$namespace" -- tail -50 /tmp/nats.log 2>/dev/null || echo "No NATS log available"
+            echo ""
+            echo "=== etcd Log ==="
+            kubectl exec "$pod_name" -n "$namespace" -- tail -50 /tmp/etcd.log 2>/dev/null || echo "No etcd log available"
+            echo ""
+            echo "=== Backend Worker Log ==="
+            kubectl exec "$pod_name" -n "$namespace" -- tail -100 /tmp/backend.log 2>/dev/null || echo "No backend log available"
+            echo ""
+            echo "=== Frontend Log ==="
+            kubectl exec "$pod_name" -n "$namespace" -- tail -50 /tmp/frontend.log 2>/dev/null || echo "No frontend log available"
+            return 1
+          fi
+
+          echo "Sending test query: Tell me a story about a brave cat"
+          HTTP_CODE=$(kubectl exec "$pod_name" -n "$namespace" -- \
+            curl -s -o /tmp/dynamo_response.json -w "%{http_code}" \
+              http://localhost:8000/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -d '{"model": "Qwen/Qwen3-0.6B", "messages": [{"role": "user", "content": "Tell me a story about a brave cat"}], "max_tokens": 200}')
+          RESPONSE=$(kubectl exec "$pod_name" -n "$namespace" -- cat /tmp/dynamo_response.json)
+          echo "Response: $RESPONSE"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR: Test query failed with HTTP $HTTP_CODE"
+            echo ""
+            echo "=== NATS Log ==="
+            kubectl exec "$pod_name" -n "$namespace" -- tail -50 /tmp/nats.log 2>/dev/null || echo "No NATS log available"
+            echo ""
+            echo "=== etcd Log ==="
+            kubectl exec "$pod_name" -n "$namespace" -- tail -50 /tmp/etcd.log 2>/dev/null || echo "No etcd log available"
+            echo ""
+            echo "=== Backend Worker Log ==="
+            kubectl exec "$pod_name" -n "$namespace" -- tail -100 /tmp/backend.log 2>/dev/null || echo "No backend log available"
+            echo ""
+            echo "=== Frontend Log ==="
+            kubectl exec "$pod_name" -n "$namespace" -- tail -50 /tmp/frontend.log 2>/dev/null || echo "No frontend log available"
+            return 1
+          fi
+          echo ""
+          echo "Test query succeeded."
+        }
+
+        deploy_dynamo_pod() {
+          local pod_yaml="$1"
+          local claim_prefix="$2"
+          local extra_var_name="$3"   # e.g. "ZE_AFFINITY_MASK"
+          local extra_var_value="$4"  # e.g. "$ZE_AFFINITY_MASK"
+          local default_template="$5" # Default ResourceClaimTemplate for this platform
+
+          local manifest="./.ci/test/dynamo-smoke/${pod_yaml}"
+          CLAIM_TEMPLATE_NAME="${claim_prefix}-${POD_NAME}"
+
+          # Use provided RESOURCE_TEMPLATE or default for the platform
+          local template_to_use="${RESOURCE_TEMPLATE:-$default_template}"
+
+          sed -i "s|{{ inputs.DOCKER_IMAGE }}|$DOCKER_IMAGE|g" "$manifest"
+          sed -i "s|{{ POD_NAME }}|$POD_NAME|g" "$manifest"
+          sed -i "s|{{ CLAIM_TEMPLATE_NAME }}|$CLAIM_TEMPLATE_NAME|g" "$manifest"
+          sed -i "s|{{ RESOURCE_TEMPLATE }}|$template_to_use|g" "$manifest"
+          if [ -n "$extra_var_name" ] && [ -n "$extra_var_value" ]; then
+            sed -i "s|{{ ${extra_var_name} }}|${extra_var_value}|g" "$manifest"
+          fi
+
+          echo "DYNAMO_CLAIM_TEMPLATE_NAME=$CLAIM_TEMPLATE_NAME" >> "$GITHUB_ENV"
+          echo "Using ResourceClaimTemplate: $template_to_use"
+          kubectl delete pod "$POD_NAME" -n dynamo-system --ignore-not-found=true
+          kubectl apply --validate=false -n dynamo-system -f "$manifest"
+          wait_for_pod_running "$POD_NAME" "dynamo-system"
+          wait_for_dynamo_and_test "$POD_NAME" "dynamo-system"
+        }
+
+        case "$DEVICE_NAME" in
+          gaudi) deploy_dynamo_pod "intel-gaudi-dynamo-pod.yaml" "gaudi-rdma"  "HABANA_VISIBLE_DEVICES" "$HABANA_VISIBLE_DEVICES" "onegaudi-rdma" ;;
+          xpu)   deploy_dynamo_pod "intel-gpu-dynamo-pod.yaml"   "intel-gpu"   "ZE_AFFINITY_MASK"       "$ZE_AFFINITY_MASK"       "onexpu-rdma" ;;
+          gpu)   deploy_dynamo_pod "nvidia-gpu-dynamo-pod.yaml"  "nvidia-gpu"  "CUDA_VISIBLE_DEVICES"   "$CUDA_VISIBLE_DEVICES"   "onenvidia-rdma" ;;
+          cpu)   deploy_dynamo_pod "cpu-dynamo-pod.yaml"         "cpu-rdma"    ""                        ""                        "$CLAIM_TEMPLATE_NAME" ;;
+          *)
+            echo "ERROR: Unsupported card type '$DEVICE_NAME' (expected: gaudi, xpu, gpu, cpu)"
+            exit 1
+            ;;
+        esac
+
+    - name: Collect logs as artifacts
+      if: always()
+      shell: bash
+      run: |
+        export KUBECONFIG="$HOME/.kube/config"
+        export NO_PROXY="localhost,127.0.0.1,172.26.46.18,172.26.0.0/16,10.0.0.0/8,.cluster.local,.svc"
+        export no_proxy="$NO_PROXY"
+        if [ -n "$DYNAMO_POD_NAME" ]; then
+          echo "Collecting logs from pod $DYNAMO_POD_NAME..."
+          mkdir -p "$GITHUB_WORKSPACE/dynamo-logs"
+
+          # Copy individual service logs from the pod
+          kubectl cp "dynamo-system/$DYNAMO_POD_NAME:/tmp/nats.log" "$GITHUB_WORKSPACE/dynamo-logs/nats.log" 2>/dev/null || echo "Could not retrieve nats.log"
+          kubectl cp "dynamo-system/$DYNAMO_POD_NAME:/tmp/etcd.log" "$GITHUB_WORKSPACE/dynamo-logs/etcd.log" 2>/dev/null || echo "Could not retrieve etcd.log"
+          kubectl cp "dynamo-system/$DYNAMO_POD_NAME:/tmp/backend.log" "$GITHUB_WORKSPACE/dynamo-logs/backend.log" 2>/dev/null || echo "Could not retrieve backend.log"
+          kubectl cp "dynamo-system/$DYNAMO_POD_NAME:/tmp/frontend.log" "$GITHUB_WORKSPACE/dynamo-logs/frontend.log" 2>/dev/null || echo "Could not retrieve frontend.log"
+
+          # Copy test response
+          kubectl cp "dynamo-system/$DYNAMO_POD_NAME:/tmp/dynamo_response.json" "$GITHUB_WORKSPACE/dynamo-logs/test-response.json" 2>/dev/null || echo "Could not retrieve test response"
+
+          # Also capture full pod logs as a fallback
+          kubectl logs "$DYNAMO_POD_NAME" -n dynamo-system > "$GITHUB_WORKSPACE/dynamo-logs/pod-full.log" 2>&1 || echo "Could not retrieve full pod logs"
+
+          # Capture pod description for debugging resource issues
+          kubectl describe pod "$DYNAMO_POD_NAME" -n dynamo-system > "$GITHUB_WORKSPACE/dynamo-logs/pod-describe.txt" 2>&1 || echo "Could not describe pod"
+
+          echo "Logs collected in $GITHUB_WORKSPACE/dynamo-logs/"
+          ls -lah "$GITHUB_WORKSPACE/dynamo-logs/" || true
+        fi
+
+    - name: Upload logs as artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: dynamo-logs-${{ inputs.DEVICE_NAME }}
+        path: ${{ github.workspace }}/dynamo-logs/
+        retention-days: 7
+        if-no-files-found: warn
+
+    - name: Cleanup pods
+      if: always()
+      shell: bash
+      run: |
+        export KUBECONFIG="$HOME/.kube/config"
+        export NO_PROXY="localhost,127.0.0.1,172.26.46.18,172.26.0.0/16,10.0.0.0/8,.cluster.local,.svc"
+        export no_proxy="$NO_PROXY"
+        if [ -n "$DYNAMO_POD_NAME" ]; then
+          echo "Cleaning up pod $DYNAMO_POD_NAME in dynamo-system..."
+          kubectl delete pod "$DYNAMO_POD_NAME" -n dynamo-system --ignore-not-found=true
+          # Delete the resourceclaim using the claim template name
+          if [ -n "$DYNAMO_CLAIM_TEMPLATE_NAME" ]; then
+            kubectl delete resourceclaim "$DYNAMO_CLAIM_TEMPLATE_NAME" -n dynamo-system --ignore-not-found=true
+          fi
+          # Delete resourceclaimtemplate ONLY for CPU (uses inline template)
+          # XPU/NVIDIA/Gaudi use external persistent templates which should NOT be deleted
+          if [ -n "$DYNAMO_CLAIM_TEMPLATE_NAME" ] && [[ "$DYNAMO_CLAIM_TEMPLATE_NAME" == cpu-rdma-* ]]; then
+            kubectl delete resourceclaimtemplate "$DYNAMO_CLAIM_TEMPLATE_NAME" -n dynamo-system --ignore-not-found=true
+          fi
+        fi
