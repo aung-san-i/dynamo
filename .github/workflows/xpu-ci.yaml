@@ -64,6 +64,8 @@ jobs:
 
   build-xpu:
     runs-on: xpu
+    outputs:
+      image: ${{ steps.push.outputs.registry_image_tag }}
     steps:
       - name: Checkout code
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
@@ -124,6 +126,7 @@ jobs:
             . 2>&1 | tee build-xpu-test.log
 
       - name: Push XPU image to registry
+        id: push
         shell: bash
         run: |
           set -x
@@ -134,6 +137,8 @@ jobs:
 
           docker tag "${IMAGE_TAG}" "${REGISTRY_IMAGE_TAG}"
           docker push "${REGISTRY_IMAGE_TAG}"
+
+          echo "registry_image_tag=${REGISTRY_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
           echo "### 🚀 XPU Image Pushed" >> $GITHUB_STEP_SUMMARY
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
@@ -149,3 +154,32 @@ jobs:
             build-xpu.log
             build-xpu-test.log
           retention-days: 7
+
+  # ============================================================================
+  # DEPLOY + SMOKE TEST XPU IMAGE
+  # Applies the Dynamo pod manifest to the dynamo-system namespace, waits for the
+  # frontend /health endpoint, confirms the backend registers Qwen/Qwen3-0.6B,
+  # and sends a chat completion. Collects logs and cleans up the pod on exit.
+  # ============================================================================
+
+  deploy-test-xpu:
+    needs: build-xpu
+    # TODO: confirm the correct runner. This must be a self-hosted runner that
+    # has $HOME/.kube/config pointing at the cluster that owns the dynamo-system
+    # namespace and the 'onexpu-rdma' ResourceClaimTemplate. The 'xpu' build
+    # runner is used here as a placeholder; swap if a dedicated kube runner
+    # (e.g. an sc09* host) is required.
+    runs-on: xpu
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
+        with:
+          ref: ${{ env.SOURCE_REF }}
+
+      - name: Apply Dynamo manifest and run smoke test
+        uses: ./.github/actions/k8s/dynamo
+        with:
+          DOCKER_IMAGE: ${{ needs.build-xpu.outputs.image }}
+          DEVICE_NAME: xpu
+          ZE_AFFINITY_MASK: '0'
