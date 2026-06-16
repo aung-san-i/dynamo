@@ -93,7 +93,12 @@ jobs:
           set -x
 
           IMAGE_NAME="dynamo-${{ env.FRAMEWORK }}-${{ env.TARGET }}-${{ env.DEVICE }}"
-          IMAGE_TAG="${IMAGE_NAME}:${{ github.run_id }}-${{ env.SOURCE_REF }}"
+          # Use a 7-char short SHA of the checked-out commit (SOURCE_REF may be a
+          # branch/ref, so resolve HEAD rather than truncating the input). This
+          # keeps the tag - and the derived pod/resourceClaim names - within the
+          # 63-char Kubernetes DNS-label limit.
+          SHORT_SHA="$(git rev-parse HEAD | cut -c1-7)"
+          IMAGE_TAG="${IMAGE_NAME}:${{ github.run_id }}-${SHORT_SHA}"
 
           echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
           echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
