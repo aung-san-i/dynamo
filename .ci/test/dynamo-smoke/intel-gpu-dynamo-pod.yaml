@@ -5,7 +5,7 @@ metadata:
 spec:
   restartPolicy: Never
   nodeSelector:
-    kubernetes.io/hostname: sc09rvp03-b60
+    gpu.type: intel-xpu
   imagePullSecrets:
     - name: amr-caas-registry
   containers:
