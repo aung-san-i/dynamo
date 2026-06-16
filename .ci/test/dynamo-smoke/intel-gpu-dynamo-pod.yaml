@@ -7,7 +7,7 @@ spec:
   nodeSelector:
     gpu.type: intel-xpu
   imagePullSecrets:
-    - name: amr-caas-registry
+    - name: {{ IMAGE_PULL_SECRET }}
   containers:
   - name: with-resource
     image: {{ inputs.DOCKER_IMAGE }}
