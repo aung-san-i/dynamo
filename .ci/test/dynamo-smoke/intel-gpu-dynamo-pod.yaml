@@ -99,6 +99,12 @@ spec:
     env:
       - name: ZE_AFFINITY_MASK
         value: "{{ ZE_AFFINITY_MASK }}"
+      - name: HF_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: hf-token
+            key: token
+            optional: true
       - name: HF_HOME
         value: /models/huggingface
       - name: TRANSFORMERS_CACHE
