@@ -136,7 +136,7 @@ jobs:
         run: |
           set -x
 
-          REGISTRY="146.152.247.53/dynamo"
+          REGISTRY="sc09super01-srv.intel.com/dynamo"
           IMAGE_TAG="${{ steps.build.outputs.image_tag }}"
           REGISTRY_IMAGE_TAG="${REGISTRY}/${IMAGE_TAG}"
 
