@@ -95,6 +95,11 @@ jobs:
     name: ${{ inputs.test_name }}
     runs-on: ${{ inputs.runner }}
     steps:
+      - name: Install SSH Key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.AUNG_SAN_I_DYNAMO }}
+
       - name: Checkout repository
         shell: bash
         env:
