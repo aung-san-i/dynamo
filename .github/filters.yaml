@@ -157,6 +157,8 @@ vllm:
   # XPU dynamo smoke-test pod manifest (deploy-test-xpu in xpu-ci.yaml). Runs a
   # vllm backend, so a manifest change should re-run the XPU vllm CI.
   - '.ci/test/dynamo-smoke/**'
+  # Heterogeneous EPD/P-D test manifests are consumed by PR-XPU and manual EPD workflows.
+  - '.ci/test/dynamo-heterog/k8s/tests/**'
   - '!**/*.md'
   - '!**/*.rst'
 

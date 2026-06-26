@@ -169,6 +169,23 @@ const testCases = [
     expect: { core: false, deploy: true },
     desc: 'helm file triggers deploy'
   },
+
+  // XPU Tests
+  {
+    file: '.ci/test/dynamo-heterog/k8s/tests/px-dn.yaml',
+    expect: { core: false, vllm: true, examples: false },
+    desc: 'heterogeneous vllm test manifest triggers vllm'
+  },
+  {
+    file: '.ci/test/dynamo-heterog/k8s/tests/pn-dx.yaml',
+    expect: { core: false, vllm: true, examples: false },
+    desc: 'heterogeneous vllm test manifest triggers vllm'
+  },
+  {
+    file: '.ci/test/dynamo-heterog/k8s/tests/e-pd_2nodes.yaml',
+    expect: { core: false, vllm: true, examples: false },
+    desc: 'heterogeneous vllm test manifest triggers vllm'
+  },
 ];
 
 // Print available filters
