@@ -1,0 +1,506 @@
+# e-pd_2nodes Test: XPU Encode + NVIDIA Prefill-Decode
+# Uses DynamoGraphDeployment with DRA (Dynamic Resource Allocation)
+# Uses pre-existing ResourceClaimTemplates: ${XPU_RESOURCE_TEMPLATE} and ${NVIDIA_RESOURCE_TEMPLATE}
+#
+# Usage:
+#   export DOCKER_IMAGE_XPU="..." DOCKER_IMAGE_GPU="..." XPU_RESOURCE_TEMPLATE="..." NVIDIA_RESOURCE_TEMPLATE="..."
+#   kubectl apply -f <(envsubst < e-pd_2nodes.yaml) -n dynamo-system
+#   kubectl wait --for=condition=Ready pod -l dynamo.nvidia.com/graph=e-pd-2nodes -n dynamo-system --timeout=10m
+#
+# Cleanup:
+#   kubectl delete -f e-pd_2nodes.yaml -n dynamo-system
+---
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: ${TEST_NAME}
+  namespace: dynamo-system
+spec:
+  backendFramework: vllm
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        nodeSelector:
+          kubernetes.io/hostname: ${NVIDIA_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+        mainContainer:
+          image: ${DOCKER_IMAGE_GPU}
+          env:
+            - name: DYN_STORE_KV
+              value: "mem"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+            - name: PYTHONHASHSEED
+              value: "0"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+
+    Enc:
+      componentType: worker
+      replicas: 1
+      extraPodSpec:
+        nodeSelector:
+          kubernetes.io/hostname: ${XPU_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+        resourceClaims:
+          - name: intel-gpu-rdma-resource
+            resourceClaimTemplateName: ${XPU_RESOURCE_TEMPLATE}
+        mainContainer:
+          image: ${DOCKER_IMAGE_XPU}
+          workingDir: /workspace
+          command:
+            - /bin/sh
+            - -c
+            - |
+              xpu-smi discovery || true
+              TRANSFER_LOCAL=0 \
+              python -m dynamo.vllm \
+                --model $MODEL \
+                --enable-multimodal \
+                --multimodal-encode-worker \
+                --enable-mm-embeds \
+                --dtype bfloat16 \
+                --enforce-eager \
+                --block-size 64 \
+                --gpu-memory-utilization 0.95 \
+                --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}' \
+                --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both", "kv_buffer_device":"xpu", "kv_connector_extra_config": {"enforce_handshake_compat": false}}'
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - "IPC_LOCK"
+                - "SYS_PTRACE"
+                - "SYS_ADMIN"
+                - "SYS_RAWIO"
+          env:
+            - name: MODEL
+              value: "/mnt/weka/data/llm-d-models-pv/models--Qwen--Qwen3-VL-32B-Instruct-FP8"
+            - name: DYN_STORE_KV
+              value: "mem"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: DYN_VLLM_KV_EVENT_PORT
+              value: "20080"
+            - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+              value: "20098"
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: PYTHONHASHSEED
+              value: "0"
+            - name: DYN_VLLM_EMBEDDING_TRANSFER_MODE
+              value: "nixl-read"
+            - name: ENABLE_ENCODER_CACHE
+              value: "0"
+            - name: VISION_ENCODE_SERIALIZE
+              value: "1"
+            - name: NIXL_USE_CPU_HOST_MEMORY
+              value: "0"
+            - name: UCX_TLS
+              value: "ib,rc,ud,rc_verbs,ud_verbs,ze_copy"
+            - name: UCX_IB_ROCE_REACHABILITY_MODE
+              value: "all"
+            - name: UCX_MEMTYPE_CACHE
+              value: "0"
+            - name: ZE_AFFINITY_MASK
+              value: "0"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+          resources:
+            claims:
+              - name: intel-gpu-rdma-resource
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+
+    PD:
+      componentType: worker
+      replicas: 1
+      extraPodSpec:
+        nodeSelector:
+          kubernetes.io/hostname: ${NVIDIA_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+        resourceClaims:
+          - name: gpu-rdma-resource
+            resourceClaimTemplateName: ${NVIDIA_RESOURCE_TEMPLATE}
+        mainContainer:
+          image: ${DOCKER_IMAGE_GPU}
+          workingDir: /workspace
+          command:
+            - /bin/sh
+            - -c
+            - |
+              TRANSFER_LOCAL=0 CUDA_VISIBLE_DEVICES=0 \
+              python -m dynamo.vllm \
+                --model $MODEL \
+                --enable-multimodal \
+                --multimodal-worker \
+                --enable-mm-embeds \
+                --route-to-encoder \
+                --mm-prompt-template "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|><prompt><|im_end|>\n<|im_start|>assistant\n" \
+                --dtype bfloat16 \
+                --max-num-seqs 40 \
+                --kv-cache-dtype fp8 \
+                --gpu-memory-utilization 0.95 \
+                --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}' \
+                --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both", "kv_buffer_device":"cuda", "kv_connector_extra_config": {"enforce_handshake_compat": false}}'
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - "IPC_LOCK"
+                - "SYS_PTRACE"
+                - "SYS_ADMIN"
+                - "SYS_RAWIO"
+          env:
+            - name: MODEL
+              value: "/mnt/weka/data/llm-d-models-pv/models--Qwen--Qwen3-VL-32B-Instruct-FP8"
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            - name: DYN_STORE_KV
+              value: "mem"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: DYN_VLLM_KV_EVENT_PORT
+              value: "20080"
+            - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+              value: "20098"
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: UCX_TLS
+              value: "ib,rc,ud,rc_verbs,ud_verbs,cuda_copy"
+            - name: UCX_IB_ROCE_REACHABILITY_MODE
+              value: "all"
+            - name: UCX_MEMTYPE_CACHE
+              value: "0"
+            - name: DYN_VLLM_EMBEDDING_TRANSFER_MODE
+              value: "nixl-read"
+            - name: PYTHONHASHSEED
+              value: "0"
+            - name: ENABLE_ENCODER_CACHE
+              value: "0"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+            - name: VLLM_DEEP_GEMM_WARMUP
+              value: "skip"
+          resources:
+            claims:
+              - name: gpu-rdma-resource
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${TEST_NAME}-bench
+  namespace: dynamo-system
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ${TEST_NAME}-bench
+        app.kubernetes.io/part-of: e-pd-2nodes
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${TEST_NAME}-k8s-service-discovery
+      nodeSelector:
+        kubernetes.io/hostname: ${NVIDIA_NODE}
+      imagePullSecrets:
+        - name: amr-caas-registry
+      volumes:
+        - name: pytorch-models
+          hostPath:
+            path: /software/data/pytorch
+            type: Directory
+        - name: weka-models
+          hostPath:
+            path: /mnt/weka
+            type: Directory
+      containers:
+        - name: benchmark-runner
+          image: ${DOCKER_IMAGE_GPU}
+          workingDir: /workspace
+          command:
+            - /bin/sh
+            - -c
+            - |
+              FRONTEND_HOST="${TEST_NAME}-frontend.dynamo-system.svc.cluster.local"
+
+              echo "========================================="
+              echo "Endpoint and FrontEnd Health Check"
+              echo "========================================="
+
+              # Wait for all worker endpoints (encode, prefill-decode) for this deployment
+              echo "Waiting for all worker endpoints (encode, prefill-decode) to be registered..."
+              timeout_sec=600
+              poll_sec=30
+              max_attempts=$((timeout_sec / poll_sec))
+              workers_ready=false
+              for attempt in $(seq 1 "$max_attempts"); do
+                health_response=$(curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health" 2>/dev/null || echo "")
+
+                # Check for both required workers for e-pd-2nodes deployment
+                has_encode=$(echo "$health_response" | grep -c "${TEST_NAME}.*encode.generate" || true)
+                has_prefill_decode=$(echo "$health_response" | grep -c "${TEST_NAME}.*backend.generate" || true)
+                frontend_status=$(echo "$health_response" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+
+                if [ "$has_encode" -gt 0 ] && [ "$has_prefill_decode" -gt 0 ] && [ "$frontend_status" = "healthy" ]; then
+                  echo "All worker endpoints registered (attempt ${attempt}/${max_attempts})"
+                  echo "Registered endpoints for e-pd-2nodes:"
+                  echo "$health_response" | grep "${TEST_NAME}" | grep -E "encode.generate|backend.generate" || true
+                  workers_ready=true
+                  break
+                fi
+                echo "Attempt ${attempt}/${max_attempts}: waiting for all workers"
+                echo "Status: encode=$has_encode, prefill-decode=$has_prefill_decode"
+                sleep "$poll_sec"
+              done
+
+              if [ "$workers_ready" != "true" ]; then
+                echo "ERROR: timeout waiting for all worker endpoints"
+                echo "Final status: encode=$has_encode, prefill-decode=$has_prefill_decode, frontend_status=$frontend_status"
+                echo "Final health check response:"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health" || true
+                exit 1
+              fi
+
+              # Wait for model to be discoverable via /v1/models before starting benchmark to avoid test instability
+              echo "========================================="
+              echo "Model Registration Check"
+              echo "========================================="
+
+              model_ready=false
+              timeout_sec=300
+              poll_sec=15
+              max_attempts=$((timeout_sec / poll_sec))
+              for attempt in $(seq 1 "$max_attempts"); do
+                if curl --noproxy '*' -sf "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models" 2>/dev/null | grep -Fq '"id":"'; then
+                  echo "Model registration check passed (attempt ${attempt}/${max_attempts})"
+                  model_ready=true
+                  break
+                fi
+                echo "Attempt ${attempt}/${max_attempts}: model not registered yet"
+                sleep "$poll_sec"
+              done
+
+              if [ "$model_ready" != "true" ]; then
+                echo "ERROR: timeout waiting for model registration"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models" || true
+                exit 1
+              fi
+
+              # Redirect curl test output to separate log file (and console)
+              {
+                echo "========================================="
+                echo "Curl Smoke Test - $(date)"
+                echo "========================================="
+                echo ""
+
+                echo "--- /v1/models ---"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models"
+                echo ""
+
+                echo "--- /v1/chat/completions (multimodal with retry) ---"
+              } 2>&1 | tee /tmp/curl_test.log
+
+              multimodal_success=false
+              multimodal_timeout=180
+              multimodal_interval=15
+              multimodal_max_attempts=$((multimodal_timeout / multimodal_interval))
+              {
+                for attempt in $(seq 1 "$multimodal_max_attempts"); do
+                  echo "Multimodal request attempt ${attempt}/${multimodal_max_attempts}..."
+                  response=$(curl --noproxy '*' -sS -X POST "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/chat/completions" \
+                    -H "Content-Type: application/json" \
+                    -d "{
+                      \"model\": \"${MODEL}\",
+                      \"messages\": [
+                        {
+                          \"role\": \"user\",
+                          \"content\": [
+                            {
+                              \"type\": \"image_url\",
+                              \"image_url\": {
+                                \"url\": \"https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg\"
+                              }
+                            },
+                            {
+                              \"type\": \"text\",
+                              \"text\": \"Describe what you see in this image.\"
+                            }
+                          ]
+                        }
+                      ],
+                      \"max_tokens\": 256,
+                      \"temperature\": 0.7
+                    }" 2>&1)
+
+                  echo "$response"
+
+                  # Check if response contains error indicators
+                  if echo "$response" | grep -qE 'missing field|Decode worker received multimodal request without prefill result|Service Unavailable'; then
+                    echo "Multimodal attempt ${attempt} failed (pipeline not ready), retrying in ${multimodal_interval}s..."
+                    sleep "$multimodal_interval"
+                  else
+                    echo "Multimodal request completed (attempt ${attempt}/${multimodal_max_attempts})"
+                    multimodal_success=true
+                    break
+                  fi
+                done
+
+                if [ "$multimodal_success" != "true" ]; then
+                  echo "WARNING: multimodal curl request failed after ${multimodal_max_attempts} attempts"
+                fi
+                echo ""
+                echo "Curl smoke test complete"
+              } 2>&1 | tee -a /tmp/curl_test.log
+
+              echo ""
+              echo "========================================="
+              echo "Curl test completed (logs saved to /tmp/curl_test.log)"
+              echo "========================================="
+
+              echo "========================================="
+              echo "Running E-PD 2-Node Benchmark"
+              echo "========================================="
+              echo ""
+              echo "Configuration:"
+              echo "  FRONTEND_HOST: $FRONTEND_HOST"
+              echo "  FRONTEND_PORT: ${FRONTEND_PORT}"
+              echo "  MODEL: ${MODEL}"
+              echo "  ISL: ${ISL}"
+              echo "  OSL: ${OSL}"
+              echo "  CONC: ${CONC}"
+              echo "  NUM_PROMPTS: ${NUM_PROMPTS}"
+              echo "  NUM_MEDIA_PER_REQ: ${NUM_MEDIA_PER_REQ}"
+              echo "  REQUEST_RATE: ${REQUEST_RATE}"
+              echo ""
+
+              vllm bench serve \
+                --backend openai-chat \
+                --base-url "http://$FRONTEND_HOST:$FRONTEND_PORT" \
+                --endpoint /v1/chat/completions \
+                --model "$MODEL" \
+                --dataset-name random-mm \
+                --tokenizer "$MODEL" \
+                --num-prompts "$NUM_PROMPTS" \
+                --random-input-len "$ISL" \
+                --random-output-len "$OSL" \
+                --random-mm-base-items-per-request "$NUM_MEDIA_PER_REQ" \
+                --random-mm-bucket-config "{(480, 854, 1): 1.0}" \
+                --random-mm-num-mm-items-range-ratio 0.0 \
+                --max-concurrency "$CONC" \
+                --request-rate "$REQUEST_RATE" \
+                --ready-check-timeout-sec 120 \
+                --percentile-metrics ttft,tpot,itl,e2el \
+                --metric-percentiles 50,90,99 \
+                --ignore-eos
+
+              echo ""
+              echo "========================================="
+              echo "Benchmark Complete"
+              echo "========================================="
+          env:
+            - name: FRONTEND_PORT
+              value: "8000"
+            - name: MODEL
+              value: "/mnt/weka/data/llm-d-models-pv/models--Qwen--Qwen3-VL-32B-Instruct-FP8"
+            - name: ISL
+              value: "6300"
+            - name: OSL
+              value: "380"
+            - name: CONC
+              value: "8"
+            - name: NUM_PROMPTS
+              value: "160"
+            - name: NUM_MEDIA_PER_REQ
+              value: "20"
+            - name: REQUEST_RATE
+              value: "inf"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HF_HUB_OFFLINE
+              value: "1"
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
