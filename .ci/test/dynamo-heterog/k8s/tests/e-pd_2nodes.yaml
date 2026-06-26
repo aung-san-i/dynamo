@@ -23,7 +23,7 @@ spec:
       replicas: 1
       extraPodSpec:
         nodeSelector:
-          kubernetes.io/hostname: ${NVIDIA_NODE}
+          dynamo.intel.com/node: ${NVIDIA_NODE}
         imagePullSecrets:
           - name: amr-caas-registry
         volumes:
@@ -69,7 +69,7 @@ spec:
       replicas: 1
       extraPodSpec:
         nodeSelector:
-          kubernetes.io/hostname: ${XPU_NODE}
+          dynamo.intel.com/node: ${XPU_NODE}
         imagePullSecrets:
           - name: amr-caas-registry
         volumes:
@@ -168,7 +168,7 @@ spec:
       replicas: 1
       extraPodSpec:
         nodeSelector:
-          kubernetes.io/hostname: ${NVIDIA_NODE}
+          dynamo.intel.com/node: ${NVIDIA_NODE}
         imagePullSecrets:
           - name: amr-caas-registry
         volumes:
@@ -279,7 +279,7 @@ spec:
       restartPolicy: Never
       serviceAccountName: ${TEST_NAME}-k8s-service-discovery
       nodeSelector:
-        kubernetes.io/hostname: ${NVIDIA_NODE}
+        dynamo.intel.com/node: ${NVIDIA_NODE}
       imagePullSecrets:
         - name: amr-caas-registry
       volumes:

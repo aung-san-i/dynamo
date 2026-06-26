@@ -62,17 +62,17 @@ on:
         type: string
         default: ''
       xpu_node:
-        description: 'XPU node hostname'
+        description: 'XPU node label value'
         required: false
         type: string
         default: 'xpu_node'
       nvidia_node:
-        description: 'NVIDIA node hostname'
+        description: 'NVIDIA node label value'
         required: false
         type: string
         default: 'nvidia_node'
       gaudi_node:
-        description: 'Gaudi node hostname'
+        description: 'Gaudi node label value'
         required: false
         type: string
         default: 'gaudi_node'
@@ -250,10 +250,20 @@ jobs:
           [ -n "$GAUDI_TEMPLATE" ] && { kubectl get resourceclaimtemplate "$GAUDI_TEMPLATE" -n dynamo-system || { echo "ERROR: $GAUDI_TEMPLATE not found"; exit 1; }; }
 
           echo ""
-          echo "Verifying nodes exist:"
-          kubectl get node "$XPU_NODE" || { echo "ERROR: Node $XPU_NODE not found"; exit 1; }
-          kubectl get node "$NVIDIA_NODE" || { echo "ERROR: Node $NVIDIA_NODE not found"; exit 1; }
-          [ -n "$GAUDI_NODE" ] && { kubectl get node "$GAUDI_NODE" || { echo "ERROR: Node $GAUDI_NODE not found"; exit 1; }; }
+          echo "Verifying node labels exist:"
+          verify_node_label() {
+            local role_name="$1"
+            local label_value="$2"
+
+            kubectl get nodes -l "dynamo.intel.com/node=$label_value" --no-headers | grep -q . || {
+              echo "ERROR: No node found with label dynamo.intel.com/node=$label_value for $role_name"
+              exit 1
+            }
+          }
+
+          verify_node_label XPU "$XPU_NODE"
+          verify_node_label NVIDIA "$NVIDIA_NODE"
+          [ -n "$GAUDI_TEMPLATE" ] && verify_node_label GAUDI "$GAUDI_NODE"
 
       - name: Deploy test
         env:
