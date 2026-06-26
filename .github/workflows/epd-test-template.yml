@@ -6,6 +6,10 @@ name: EPD Test Template
 
 on:
   workflow_call:
+    secrets:
+      AUNG_SAN_I_DYNAMO:
+        description: 'SSH private key with read access to this repository'
+        required: true
     inputs:
       test_name:
         description: 'Test name (e.g., e-pd-2nodes)'
@@ -100,6 +104,30 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.AUNG_SAN_I_DYNAMO }}
 
+      - name: Verify SSH checkout credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Loaded SSH identities:"
+          ssh-add -l
+
+          echo "Testing SSH authentication to GitHub..."
+          set +e
+          SSH_OUTPUT=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=accept-new git@github.com 2>&1)
+          SSH_STATUS=$?
+          set -e
+
+          echo "$SSH_OUTPUT"
+
+          if echo "$SSH_OUTPUT" | grep -q "successfully authenticated"; then
+            echo "SSH authentication to GitHub succeeded"
+          else
+            echo "ERROR: SSH authentication to GitHub failed"
+            echo "Check that secret AUNG_SAN_I_DYNAMO contains the private key whose public key has read access to ${GITHUB_REPOSITORY}"
+            exit "$SSH_STATUS"
+          fi
+
       - name: Checkout repository
         shell: bash
         env:
@@ -124,17 +152,23 @@ jobs:
 
           cd "$GITHUB_WORKSPACE"
 
+          # Ensure GitHub's SSH host key is trusted (fixes "Host key verification failed")
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keyscan -t rsa,ecdsa,ed25519 github.com 2>/dev/null >> ~/.ssh/known_hosts
+          sort -u ~/.ssh/known_hosts -o ~/.ssh/known_hosts
+          
+          REPO_SSH_URL="git@github.com:${GITHUB_REPOSITORY}.git"
           if [ -n "$PR_NUMBER" ]; then
             echo "Checking out main and merging PR #$PR_NUMBER"
-            git clone --branch main git@github.com:${GITHUB_REPOSITORY}.git "$REPO_NAME"
+            git clone --branch main "$REPO_SSH_URL" "$REPO_NAME"
             cd "$REPO_NAME"
             git fetch origin pull/${PR_NUMBER}/head:pr-${PR_NUMBER}
             git merge --no-edit pr-${PR_NUMBER}
           else
             echo "Checking out commit SHA: $COMMIT_SHA"
-            git clone --depth 1 --branch "$COMMIT_SHA" git@github.com:${GITHUB_REPOSITORY}.git "$REPO_NAME" || \
-            (git clone git@github.com:${GITHUB_REPOSITORY}.git "$REPO_NAME" && \
-            cd "$REPO_NAME" && git checkout "$COMMIT_SHA")
+            git clone --filter=blob:none "$REPO_SSH_URL" "$REPO_NAME"
+            cd "$REPO_NAME"
+            git checkout "$COMMIT_SHA"
           fi
 
       - name: Prepare diagnostics helper
