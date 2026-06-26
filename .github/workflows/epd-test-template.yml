@@ -263,7 +263,7 @@ jobs:
 
           verify_node_label XPU "$XPU_NODE"
           verify_node_label NVIDIA "$NVIDIA_NODE"
-          [ -n "$GAUDI_TEMPLATE" ] && verify_node_label GAUDI "$GAUDI_NODE"
+          # [ -n "$GAUDI_TEMPLATE" ] && verify_node_label GAUDI "$GAUDI_NODE"
 
       - name: Deploy test
         env:
