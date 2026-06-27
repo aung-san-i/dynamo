@@ -4,7 +4,7 @@
 #
 # Usage:
 #   export DOCKER_IMAGE_XPU="..." DOCKER_IMAGE_GPU="..." XPU_RESOURCE_TEMPLATE="..." NVIDIA_RESOURCE_TEMPLATE="..."
-#   export MODEL="/mnt/weka/data/llm-d-models-pv/models--Qwen--Qwen3-0.6B" TENSOR_PARALLEL="1"
+#   export MODEL="Qwen/Qwen3-0.6B" TENSOR_PARALLEL="1"
 #   kubectl apply -f <(envsubst < pn-dx.yaml) -n dynamo-system
 #   kubectl wait --for=condition=Ready pod -l dynamo.nvidia.com/graph=pn-dx -n dynamo-system --timeout=10m
 #
@@ -111,7 +111,7 @@ spec:
                 - "SYS_RAWIO"
           env:
             - name: MODEL
-              value: "${MODEL:-/mnt/weka/data/llm-d-models-pv/models--Qwen--Qwen3-0.6B}"
+              value: "${MODEL:-Qwen/Qwen3-0.6B}"
             - name: TENSOR_PARALLEL
               value: "${TENSOR_PARALLEL:-1}"
             - name: CUDA_VISIBLE_DEVICES
@@ -141,7 +141,7 @@ spec:
             - name: TRANSFORMERS_CACHE
               value: /models/huggingface/hub
             - name: HF_HUB_OFFLINE
-              value: "1"
+              value: "0"
             - name: VLLM_LOGGING_LEVEL
               value: "INFO"
             - name: VLLM_KV_CACHE_LAYOUT
@@ -204,7 +204,7 @@ spec:
                 - "SYS_RAWIO"
           env:
             - name: MODEL
-              value: "${MODEL:-/mnt/weka/data/llm-d-models-pv/models--Qwen--Qwen3-0.6B}"
+              value: "${MODEL:-Qwen/Qwen3-0.6B}"
             - name: TENSOR_PARALLEL
               value: "${TENSOR_PARALLEL:-1}"
             - name: DYN_STORE_KV
@@ -232,7 +232,7 @@ spec:
             - name: TRANSFORMERS_CACHE
               value: /models/huggingface/hub
             - name: HF_HUB_OFFLINE
-              value: "1"
+              value: "0"
             - name: VLLM_LOGGING_LEVEL
               value: "INFO"
             - name: VLLM_KV_CACHE_LAYOUT
@@ -446,7 +446,7 @@ spec:
             - name: FRONTEND_PORT
               value: "8000"
             - name: MODEL
-              value: "${MODEL:-/mnt/weka/data/llm-d-models-pv/models--Qwen--Qwen3-0.6B}"
+              value: "${MODEL:-Qwen/Qwen3-0.6B}"
             - name: ISL
               value: "1024"
             - name: OSL
@@ -462,7 +462,7 @@ spec:
             - name: TRANSFORMERS_CACHE
               value: /models/huggingface/hub
             - name: HF_HUB_OFFLINE
-              value: "1"
+              value: "0"
           volumeMounts:
             - name: pytorch-models
               mountPath: /models

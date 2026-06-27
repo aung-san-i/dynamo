@@ -200,7 +200,7 @@ jobs:
       nvidia_resource_template: "onenvidia-rdma"
       xpu_node: "xpu_node"
       nvidia_node: "nvidia_node"
-      model: '/mnt/weka/data/llm-d-models-pv/models--Qwen--Qwen3-0.6B'
+      model: 'Qwen/Qwen3-0.6B'
       tensor_parallel: '1'
       log_dir_name: "dynamo-heterog-logs-px-dn"
 
@@ -226,7 +226,7 @@ jobs:
       nvidia_resource_template: "onenvidia-rdma"
       xpu_node: "xpu_node"
       nvidia_node: "nvidia_node"
-      model: '/mnt/weka/data/llm-d-models-pv/models--Qwen--Qwen3-0.6B'
+      model: 'Qwen/Qwen3-0.6B'
       tensor_parallel: '1'
       log_dir_name: "dynamo-heterog-logs-pn-dx"
 
