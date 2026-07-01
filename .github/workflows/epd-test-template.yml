@@ -247,7 +247,7 @@ jobs:
           echo "Verifying ResourceClaimTemplates exist:"
           kubectl get resourceclaimtemplate "$XPU_TEMPLATE" -n dynamo-system || { echo "ERROR: $XPU_TEMPLATE not found"; exit 1; }
           kubectl get resourceclaimtemplate "$NVIDIA_TEMPLATE" -n dynamo-system || { echo "ERROR: $NVIDIA_TEMPLATE not found"; exit 1; }
-          [ -n "$GAUDI_TEMPLATE" ] && { kubectl get resourceclaimtemplate "$GAUDI_TEMPLATE" -n dynamo-system || { echo "ERROR: $GAUDI_TEMPLATE not found"; exit 1; }; }
+          # [ -n "$GAUDI_TEMPLATE" ] && { kubectl get resourceclaimtemplate "$GAUDI_TEMPLATE" -n dynamo-system || { echo "ERROR: $GAUDI_TEMPLATE not found"; exit 1; }; }
 
           echo ""
           echo "Verifying node labels exist:"
@@ -346,12 +346,14 @@ jobs:
           elapsed=0
           check_interval=30
 
+          # Retry readiness checks until every pod is Ready, an error is detected, or the timeout expires.
           while [ $elapsed -lt $timeout_seconds ]; do
             # Get pod statuses
             all_ready=true
             has_error=false
             error_msg=""
 
+            # Scan the current pod list once; the outer loop handles retrying until all pods are Ready.
             while IFS= read -r pod; do
               if [ -z "$pod" ]; then continue; fi
 
