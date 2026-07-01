@@ -22,6 +22,12 @@ spec:
     Frontend:
       componentType: frontend
       replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "3"
       extraPodSpec:
         nodeSelector:
           dynamo.intel.com/node: ${NVIDIA_NODE}
@@ -68,6 +74,12 @@ spec:
     Prefill:
       componentType: worker
       replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "3"
       extraPodSpec:
         nodeSelector:
           dynamo.intel.com/node: ${NVIDIA_NODE}
@@ -129,7 +141,7 @@ spec:
                 fieldRef:
                   fieldPath: status.podIP
             - name: UCX_TLS
-              value: "ib,rc,ud,rc_verbs,ud_verbs,cuda_copy"
+              value: "ib,rc,ud,rc_verbs,ud_verbs,ze_copy"
             - name: UCX_IB_ROCE_REACHABILITY_MODE
               value: "all"
             - name: UCX_MEMTYPE_CACHE
@@ -159,6 +171,12 @@ spec:
     Decode:
       componentType: worker
       replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "3"
       extraPodSpec:
         nodeSelector:
           dynamo.intel.com/node: ${XPU_NODE}

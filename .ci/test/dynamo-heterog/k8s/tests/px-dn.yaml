@@ -22,6 +22,12 @@ spec:
     Frontend:
       componentType: frontend
       replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "3"
       extraPodSpec:
         nodeSelector:
           dynamo.intel.com/node: ${NVIDIA_NODE}
@@ -68,6 +74,12 @@ spec:
     Prefill:
       componentType: worker
       replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "3"
       extraPodSpec:
         nodeSelector:
           dynamo.intel.com/node: ${XPU_NODE}
@@ -161,6 +173,12 @@ spec:
     Decode:
       componentType: worker
       replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "3"
       extraPodSpec:
         nodeSelector:
           dynamo.intel.com/node: ${NVIDIA_NODE}
