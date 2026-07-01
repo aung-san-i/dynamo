@@ -196,8 +196,8 @@ jobs:
       CHECKOUT_COMMIT: ${{ github.sha }}
       docker_image_xpu: ${{ needs.build-xpu.outputs.image }}
       docker_image_gpu: "${{ needs.changed-files.outputs.docker_image_gpu }}"
-      xpu_resource_template: "onexpu-rdma"
-      nvidia_resource_template: "onenvidia-rdma"
+      xpu_resource_template: "onexpu-rdma-kueue"
+      nvidia_resource_template: "onenvidia-rdma-kueue"
       xpu_node: "xpu_node"
       nvidia_node: "nvidia_node"
       model: 'Qwen/Qwen3-0.6B'
@@ -222,8 +222,8 @@ jobs:
       CHECKOUT_COMMIT: ${{ github.sha }}
       docker_image_xpu: ${{ needs.build-xpu.outputs.image }}
       docker_image_gpu: "${{ needs.changed-files.outputs.docker_image_gpu }}"
-      xpu_resource_template: "onexpu-rdma"
-      nvidia_resource_template: "onenvidia-rdma"
+      xpu_resource_template: "onexpu-rdma-kueue"
+      nvidia_resource_template: "onenvidia-rdma-kueue"
       xpu_node: "xpu_node"
       nvidia_node: "nvidia_node"
       model: 'Qwen/Qwen3-0.6B'
