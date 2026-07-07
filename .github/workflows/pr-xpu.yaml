@@ -4,6 +4,8 @@
 name: PR-XPU
 
 on:
+  schedule:
+    - cron: '0 23 * * *'
   push:
     branches:
       - "pull-request/[0-9]+"
@@ -30,6 +32,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            echo "has_xpu_label=true" >> "$GITHUB_OUTPUT"
+            echo "🌙 Nightly XPU CI run – skipping PR label gate"
+            exit 0
+          fi
+
           PR_NUMBER="${GITHUB_REF_NAME##*/}"
 
           # Check for xpu label
@@ -51,8 +59,8 @@ jobs:
     if: needs.guard.outputs.has_xpu_label == 'true'
     runs-on: ubuntu-latest
     outputs:
-      core: ${{ steps.changes.outputs.core }}
-      vllm: ${{ steps.changes.outputs.vllm }}
+      core: ${{ github.event_name == 'schedule' && 'true' || steps.changes.outputs.core }}
+      vllm: ${{ github.event_name == 'schedule' && 'true' || steps.changes.outputs.vllm }}
       sglang: ${{ steps.changes.outputs.sglang }}
       docker_image_gpu: ${{ steps.shared-images.outputs.docker_image_gpu }}
     steps:
@@ -61,14 +69,20 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check for changes
+        if: github.event_name != 'schedule'
         id: changes
         uses: ./.github/actions/changed-files
         with:
           gh_token: ${{ github.token }}
       - name: Set shared images
         id: shared-images
+        shell: bash
         run: |
-          echo "docker_image_gpu=nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1-cuda13" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            echo "docker_image_gpu=nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly:nightly" >> "$GITHUB_OUTPUT"
+          else
+            echo "docker_image_gpu=nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1-cuda13" >> "$GITHUB_OUTPUT"
+          fi
 
   # ============================================================================
   # BUILD XPU IMAGE
