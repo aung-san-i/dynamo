@@ -1,0 +1,248 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: XPU-Heterog-CI-PD
+
+on:
+  workflow_dispatch:
+    inputs:
+      framework:
+        description: 'Framework name (vllm, sglang, dynamo)'
+        required: false
+        type: string
+        default: 'vllm'
+      target:
+        description: 'Target stage for Docker rendering'
+        required: false
+        type: string
+        default: 'runtime'
+      source_ref:
+        description: 'Git ref/SHA to checkout. Empty = current SHA.'
+        required: false
+        type: string
+        default: ''
+      pytest_markers:
+        description: 'Pytest marker expression for test selection'
+        required: false
+        type: string
+        default: ''
+      docker_image_gpu:
+        description: 'GPU image used by heterogeneous P/D tests'
+        required: false
+        type: string
+        default: 'nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1-cuda13'
+      run_heterog_tests:
+        description: 'Run heterogeneous XPU/NVIDIA P/D tests after building the XPU image'
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      framework:
+        description: 'Framework name (vllm, sglang, dynamo)'
+        required: false
+        type: string
+        default: 'vllm'
+      target:
+        description: 'Target stage for Docker rendering'
+        required: false
+        type: string
+        default: 'runtime'
+      source_ref:
+        description: 'Git ref/SHA to checkout. Empty = caller SHA.'
+        required: false
+        type: string
+        default: ''
+      pytest_markers:
+        description: 'Pytest marker expression for test selection'
+        required: false
+        type: string
+        default: ''
+      docker_image_gpu:
+        description: 'GPU image used by heterogeneous P/D tests'
+        required: false
+        type: string
+        default: 'nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1-cuda13'
+      run_heterog_tests:
+        description: 'Run heterogeneous XPU/NVIDIA P/D tests after building the XPU image'
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      image:
+        description: 'Pushed XPU runtime image'
+        value: ${{ jobs.build-xpu.outputs.image }}
+
+env:
+  FRAMEWORK: ${{ inputs.framework || 'vllm' }}
+  TARGET: ${{ inputs.target || 'runtime' }}
+  DEVICE: xpu
+  PLATFORM: linux/amd64
+  SOURCE_REF: ${{ inputs.source_ref || github.sha }}
+
+jobs:
+
+  # ============================================================================
+  # BUILD XPU IMAGE
+  # ============================================================================
+
+  build-xpu:
+    runs-on: xpu
+    outputs:
+      image: ${{ steps.push.outputs.registry_image_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          # lfs: true
+
+      - name: Generate Dockerfile
+        shell: bash
+        run: |
+          echo "::group::Generating XPU Dockerfile"
+          python3 ./container/render.py \
+              --target=${{ env.TARGET }} \
+              --framework=${{ env.FRAMEWORK }} \
+              --device=${{ env.DEVICE }} \
+              --platform=${{ env.PLATFORM }} \
+              --show-result \
+              --output-short-filename
+          echo "::endgroup::"
+
+      - name: Build XPU image
+        id: build
+        shell: bash
+        run: |
+          set -x
+
+          IMAGE_NAME="dynamo-${{ env.FRAMEWORK }}-${{ env.TARGET }}-${{ env.DEVICE }}"
+          # Use a 7-char short SHA of the checked-out commit (SOURCE_REF may be a
+          # branch/ref, so resolve HEAD rather than truncating the input). This
+          # keeps the tag - and the derived pod/resourceClaim names - within the
+          # 63-char Kubernetes DNS-label limit.
+          SHORT_SHA="$(git rev-parse HEAD | cut -c1-7)"
+          IMAGE_TAG="${IMAGE_NAME}:${{ github.run_id }}-${SHORT_SHA}"
+
+          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+          docker build \
+            --progress=plain \
+            --tag "${IMAGE_TAG}" \
+            -f ./container/rendered.Dockerfile \
+            . 2>&1 | tee build-xpu.log
+
+          echo "### 🐳 XPU Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | \`${IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Framework | ${{ env.FRAMEWORK }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Device | ${{ env.DEVICE }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Build XPU test image
+        shell: bash
+        run: |
+          set -x
+
+          TEST_IMAGE_TAG="${{ steps.build.outputs.image_tag }}-test"
+
+          docker build \
+            --progress=plain \
+            --tag "${TEST_IMAGE_TAG}" \
+            -f container/Dockerfile.test \
+            --build-arg BASE_IMAGE=${{ steps.build.outputs.image_tag }} \
+            . 2>&1 | tee build-xpu-test.log
+
+      - name: Push XPU image to registry
+        id: push
+        shell: bash
+        run: |
+          set -x
+
+          REGISTRY="sc09super01-srv.intel.com/dynamo"
+          IMAGE_TAG="${{ steps.build.outputs.image_tag }}"
+          REGISTRY_IMAGE_TAG="${REGISTRY}/${IMAGE_TAG}"
+
+          docker tag "${IMAGE_TAG}" "${REGISTRY_IMAGE_TAG}"
+          docker push "${REGISTRY_IMAGE_TAG}"
+
+          echo "registry_image_tag=${REGISTRY_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+          echo "### 🚀 XPU Image Pushed" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Registry Image | \`${REGISTRY_IMAGE_TAG}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpu-build-log
+          path: |
+            build-xpu.log
+            build-xpu-test.log
+          retention-days: 7
+
+  # ============================================================================
+  # HETEROGENEOUS P/D TESTS
+  # ============================================================================
+
+  heterog-test-px-dn:
+    name: "Heterog: XPU Prefill + NVIDIA Decode"
+    needs: [build-xpu]
+    if: ${{ inputs.run_heterog_tests }}
+    uses: ./.github/workflows/epd-test-template.yml
+    secrets: inherit
+    with:
+      test_name: "px-dn"
+      test_yaml_path: ".ci/test/dynamo-heterog/k8s/tests/px-dn.yaml"
+      runner: "xpu"
+      CHECKOUT_COMMIT: ${{ inputs.source_ref || github.sha }}
+      docker_image_xpu: ${{ needs.build-xpu.outputs.image }}
+      docker_image_gpu: ${{ inputs.docker_image_gpu }}
+      xpu_resource_template: "onexpu-rdma-kueue"
+      nvidia_resource_template: "onenvidia-rdma-kueue"
+      xpu_node: "xpu_node"
+      nvidia_node: "nvidia_node"
+      model: 'Qwen/Qwen3-0.6B'
+      tensor_parallel: '1'
+      log_dir_name: "dynamo-heterog-logs-px-dn"
+
+  heterog-test-pn-dx:
+    name: "Heterog: NVIDIA Prefill + XPU Decode"
+    needs: [build-xpu, heterog-test-px-dn]
+    if: >-
+      always() &&
+      inputs.run_heterog_tests &&
+      needs.build-xpu.result == 'success' &&
+      needs.heterog-test-px-dn.result != 'cancelled'
+    uses: ./.github/workflows/epd-test-template.yml
+    secrets: inherit
+    with:
+      test_name: "pn-dx"
+      test_yaml_path: ".ci/test/dynamo-heterog/k8s/tests/pn-dx.yaml"
+      runner: "xpu"
+      CHECKOUT_COMMIT: ${{ inputs.source_ref || github.sha }}
+      docker_image_xpu: ${{ needs.build-xpu.outputs.image }}
+      docker_image_gpu: ${{ inputs.docker_image_gpu }}
+      xpu_resource_template: "onexpu-rdma-kueue"
+      nvidia_resource_template: "onenvidia-rdma-kueue"
+      xpu_node: "xpu_node"
+      nvidia_node: "nvidia_node"
+      model: 'Qwen/Qwen3-0.6B'
+      tensor_parallel: '1'
+      log_dir_name: "dynamo-heterog-logs-pn-dx"
+
+  # ============================================================================
+  # STATUS CHECK
+  # ============================================================================
+
+  xpu-status-check:
+    runs-on: ubuntu-latest
+    needs: [build-xpu, heterog-test-px-dn, heterog-test-pn-dx]
+    if: always()
+    steps:
+      - name: Check all XPU jobs
+        run: |
+          echo '${{ toJson(needs) }}' | jq -e 'to_entries | map(.value.result) | all(. as $result | ["success", "skipped"] | any($result == .))'
