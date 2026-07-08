@@ -441,6 +441,23 @@ jobs:
     secrets: inherit
 
   # ============================================================================
+  # XPU HETEROGENEOUS TEST JOBS
+  # ============================================================================
+
+  vllm-test-xpu-heterog:
+    name: vllm-xpu-heterog
+    needs: [resolve-source-sha, compute-release-mode]
+    if: ${{ needs.compute-release-mode.outputs.run_tests == 'true' }}
+    uses: ./.github/workflows/xpu-heterog-ci.yaml
+    with:
+      framework: vllm
+      target: runtime
+      source_ref: ${{ needs.resolve-source-sha.outputs.source_sha }}
+      docker_image_gpu: nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly:nightly
+      run_heterog_tests: true
+    secrets: inherit
+
+  # ============================================================================
   # DYNAMO RUNTIME PIPELINE
   # ============================================================================
   dynamo-pipeline:
