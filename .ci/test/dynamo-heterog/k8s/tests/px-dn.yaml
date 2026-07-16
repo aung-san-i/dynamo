@@ -270,6 +270,8 @@ kind: Job
 metadata:
   name: ${TEST_NAME}-bench
   namespace: dynamo-system
+  labels:
+    kueue.x-k8s.io/queue-name: dynamo-queue
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 86400
@@ -278,6 +280,7 @@ spec:
       labels:
         app.kubernetes.io/name: ${TEST_NAME}-bench
         app.kubernetes.io/part-of: px-dn
+        kueue.x-k8s.io/queue-name: dynamo-queue
     spec:
       restartPolicy: Never
       serviceAccountName: ${TEST_NAME}-k8s-service-discovery
