@@ -87,7 +87,7 @@ jobs:
   # ============================================================================
 
   build-xpu:
-    runs-on: xpu
+    runs-on: xpu-heterogeneous-ubuntu-latest
     outputs:
       image: ${{ steps.push.outputs.registry_image_tag }}
     steps:
@@ -123,15 +123,17 @@ jobs:
           # 63-char Kubernetes DNS-label limit.
           SHORT_SHA="$(git rev-parse HEAD | cut -c1-7)"
           IMAGE_TAG="${IMAGE_NAME}:${{ github.run_id }}-${SHORT_SHA}"
-
-          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
-          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "image_name=${IMAGE_NAME}"
+          echo "image_tag=${IMAGE_TAG}"
 
           docker build \
             --progress=plain \
             --tag "${IMAGE_TAG}" \
             -f ./container/rendered.Dockerfile \
             . 2>&1 | tee build-xpu.log
+
+          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
 
           echo "### 🐳 XPU Image Built" >> $GITHUB_STEP_SUMMARY
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
@@ -146,6 +148,7 @@ jobs:
           set -x
 
           TEST_IMAGE_TAG="${{ steps.build.outputs.image_tag }}-test"
+          echo "test_image_tag=${TEST_IMAGE_TAG}"
 
           docker build \
             --progress=plain \
@@ -153,6 +156,8 @@ jobs:
             -f container/Dockerfile.test \
             --build-arg BASE_IMAGE=${{ steps.build.outputs.image_tag }} \
             . 2>&1 | tee build-xpu-test.log
+          
+          echo "test_image_tag=${TEST_IMAGE_TAG}" >> $GITHUB_OUTPUT
 
       - name: Push XPU image to registry
         id: push
@@ -239,7 +244,7 @@ jobs:
   # ============================================================================
 
   xpu-status-check:
-    runs-on: ubuntu-latest
+    runs-on: xpu-heterogeneous-ubuntu-latest
     needs: [build-xpu, heterog-test-px-dn, heterog-test-pn-dx]
     if: always()
     steps:

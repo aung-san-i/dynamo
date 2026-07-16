@@ -21,7 +21,7 @@ jobs:
   # ============================================================================
 
   guard:
-    runs-on: ubuntu-latest
+    runs-on: xpu-heterogeneous-ubuntu-latest
     outputs:
       has_xpu_label: ${{ steps.pr-info.outputs.has_xpu_label }}
     steps:
@@ -49,7 +49,7 @@ jobs:
   changed-files:
     needs: [guard]
     if: needs.guard.outputs.has_xpu_label == 'true'
-    runs-on: ubuntu-latest
+    runs-on: xpu-heterogeneous-ubuntu-latest
     outputs:
       core: ${{ steps.changes.outputs.core }}
       vllm: ${{ steps.changes.outputs.vllm }}
@@ -88,7 +88,7 @@ jobs:
   # ============================================================================
 
   xpu-heterog-status-check:
-    runs-on: ubuntu-latest
+    runs-on: xpu-heterogeneous-ubuntu-latest
     needs: [guard, changed-files, xpu-heterog-ci-vllm]
     if: always() && needs.guard.outputs.has_xpu_label == 'true'
     steps:
