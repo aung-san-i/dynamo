@@ -16,12 +16,17 @@ on:
           - pn-dx
         default: both
       CHECKOUT_COMMIT:
-        description: 'Commit SHA to checkout (optional, defaults to workflow trigger commit)'
+        description: 'Commit SHA for the heterog test checkout (optional, defaults to workflow trigger commit)'
+        required: false
+        type: string
+        default: ''
+      xpu_build_checkout_commit:
+        description: 'Commit SHA to build the XPU image from (optional, defaults to CHECKOUT_COMMIT or workflow trigger commit)'
         required: false
         type: string
         default: ''
       xpu_image_source:
-        description: 'Use provided XPU image or build one from CHECKOUT_COMMIT'
+        description: 'Use provided XPU image or build one from xpu_build_checkout_commit'
         required: true
         type: choice
         options:
@@ -63,11 +68,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  print-inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print workflow inputs
+        shell: bash
+        run: |
+          echo "test_selection=${{ inputs.test_selection }}"
+          echo "CHECKOUT_COMMIT=${{ inputs.CHECKOUT_COMMIT }}"
+          echo "xpu_build_checkout_commit=${{ inputs.xpu_build_checkout_commit }}"
+          echo "xpu_image_source=${{ inputs.xpu_image_source }}"
+          echo "docker_image_xpu=${{ inputs.docker_image_xpu }}"
+          echo "docker_image_gpu=${{ inputs.docker_image_gpu }}"
+          echo "xpu_resource_template=${{ inputs.xpu_resource_template }}"
+          echo "nvidia_resource_template=${{ inputs.nvidia_resource_template }}"
+          echo "xpu_base_image=${{ inputs.xpu_base_image }}"
+          echo "xpu_base_image_tag=${{ inputs.xpu_base_image_tag }}"
+
   # ============================================================================
   # OPTIONAL XPU IMAGE BUILD
   # ============================================================================
-
   build-xpu:
+    needs: [print-inputs]
     if: inputs.xpu_image_source == 'build'
     runs-on: xpu-heterogeneous-ubuntu-latest
     outputs:
@@ -81,7 +103,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
         with:
-          ref: ${{ inputs.CHECKOUT_COMMIT || github.sha }}
+          ref: ${{ inputs.xpu_build_checkout_commit || inputs.CHECKOUT_COMMIT || github.sha }}
 
       - name: Generate Dockerfile
         shell: bash
