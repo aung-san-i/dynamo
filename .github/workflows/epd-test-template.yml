@@ -166,6 +166,12 @@ jobs:
           [ -n "$SUFFIX" ] && DEST="$LOCAL_LOG_DIR/$SUFFIX"
           mkdir -p "$DEST"
 
+          # Dynamo's Rust tracing logger writes ANSI color codes (ESC[..m) to
+          # stdout; kubectl logs preserves them, leaving the saved .log files
+          # littered with ^[[2m/^[[0m escapes that are hard to read. Strip CSI
+          # sequences so the captured pod logs are plain text.
+          strip_ansi() { sed -r 's/\x1b\[[0-9;?]*[a-zA-Z]//g'; }
+
           if [ -z "${TEST_NAME:-}" ]; then
             echo "dump-diagnostics: TEST_NAME is empty, nothing to collect" | tee "$DEST/NO_TEST_NAME.txt"
             exit 0
@@ -183,8 +189,8 @@ jobs:
           BENCH=$(kubectl get pods -n "$NS" -l "job-name=$TEST_NAME-bench" -o name 2>/dev/null || true)
           for pod in $PODS $BENCH; do
             name=${pod##*/}
-            kubectl logs -n "$NS" "$pod" --all-containers=true            > "$DEST/$name.log"          2>&1 || true
-            kubectl logs -n "$NS" "$pod" --all-containers=true --previous > "$DEST/$name-previous.log" 2>/dev/null || true
+            kubectl logs -n "$NS" "$pod" --all-containers=true            2>&1        | strip_ansi > "$DEST/$name.log"          || true
+            kubectl logs -n "$NS" "$pod" --all-containers=true --previous 2>/dev/null | strip_ansi > "$DEST/$name-previous.log" || true
             kubectl describe -n "$NS" "$pod"                              > "$DEST/$name-describe.txt" 2>&1 || true
           done
           SCRIPT
