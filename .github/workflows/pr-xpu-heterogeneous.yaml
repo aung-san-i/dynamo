@@ -277,7 +277,6 @@ jobs:
       nvidia_node: "nvidia_node"
       model: 'Qwen/Qwen3-0.6B'
       tensor_parallel: '1'
-      log_dir_name: "dynamo-heterog-logs-px-dn-${{ needs.build-xpu.outputs.short_sha }}"
 
   heterog-test-pn-dx:
     name: "Heterog: NVIDIA Prefill + XPU Decode"
@@ -303,7 +302,6 @@ jobs:
       nvidia_node: "nvidia_node"
       model: 'Qwen/Qwen3-0.6B'
       tensor_parallel: '1'
-      log_dir_name: "dynamo-heterog-logs-pn-dx-${{ needs.build-xpu.outputs.short_sha }}"
 
   # ============================================================================
   # STATUS CHECK
