@@ -393,9 +393,9 @@ jobs:
 
             # Exit on errors
             if [ "$has_error" = true ]; then
-              echo "ERROR: $error_msg"
-              kubectl get pods -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME"
-              kubectl describe pods -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME"
+              echo "ERROR: $error_msg"; echo ""
+              kubectl get pods -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME"; echo ""
+              kubectl describe pods -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME"; echo ""
               # Capture logs now -- a crash-looping/failed pod may be replaced before Collect logs runs
               "$RUNNER_TEMP/dump-diagnostics.sh" pod-error || true
               exit 1
@@ -665,6 +665,41 @@ jobs:
 
           echo "✓ Generated perf_summary.json:"
           head -20 "$UPLOAD_LOG_DIR/perf_summary.json"
+
+      - name: Stage failure diagnostics for upload
+        if: failure()
+        shell: bash
+        run: |
+          set -u
+          # On success the artifact ships only perf_summary.json + the bench log.
+          # On failure the pod diagnostics live solely in LOCAL_LOG_DIR (plus
+          # failure subdirs like pod-error/), so they never reach the downloadable
+          # artifact. Copy just those files -- pod *.log, *-previous.log, and
+          # *-describe.txt -- into UPLOAD_LOG_DIR, preserving the subdir layout,
+          # so a failed run is debuggable from the artifact alone.
+          # Guard against the vars being unset (e.g. the Prepare step failed
+          # before writing GITHUB_ENV) so set -u doesn't abort this failure hook.
+          local_dir="${LOCAL_LOG_DIR:-}"
+          upload_dir="${UPLOAD_LOG_DIR:-}"
+          if [ -z "$local_dir" ] || [ -z "$upload_dir" ]; then
+            echo "LOCAL_LOG_DIR/UPLOAD_LOG_DIR not set; nothing to stage"
+            exit 0
+          fi
+          if [ ! -d "$local_dir" ]; then
+            echo "LOCAL_LOG_DIR ($local_dir) missing; nothing to stage"
+            exit 0
+          fi
+          mkdir -p "$upload_dir"
+          cd "$local_dir" || exit 0
+          staged=0
+          while IFS= read -r -d '' f; do
+            dest="$upload_dir/$f"
+            mkdir -p "$(dirname "$dest")"
+            if cp "$f" "$dest"; then
+              staged=$((staged + 1))
+            fi
+          done < <(find . \( -name '*.log' -o -name '*-describe.txt' \) -type f -print0)
+          echo "Staged $staged failure-diagnostic file(s) into $upload_dir"
 
       - name: Upload logs
         if: always()
