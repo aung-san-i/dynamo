@@ -504,6 +504,17 @@ jobs:
               LOGS=$(kubectl logs -n "$NS" "$BENCHMARK_POD" 2>&1)
               echo "$LOGS"
 
+              # A green pod phase is NOT proof the benchmark ran: `vllm bench
+              # serve` can raise a Python traceback (e.g. "Initial test run
+              # failed ... Error: Not Found" when the frontend 404s) while the
+              # container still exits 0 and the pod reports phase=Succeeded.
+              # Detect those crash markers explicitly and fail.
+              if echo "$LOGS" | grep -Eq 'Traceback \(most recent call last\)|Initial test run failed'; then
+                echo "ERROR: Benchmark run crashed (traceback / 'Initial test run failed' found in logs)"
+                "$RUNNER_TEMP/dump-diagnostics.sh" bench-crashed || true
+                exit 1
+              fi
+
               # Parse benchmark results
               SUCCESSFUL_REQUESTS=$(echo "$LOGS" | grep -oP 'Successful requests:\s+\K\d+' || echo "")
               FAILED_REQUESTS=$(echo "$LOGS" | grep -oP 'Failed requests:\s+\K\d+' || echo "")
@@ -515,13 +526,30 @@ jobs:
               echo "  Failed requests: ${FAILED_REQUESTS:-unknown}"
               echo "========================================="
 
+              # A valid run MUST report a results summary. If the "Successful
+              # requests:" line is absent, the benchmark produced no metrics --
+              # treat that as failure instead of silently passing (the previous
+              # logic only failed on FAILED_REQUESTS>0, so an empty summary from
+              # a crashed run slipped through as a pass).
+              if [ -z "$SUCCESSFUL_REQUESTS" ]; then
+                echo "ERROR: Benchmark did not report a results summary (no 'Successful requests:' line)"
+                "$RUNNER_TEMP/dump-diagnostics.sh" bench-no-results || true
+                exit 1
+              fi
+
               # Fail if there were any failed requests
               if [ -n "$FAILED_REQUESTS" ] && [ "$FAILED_REQUESTS" -gt 0 ]; then
                 echo "ERROR: Benchmark validation failed - $FAILED_REQUESTS failed requests detected"
                 exit 1
               fi
 
-              echo "✓ Benchmark validation passed"
+              # Fail if the run completed but served nothing
+              if [ "$SUCCESSFUL_REQUESTS" -eq 0 ]; then
+                echo "ERROR: Benchmark validation failed - 0 successful requests"
+                exit 1
+              fi
+
+              echo "✓ Benchmark validation passed ($SUCCESSFUL_REQUESTS successful requests)"
               exit 0
             elif [ "$phase" = "Failed" ] || [ "$phase" = "Error" ]; then
               echo "ERROR: Benchmark pod in phase: $phase"
