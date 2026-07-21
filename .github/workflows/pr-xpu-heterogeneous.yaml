@@ -18,8 +18,18 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: pr-xpu-${{ github.event.issue.number || github.ref_name }}
-  cancel-in-progress: true
+  # Normalize the group so both PR triggers share one queue. A push sets
+  # github.ref_name = "pull-request/14"; an issue_comment (/run_xpu_heterog)
+  # only exposes github.event.issue.number = "14". Expressions have no
+  # replace/split, so we can't strip the prefix off the push side -- instead we
+  # add it to the comment side via format(), leaving both at "pull-request/14".
+  # schedule has neither, so it falls back to github.ref_name (default branch)
+  # and keeps its own group.
+  group: pr-xpu-heterogeneous-${{ github.event.issue.number && format('pull-request/{0}', github.event.issue.number) || github.ref_name }}
+  # Let an in-progress run finish instead of killing it when a newer push/comment
+  # arrives for the same PR. A new run queues behind the running one rather than
+  # cancelling it (which previously left px-dn 'cancelled' and skipped pn-dx).
+  cancel-in-progress: false
 
 jobs:
 
