@@ -61,7 +61,7 @@ on:
         description: 'XPU base/runtime image tag used when building'
         required: false
         type: string
-        default: 'ee0da84ab9e04ac7610e28580af62c365e898389-xpu'
+        default: '0e28fde4367eea39191c7fdaa3a6d7b554ab21ad-xpu'
 
 concurrency:
   group: pr-xpu-${{ github.ref_name }}
