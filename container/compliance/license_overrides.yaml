@@ -188,6 +188,16 @@ overrides:
     license: LicenseRef-Intel-ISSL
     source: "Intel Simplified Software License — https://www.intel.com/content/www/us/en/developer/articles/license/end-user-license-agreement.html"
 
+  # --- Intel oneAPI Level Zero dpkgs (XPU base image) ---
+  # The XPU base image (vllm-ci-test-repo:*-xpu) installs level-zero and
+  # level-zero-devel from the Intel GPU repo, but the .deb ships no
+  # /usr/share/doc/*/copyright file, so the DEP-5 parser falls through to
+  # UNKNOWN and the policy gate denies it. Upstream oneapi-src/level-zero is
+  # MIT-licensed. Version-agnostic by (ecosystem, name), so patch bumps of the
+  # base image stay covered.
+  - { ecosystem: dpkg, name: level-zero,       license: "MIT", source: "Intel oneAPI Level Zero — https://github.com/oneapi-src/level-zero/blob/master/LICENSE" }
+  - { ecosystem: dpkg, name: level-zero-devel, license: "MIT", source: "Intel oneAPI Level Zero — https://github.com/oneapi-src/level-zero/blob/master/LICENSE" }
+
   # --- NVIDIA CUDA Toolkit dpkgs ---
   # Apt-installed CUDA components from the NVIDIA repo. Their copyright files
   # reference /usr/share/common-licenses/GPL-3 because some bundled GDB-related

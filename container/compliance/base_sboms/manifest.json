@@ -70,16 +70,6 @@
       "platform": "linux/arm64"
     },
     {
-      "baseline_digest": "sha256:22b2291f0d515dbffde9d9f2333d82051b72781149fb5c2664076224dd8c53de",
-      "baseline_image": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo",
-      "baseline_sbom": "vllm-ci-test-repo@22b2291f-amd64.cdx.json",
-      "baseline_tag": "ee0da84ab9e04ac7610e28580af62c365e898389-xpu",
-      "from_digest": "sha256:22b2291f0d515dbffde9d9f2333d82051b72781149fb5c2664076224dd8c53de",
-      "from_image": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo",
-      "from_tag": "ee0da84ab9e04ac7610e28580af62c365e898389-xpu",
-      "platform": "linux/amd64"
-    },
-    {
       "baseline_digest": "sha256:043085f9298b5da0d79bfd91e162b04c0661f3cb2f03202c5b912037cf6c1ba6",
       "baseline_image": "nvcr.io/nvidia/distroless/python",
       "baseline_sbom": "python@043085f9-amd64.cdx.json",
@@ -118,6 +108,16 @@
       "from_image": "nvcr.io/nvidia/distroless/go",
       "from_tag": "v4.0.3",
       "platform": "linux/arm64"
+    },
+    {
+      "baseline_digest": "sha256:b24859c20a22ca88288c8c7a35c49ce18ea3c954b54133505298335b9cff5084",
+      "baseline_image": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo",
+      "baseline_sbom": "vllm-ci-test-repo@b24859c2-amd64.cdx.json",
+      "baseline_tag": "0e28fde4367eea39191c7fdaa3a6d7b554ab21ad-xpu",
+      "from_digest": "sha256:b24859c20a22ca88288c8c7a35c49ce18ea3c954b54133505298335b9cff5084",
+      "from_image": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo",
+      "from_tag": "0e28fde4367eea39191c7fdaa3a6d7b554ab21ad-xpu",
+      "platform": "linux/amd64"
     }
   ],
   "entry_schema": {
@@ -132,6 +132,6 @@
     "platform": "platform pinned for layer-prefix verification, e.g. linux/amd64"
   },
   "format": "CycloneDX 1.6 JSON, slim filter (drop properties/hashes/dependencies; keep evidence). Hard cap 5 MB per file.",
-  "generated_at": "2026-07-09T16:26:09+00:00",
+  "generated_at": "2026-07-22T20:07:11+00:00",
   "schema_version": 2
 }
