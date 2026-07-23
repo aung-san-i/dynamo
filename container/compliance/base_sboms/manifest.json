@@ -110,16 +110,6 @@
       "platform": "linux/arm64"
     },
     {
-      "baseline_digest": "sha256:b24859c20a22ca88288c8c7a35c49ce18ea3c954b54133505298335b9cff5084",
-      "baseline_image": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo",
-      "baseline_sbom": "vllm-ci-test-repo@b24859c2-amd64.cdx.json",
-      "baseline_tag": "0e28fde4367eea39191c7fdaa3a6d7b554ab21ad-xpu",
-      "from_digest": "sha256:b24859c20a22ca88288c8c7a35c49ce18ea3c954b54133505298335b9cff5084",
-      "from_image": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo",
-      "from_tag": "0e28fde4367eea39191c7fdaa3a6d7b554ab21ad-xpu",
-      "platform": "linux/amd64"
-    },
-    {
       "baseline_digest": "sha256:7291df3657ecfcf05332af183b373994eb2cf328c7914944b09e6c437bf2edf8",
       "baseline_image": "nvcr.io/nvidia/base/ubuntu",
       "baseline_sbom": "ubuntu@7291df36-amd64.cdx.json",
@@ -148,6 +138,16 @@
       "from_image": "nvcr.io/nvidia/cuda-dl-base",
       "from_tag": "25.11-cuda13.0-devel-ubuntu24.04",
       "platform": "linux/amd64"
+    },
+    {
+      "baseline_digest": "sha256:15ff6ee454eaf8be3b825f50225d60183eb09f14b5971454b4489a44dd5dac94",
+      "baseline_image": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo",
+      "baseline_sbom": "vllm-ci-test-repo@15ff6ee4-amd64.cdx.json",
+      "baseline_tag": "1582e816cbe65df7a10d4cbe61ccc299ea47b063-xpu",
+      "from_digest": "sha256:15ff6ee454eaf8be3b825f50225d60183eb09f14b5971454b4489a44dd5dac94",
+      "from_image": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo",
+      "from_tag": "1582e816cbe65df7a10d4cbe61ccc299ea47b063-xpu",
+      "platform": "linux/amd64"
     }
   ],
   "entry_schema": {
@@ -162,6 +162,6 @@
     "platform": "platform pinned for layer-prefix verification, e.g. linux/amd64"
   },
   "format": "CycloneDX 1.6 JSON, slim filter (drop properties/hashes/dependencies; keep evidence). Hard cap 5 MB per file.",
-  "generated_at": "2026-07-22T20:07:11+00:00",
+  "generated_at": "2026-07-23T23:20:53+00:00",
   "schema_version": 2
 }
