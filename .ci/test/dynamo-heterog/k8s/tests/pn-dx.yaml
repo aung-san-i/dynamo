@@ -141,7 +141,7 @@ spec:
                 fieldRef:
                   fieldPath: status.podIP
             - name: UCX_TLS
-              value: "ib,rc,ud,rc_verbs,ud_verbs,ze_copy"
+              value: "ib,rc,ud,rc_verbs,ud_verbs,cuda_copy"
             - name: UCX_IB_ROCE_REACHABILITY_MODE
               value: "all"
             - name: UCX_MEMTYPE_CACHE

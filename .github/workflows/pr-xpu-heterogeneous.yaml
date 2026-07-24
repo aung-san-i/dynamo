@@ -137,11 +137,7 @@ jobs:
         id: shared-images
         shell: bash
         run: |
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            echo "docker_image_gpu=nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly:nightly" >> "$GITHUB_OUTPUT"
-          else
-            echo "docker_image_gpu=nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1-cuda13" >> "$GITHUB_OUTPUT"
-          fi
+          echo "docker_image_gpu=nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly:latest" >> "$GITHUB_OUTPUT"
 
   # ============================================================================
   # BUILD XPU IMAGE
