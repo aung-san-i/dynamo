@@ -447,9 +447,9 @@ jobs:
 
           echo "Benchmark Job created, waiting for pod to be Ready..."
 
-          # Wait for benchmark pod to be created and Ready (max 3 minutes)
-          timeout_sec=180
-          check_interval=15
+          # Wait for benchmark pod to be created and Ready (max 10 minutes)
+          timeout_sec=600
+          check_interval=10
           elapsed=0
           while [ $elapsed -lt $timeout_sec ]; do
             BENCHMARK_POD=$(kubectl get pods -n "$NS" -l job-name="$TEST_NAME-bench" -o name 2>/dev/null | head -n1)
@@ -470,7 +470,7 @@ jobs:
           done
 
           if [ $elapsed -ge $timeout_sec ]; then
-            echo "ERROR: Benchmark pod did not become Ready within 3 minutes"
+            echo "ERROR: Benchmark pod did not become Ready within 10 minutes"
             echo "Pods currently in namespace:"
             kubectl get pods -n "$NS" --no-headers || true
             "$RUNNER_TEMP/dump-diagnostics.sh" bench-not-ready || true
@@ -478,7 +478,9 @@ jobs:
           fi
 
       - name: Wait for curl test and benchmark completion
-        timeout-minutes: 35
+        # Cap above the in-pod budget (below) so this step fails on its own terms
+        # and still runs its diagnostics dump, instead of being force-cancelled.
+        timeout-minutes: 55
         run: |
           echo "Waiting for BenchmarkRunner pod to complete..."
           BENCHMARK_POD=$(kubectl get pods -n "$NS" -l job-name="$TEST_NAME-bench" -o name | head -n1)
@@ -492,12 +494,20 @@ jobs:
 
           echo "Found $BENCHMARK_POD"
 
-          # Wait for benchmark to complete (max 30 minutes)
-          # Timer starts after all pods are Ready (Step N-2 for Services, N-1 for BenchmarkRunner)
-          # measures benchmark execution time only
-          for i in {1..180}; do
+          # Wait for benchmark to complete (max 50 minutes = 300 x 10s).
+          # Model loading (20-40 min) is NOT waited for here -- it is absorbed by
+          # "Wait for services" above, since a worker only passes its readiness
+          # probe once the engine is loaded and its endpoint is registered. The
+          # bench Job is created after that, so this loop covers only the bench
+          # container's own pre-flight plus the run itself:
+          #   worker endpoint discovery via frontend /health  30 min (safety net)
+          #   model registration (/v1/models)                  5 min
+          #   text-completion smoke test                       5 min (warns only)
+          #   benchmark run                                   10 min
+          # Keep this in sync with timeout_sec/text_timeout in the test YAMLs.
+          for i in {1..300}; do
             phase=$(kubectl get "$BENCHMARK_POD" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || true)
-            echo "Benchmark pod phase: $phase (check $i/180)"
+            echo "Benchmark pod phase: $phase (check $i/300)"
 
             if [ "$phase" = "Succeeded" ]; then
               echo "Benchmark pod completed successfully"
@@ -561,7 +571,7 @@ jobs:
             sleep 10
           done
 
-          echo "ERROR: Benchmark did not complete within 30 minutes"
+          echo "ERROR: Benchmark did not complete within 50 minutes"
           kubectl logs -n "$NS" "$BENCHMARK_POD"
           "$RUNNER_TEMP/dump-diagnostics.sh" bench-timeout || true
           exit 1

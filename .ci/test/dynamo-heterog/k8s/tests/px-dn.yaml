@@ -313,8 +313,8 @@ spec:
 
               # Wait for all worker endpoints (prefill, decode) for this deployment
               echo "Waiting for all worker endpoints (prefill, decode) to be registered..."
-              timeout_sec=600
-              poll_sec=30
+              timeout_sec=1800
+              poll_sec=10
               max_attempts=$((timeout_sec / poll_sec))
               workers_ready=false
               for attempt in $(seq 1 "$max_attempts"); do
@@ -352,8 +352,8 @@ spec:
               echo "========================================="
 
               model_ready=false
-              timeout_sec=180
-              poll_sec=15
+              timeout_sec=300
+              poll_sec=10
               max_attempts=$((timeout_sec / poll_sec))
               for attempt in $(seq 1 "$max_attempts"); do
                 if curl --noproxy '*' -sf "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models" 2>/dev/null | grep -Fq '"id":"'; then
@@ -386,8 +386,8 @@ spec:
               } 2>&1 | tee /tmp/curl_test.log
 
               text_success=false
-              text_timeout=180
-              text_interval=15
+              text_timeout=300
+              text_interval=10
               text_max_attempts=$((text_timeout / text_interval))
               {
                 for attempt in $(seq 1 "$text_max_attempts"); do
