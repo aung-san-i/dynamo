@@ -352,6 +352,17 @@ jobs:
             while IFS= read -r pod; do
               if [ -z "$pod" ]; then continue; fi
 
+              # A pod carrying a deletionTimestamp is Terminating (evicted,
+              # preempted, or the deployment was deleted out from under us). Its
+              # phase still reads Running/Pending, so without this check the loop
+              # would poll a doomed pod for the full 4 hours. Bail out now.
+              deletion_ts=$(kubectl get pod "$pod" -n "$NS" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || echo "")
+              if [ -n "$deletion_ts" ]; then
+                has_error=true
+                error_msg="Pod $pod is Terminating (deletionTimestamp=$deletion_ts)"
+                break
+              fi
+
               # Check pod phase
               phase=$(kubectl get pod "$pod" -n "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
 
