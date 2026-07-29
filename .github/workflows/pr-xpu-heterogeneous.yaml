@@ -17,9 +17,18 @@ permissions:
   issues: write
   pull-requests: read
 
+# Scoped to this workflow via github.workflow. Previously the group was a bare
+# "pr-xpu-<ref>", which XPU-Heterogeneous-Dispatch and PR-XPU also used, so a
+# manual dispatch would evict an in-flight PR run ("Canceling since a higher
+# priority waiting request ... exists"). Hardware contention is now handled by
+# the job-level mutex on the heterog test jobs instead of by this group.
 concurrency:
-  group: pr-xpu-${{ github.event.issue.number || github.ref_name }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.issue.number || github.ref_name }}
+  cancel-in-progress: false
+  # queue: max allows up to 100 runs to wait, instead of the default queue:
+  # single which keeps only ONE pending run and cancels it whenever a newer one
+  # arrives. Required for "never cancel"; invalid with cancel-in-progress: true.
+  queue: max
 
 jobs:
 
@@ -349,6 +358,16 @@ jobs:
 
   heterog-test-px-dn:
     name: "Heterog: XPU Prefill + NVIDIA Decode"
+    # Cross-workflow mutex over the shared xpu/nvidia hardware and the
+    # onexpu-/onenvidia-rdma-kueue ResourceClaimTemplates. Deliberately NOT
+    # keyed on github.workflow or github.run_id: every heterog test in every
+    # workflow must serialize on this one group. cancel-in-progress: false so a
+    # waiting run queues rather than killing a test mid-deploy and orphaning
+    # pods / ResourceClaims in the cluster.
+    concurrency:
+      group: xpu-heterog-hardware
+      cancel-in-progress: false
+      queue: max
     needs: [changed-files, build-xpu]
     if: >-
       needs.build-xpu.result == 'success' &&
@@ -372,6 +391,11 @@ jobs:
 
   heterog-test-pn-dx:
     name: "Heterog: NVIDIA Prefill + XPU Decode"
+    # Same hardware mutex as heterog-test-px-dn; see the comment there.
+    concurrency:
+      group: xpu-heterog-hardware
+      cancel-in-progress: false
+      queue: max
     needs: [changed-files, build-xpu, heterog-test-px-dn]
     if: >-
       always() &&

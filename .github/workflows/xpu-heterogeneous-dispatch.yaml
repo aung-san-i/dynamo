@@ -63,9 +63,17 @@ on:
         type: string
         default: 'ee0da84ab9e04ac7610e28580af62c365e898389-xpu'
 
+# Scoped to this workflow via github.workflow. Previously the group was a bare
+# "pr-xpu-<ref>" shared with PR-XPU-Heterogeneous and PR-XPU, so dispatching this
+# workflow cancelled whatever PR run was already testing that branch. Hardware
+# contention is now handled by the job-level mutex on the heterog test jobs.
 concurrency:
-  group: pr-xpu-${{ github.ref_name }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+  # queue: max allows up to 100 runs to wait, instead of the default queue:
+  # single which keeps only ONE pending run and cancels it whenever a newer one
+  # arrives. Required for "never cancel"; invalid with cancel-in-progress: true.
+  queue: max
 
 jobs:
   print-inputs:
@@ -359,6 +367,16 @@ jobs:
 
   heterog-test-px-dn:
     name: "Heterog: XPU Prefill + NVIDIA Decode"
+    # Cross-workflow mutex over the shared xpu/nvidia hardware and the
+    # onexpu-/onenvidia-rdma-kueue ResourceClaimTemplates. Deliberately NOT
+    # keyed on github.workflow or github.run_id: every heterog test in every
+    # workflow must serialize on this one group. cancel-in-progress: false so a
+    # waiting run queues rather than killing a test mid-deploy and orphaning
+    # pods / ResourceClaims in the cluster.
+    concurrency:
+      group: xpu-heterog-hardware
+      cancel-in-progress: false
+      queue: max
     needs: [resolve-inputs]
     # always() is required, not decorative: without a status function the
     # implicit success() evaluates over the whole ancestor closure, so a skipped
@@ -388,6 +406,11 @@ jobs:
 
   heterog-test-pn-dx:
     name: "Heterog: NVIDIA Prefill + XPU Decode"
+    # Same hardware mutex as heterog-test-px-dn; see the comment there.
+    concurrency:
+      group: xpu-heterog-hardware
+      cancel-in-progress: false
+      queue: max
     needs: [resolve-inputs, heterog-test-px-dn]
     if: >-
       always() &&
