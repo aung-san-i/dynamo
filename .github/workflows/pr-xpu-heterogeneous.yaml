@@ -145,17 +145,38 @@ jobs:
 
           GPU_REPO="nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly"
           GPU_PATH="nvidia/ai-dynamo/vllm-runtime-nightly"
-          GPU_IMAGE="${GPU_REPO}:latest"
 
-          # ":latest" is a moving pointer, so a run's logs alone never say which
-          # nightly was actually tested. Resolve it to the immutable YYYYMMDD-sha
-          # tag (e.g. 20260715-b0b7786) and record that in the job summary, so a
-          # failure can be reproduced against the exact image months later.
+          # ---- Override point -------------------------------------------------
+          # "latest" follows whatever the newest nightly is, which is what the
+          # 23:00 cron and the PR runs want. To pin every run of this workflow to
+          # one specific nightly instead, replace it with that build's immutable
+          # dated tag, e.g.
+          #     GPU_TAG="20260727-769ee07"
+          # Tag only -- GPU_PATH must keep matching GPU_REPO for the registry API
+          # calls below, so do not fold a full image reference in here.
+          GPU_TAG="20260727-769ee07"
+          # ---------------------------------------------------------------------
+
+          GPU_IMAGE="${GPU_REPO}:${GPU_TAG}"
+
+          # A moving pointer like ":latest" means a run's logs alone never say
+          # which nightly was actually tested. Resolve it to the immutable
+          # YYYYMMDD-sha tag (e.g. 20260715-b0b7786) and record that in the job
+          # summary, so a failure can be reproduced against the exact image months
+          # later.
           #
           # Done by digest comparison rather than by reading image labels: the
           # labels on these nightlies are inherited from the upstream vLLM base
           # image (org.opencontainers.image.version=vllm/vllm-openai:...), so they
           # identify the vLLM release, not the dynamo nightly build.
+          #
+          # An explicitly pinned dated tag is already immutable, so it is its own
+          # provenance record: skip the reverse lookup and just record the digest.
+          case "$GPU_TAG" in
+            [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-*) pinned=true ;;
+            *)                                          pinned=false ;;
+          esac
+
           resolved_tag=""
           digest=""
           accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json'
@@ -169,9 +190,13 @@ jobs:
               | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}'
           }
 
+          if [ "$pinned" = true ]; then
+            resolved_tag="$GPU_TAG"
+          fi
+
           if [ -n "$token" ]; then
-            digest=$(manifest_digest latest)
-            if [ -n "$digest" ]; then
+            digest=$(manifest_digest "$GPU_TAG")
+            if [ "$pinned" != true ] && [ -n "$digest" ]; then
               # Newest date tags first so the freshest match wins if a digest is
               # carried by more than one tag.
               for tag in $(curl -sS --max-time 30 -H "Authorization: Bearer $token" \
@@ -196,11 +221,14 @@ jobs:
           echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Requested | \`${GPU_IMAGE}\` |" >> "$GITHUB_STEP_SUMMARY"
-          if [ -n "$resolved_tag" ]; then
+          if [ "$pinned" = true ]; then
+            echo "| Resolved | \`${GPU_IMAGE}\` (pinned in workflow) |" >> "$GITHUB_STEP_SUMMARY"
+            echo "📌 Pinned to ${GPU_IMAGE} (dated tag, no :latest resolution needed)"
+          elif [ -n "$resolved_tag" ]; then
             echo "| Resolved | \`${GPU_REPO}:${resolved_tag}\` |" >> "$GITHUB_STEP_SUMMARY"
             echo "✅ Resolved ${GPU_IMAGE} -> ${GPU_REPO}:${resolved_tag}"
           else
-            echo "| Resolved | ⚠️ could not resolve \`:latest\` to a dated tag |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Resolved | ⚠️ could not resolve \`${GPU_TAG}\` to a dated tag |" >> "$GITHUB_STEP_SUMMARY"
             echo "⚠️ Could not resolve ${GPU_IMAGE} to a dated tag (registry unreachable or no matching tag)"
           fi
           if [ -n "$digest" ]; then
