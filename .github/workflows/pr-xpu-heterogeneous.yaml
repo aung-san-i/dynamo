@@ -120,6 +120,10 @@ jobs:
       vllm: ${{ (github.event_name == 'schedule' || github.event_name == 'issue_comment') && 'true' || steps.changes.outputs.vllm }}
       sglang: ${{ steps.changes.outputs.sglang }}
       docker_image_gpu: ${{ steps.shared-images.outputs.docker_image_gpu }}
+      # Immutable form of docker_image_gpu (repo:YYYYMMDD-sha) plus its digest,
+      # recorded for provenance. Empty if :latest could not be resolved.
+      docker_image_gpu_resolved: ${{ steps.shared-images.outputs.docker_image_gpu_resolved }}
+      docker_image_gpu_digest: ${{ steps.shared-images.outputs.docker_image_gpu_digest }}
       checkout_ref: ${{ needs.guard.outputs.checkout_ref }}
     steps:
       - name: Checkout code
@@ -137,7 +141,71 @@ jobs:
         id: shared-images
         shell: bash
         run: |
-          echo "docker_image_gpu=nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly:latest" >> "$GITHUB_OUTPUT"
+          set -uo pipefail
+
+          GPU_REPO="nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly"
+          GPU_PATH="nvidia/ai-dynamo/vllm-runtime-nightly"
+          GPU_IMAGE="${GPU_REPO}:latest"
+
+          # ":latest" is a moving pointer, so a run's logs alone never say which
+          # nightly was actually tested. Resolve it to the immutable YYYYMMDD-sha
+          # tag (e.g. 20260715-b0b7786) and record that in the job summary, so a
+          # failure can be reproduced against the exact image months later.
+          #
+          # Done by digest comparison rather than by reading image labels: the
+          # labels on these nightlies are inherited from the upstream vLLM base
+          # image (org.opencontainers.image.version=vllm/vllm-openai:...), so they
+          # identify the vLLM release, not the dynamo nightly build.
+          resolved_tag=""
+          digest=""
+          accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json'
+
+          token=$(curl -sS --max-time 30 "https://nvcr.io/proxy_auth?scope=repository:${GPU_PATH}:pull" 2>/dev/null | jq -r '.token // empty' || true)
+
+          manifest_digest() {
+            curl -sS --max-time 30 -o /dev/null -D - \
+              -H "Authorization: Bearer $token" -H "Accept: $accept" \
+              "https://nvcr.io/v2/${GPU_PATH}/manifests/$1" 2>/dev/null \
+              | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}'
+          }
+
+          if [ -n "$token" ]; then
+            digest=$(manifest_digest latest)
+            if [ -n "$digest" ]; then
+              # Newest date tags first so the freshest match wins if a digest is
+              # carried by more than one tag.
+              for tag in $(curl -sS --max-time 30 -H "Authorization: Bearer $token" \
+                             "https://nvcr.io/v2/${GPU_PATH}/tags/list" 2>/dev/null \
+                             | jq -r '.tags[]? // empty' | grep -E '^[0-9]{8}-' | sort -r); do
+                if [ "$(manifest_digest "$tag")" = "$digest" ]; then
+                  resolved_tag="$tag"
+                  break
+                fi
+              done
+            fi
+          fi
+
+          echo "docker_image_gpu=${GPU_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "docker_image_gpu_digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "docker_image_gpu_resolved=${resolved_tag:+${GPU_REPO}:${resolved_tag}}" >> "$GITHUB_OUTPUT"
+
+          # Resolution is best-effort: it is a provenance record, not a gate, so a
+          # registry hiccup must not fail the build. Say so plainly in the summary
+          # instead of silently reporting nothing.
+          echo "### 📦 Shared GPU Image" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Requested | \`${GPU_IMAGE}\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$resolved_tag" ]; then
+            echo "| Resolved | \`${GPU_REPO}:${resolved_tag}\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ Resolved ${GPU_IMAGE} -> ${GPU_REPO}:${resolved_tag}"
+          else
+            echo "| Resolved | ⚠️ could not resolve \`:latest\` to a dated tag |" >> "$GITHUB_STEP_SUMMARY"
+            echo "⚠️ Could not resolve ${GPU_IMAGE} to a dated tag (registry unreachable or no matching tag)"
+          fi
+          if [ -n "$digest" ]; then
+            echo "| Digest | \`${digest}\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # ============================================================================
   # BUILD XPU IMAGE
