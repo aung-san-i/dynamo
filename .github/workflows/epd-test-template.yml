@@ -308,38 +308,75 @@ jobs:
           echo "Checking DynamoGraphDeployment status:"
           kubectl get dynamographdeployment "$TEST_NAME" -n "$NS" -o yaml
 
-      - name: Wait for services
-        # Cap below GitHub's hard job limit so this step fails on its own terms
-        # (running its diagnostics dump) instead of being force-cancelled.
-        timeout-minutes: 250
+      - name: Wait for pods
+        # Cap above the internal 1 hour loop below so this step fails on its own
+        # terms (running its diagnostics dump) instead of being force-cancelled.
+        #
+        # For reference, measured runs (Qwen3-0.6B, TP=1): pods went Ready in
+        # 1.6 min when the cluster was free and 30.8 min when it was busy -- and
+        # 28.3 of those 30.8 min were spent SchedulingGated, queueing for
+        # XPU/NVIDIA capacity behind other jobs, not loading the model. Queue
+        # depth is the dominant and least predictable cost here, and larger
+        # models add load time on top of queueing rather than replacing it, so
+        # a run that trips the loop is more likely to have been stuck behind
+        # other jobs than genuinely broken; check for SchedulingGated in the
+        # dump before assuming a deployment failure.
+        timeout-minutes: 65
         run: |
           # redirects all output from the rest of that shell step to both console log and $DEPLOY_LOG
           exec > >(tee -a "$DEPLOY_LOG") 2>&1
 
-          echo "Waiting for pods to be created by DynamoGraphDeployment controller..."
+          # Expected pod count = sum of replicas across every service in the DGD
+          # spec (defaulting to 1 when replicas is omitted). Without this the
+          # waits below are satisfied by whatever subset of pods happens to exist
+          # at poll time -- e.g. a Ready Frontend alone would pass while the
+          # Prefill/Decode workers had not been created yet.
+          EXPECTED_PODS=$(kubectl get dynamographdeployment "$TEST_NAME" -n "$NS" \
+            -o go-template='{{range $name, $svc := .spec.services}}{{if $svc.replicas}}{{$svc.replicas}}{{else}}1{{end}}{{"\n"}}{{end}}' \
+            2>/dev/null | awk 'NF {s += $1} END {print s + 0}')
+          if [ -z "$EXPECTED_PODS" ] || [ "$EXPECTED_PODS" -le 0 ]; then
+            echo "ERROR: could not determine expected pod count from DynamoGraphDeployment $TEST_NAME"
+            kubectl get dynamographdeployment "$TEST_NAME" -n "$NS" -o yaml || true
+            "$RUNNER_TEMP/dump-diagnostics.sh" no-expected-pod-count || true
+            exit 1
+          fi
+          echo "EXPECTED_PODS=$EXPECTED_PODS" >> "$GITHUB_ENV"
+          echo "Expecting $EXPECTED_PODS pod(s) from DynamoGraphDeployment $TEST_NAME"
+
+          echo "Waiting for all $EXPECTED_PODS pod(s) to be created by DynamoGraphDeployment controller..."
           pod_count=0
           for i in {1..10}; do
             pod_count=$(kubectl get pods -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME" --no-headers 2>/dev/null | wc -l || echo 0)
-            if [ "$pod_count" -gt 0 ]; then
-              echo "Found $pod_count pod(s), proceeding to wait for Ready status..."
+            if [ "$pod_count" -ge "$EXPECTED_PODS" ]; then
+              echo "Found $pod_count/$EXPECTED_PODS pod(s), proceeding to wait for Ready status..."
               break
             fi
-            echo "No pods found yet, waiting... (attempt $i/10)"
+            echo "Only $pod_count/$EXPECTED_PODS pod(s) found yet, waiting... (attempt $i/10)"
             sleep 30
           done
 
-          if [ "$pod_count" -eq 0 ]; then
-            echo "ERROR: No pods were created after 5 minutes"
+          if [ "$pod_count" -lt "$EXPECTED_PODS" ]; then
+            echo "ERROR: only $pod_count/$EXPECTED_PODS pods were created after 5 minutes"
             "$RUNNER_TEMP/dump-diagnostics.sh" no-pods-created || true
             exit 1
           fi
 
-          # Smart wait for pods: up to 4 hours for resource scheduling, but fail fast on errors
-          # This allows K8s to schedule when resources are constrained, but exits immediately on real failures
-          echo "Waiting for pods to become Ready (max 4 hours for resource scheduling)..."
-          timeout_seconds=$((4 * 60 * 60))  # 4 hours
+          # Smart wait for pods: up to 1 hour for Kueue admission + model load, but
+          # fail fast on errors. This allows K8s to schedule when resources are
+          # constrained, but exits immediately on real failures. Kept below this
+          # step's timeout-minutes so the timeout branch below actually runs and
+          # dumps diagnostics instead of the step being force-cancelled.
+          echo "Waiting for pods to become Ready (max 1 hour for resource scheduling)..."
+          timeout_seconds=$((60 * 60))  # 1 hour
+          check_interval=5
+
+          # Measure elapsed from wall clock rather than by summing check_interval.
+          # Each pass also spends time in kubectl calls, which summing cannot see,
+          # so a counted total under-reports by that much on every iteration -- at
+          # a 5s interval that is ~720 iterations of drift, enough for the loop to
+          # outlive this step's timeout-minutes and lose its diagnostics dump.
+          start_ts=$(date +%s)
           elapsed=0
-          check_interval=30
 
           # Retry readiness checks until every pod is Ready, an error is detected, or the timeout expires.
           while [ $elapsed -lt $timeout_seconds ]; do
@@ -347,15 +384,18 @@ jobs:
             all_ready=true
             has_error=false
             error_msg=""
+            seen_pods=0
+            ready_pods=0
 
             # Scan the current pod list once; the outer loop handles retrying until all pods are Ready.
             while IFS= read -r pod; do
               if [ -z "$pod" ]; then continue; fi
+              seen_pods=$((seen_pods + 1))
 
               # A pod carrying a deletionTimestamp is Terminating (evicted,
               # preempted, or the deployment was deleted out from under us). Its
               # phase still reads Running/Pending, so without this check the loop
-              # would poll a doomed pod for the full 4 hours. Bail out now.
+              # would poll a doomed pod until the timeout. Bail out now.
               deletion_ts=$(kubectl get pod "$pod" -n "$NS" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || echo "")
               if [ -n "$deletion_ts" ]; then
                 has_error=true
@@ -369,6 +409,9 @@ jobs:
               if [ "$phase" = "Running" ]; then
                 # Check if all containers are ready
                 ready=$(kubectl get pod "$pod" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+                if [ "$ready" = "True" ]; then
+                  ready_pods=$((ready_pods + 1))
+                fi
                 if [ "$ready" != "True" ]; then
                   all_ready=false
                   # Check for CrashLoopBackOff in Running pods
@@ -381,7 +424,9 @@ jobs:
                   fi
                 fi
               elif [ "$phase" = "Succeeded" ] || [ "$phase" = "Completed" ]; then
-                # Job pods that completed successfully
+                # Job pods that completed successfully -- count as satisfied so a
+                # completed pod cannot stall the EXPECTED_PODS check below.
+                ready_pods=$((ready_pods + 1))
                 continue
               elif [ "$phase" = "Failed" ] || [ "$phase" = "Error" ]; then
                 has_error=true
@@ -412,25 +457,158 @@ jobs:
               exit 1
             fi
 
-            # Exit if all ready
-            if [ "$all_ready" = true ]; then
-              echo "✓ All pods are Ready"
+            # Exit only when every expected pod exists AND is Ready. Checking the
+            # count too stops a partially-created deployment from passing just
+            # because the pods that do exist are all Ready.
+            if [ "$all_ready" = true ] && [ "$seen_pods" -ge "$EXPECTED_PODS" ] && [ "$ready_pods" -ge "$EXPECTED_PODS" ]; then
+              echo "✓ All $ready_pods/$EXPECTED_PODS pods are Ready"
               kubectl get pods -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME"
               break
             fi
 
             # Show status and wait
-            echo "Pods not ready yet (${elapsed}s elapsed, max ${timeout_seconds}s). Checking again in ${check_interval}s..."
+            echo "Pods not ready yet: $ready_pods/$EXPECTED_PODS Ready, $seen_pods seen (${elapsed}s elapsed, max ${timeout_seconds}s). Checking again in ${check_interval}s..."
             kubectl get pods -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME" --no-headers | awk '{print "  - " $1 ": " $3}'
             sleep $check_interval
-            elapsed=$((elapsed + check_interval))
+            elapsed=$(( $(date +%s) - start_ts ))
           done
 
           if [ $elapsed -ge $timeout_seconds ]; then
-            echo "ERROR: Pods did not become Ready within 4 hours"
+            echo "ERROR: Pods did not become Ready within 1 hour ($ready_pods/$EXPECTED_PODS Ready after ${elapsed}s)"
             kubectl get pods -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME"
             kubectl describe pods -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME"
             "$RUNNER_TEMP/dump-diagnostics.sh" pods-not-ready || true
+            exit 1
+          fi
+
+      - name: Check Service endpoints
+        # Pod readiness (above) only proves each pod is individually Ready -- the
+        # Frontend's own probe returns 200 with zero workers registered, so a
+        # Ready Frontend and Ready workers can still be mutually invisible.
+        # This step is the first check that they are actually wired together:
+        # the Service has backing endpoints AND the Frontend can see every
+        # worker. Model loading already finished in "Wait for pods", so this is
+        # discovery propagation only and should settle in seconds.
+        #
+        # Cap = the two internal budgets below (2 min + 30 min) plus 3 min for
+        # the diagnostics dumps. Sizing it to exactly the sum would let GitHub
+        # force-cancel the step at the moment the second loop gives up, losing
+        # the workers-not-registered dump that explains the failure.
+        #
+        # Worker pods are already Ready by now, and Ready implies the engine is
+        # loaded (the readiness probe gates on the generate endpoint being
+        # registered, which happens after engine init), so nothing here waits on
+        # model load -- this is discovery propagation only and normally settles
+        # in seconds. The 30 min budget matches the same assertion made inside
+        # the bench pod (timeout_sec in the test YAMLs) so the two cannot
+        # disagree about how long registration is allowed to take.
+        timeout-minutes: 35
+        run: |
+          exec > >(tee -a "$DEPLOY_LOG") 2>&1
+
+          # jq parses /health below. Checking up front turns a missing jq into an
+          # immediate, obvious failure instead of a full timeout's worth of
+          # polling that reports every attempt as "not ready".
+          command -v jq >/dev/null 2>&1 || { echo "ERROR: jq is required on the runner but was not found"; exit 1; }
+
+          echo "Checking Service endpoints:"
+          kubectl get endpoints -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME" -o wide || true
+          kubectl get endpointslices -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME" -o wide || true
+
+          FRONTEND_SVC="$TEST_NAME-frontend"
+
+          # Wait for the frontend Service to have at least one ready address --
+          # without this, /health below is unreachable for a reason the proxy
+          # error alone would not make obvious.
+          echo ""
+          echo "Waiting for Service $FRONTEND_SVC to have ready endpoints..."
+          svc_timeout=120
+          # Elapsed comes from wall clock, not a running sum of the sleeps: each
+          # pass also spends time in kubectl calls, which a sum cannot see, so a
+          # counted total under-reports and the loop outlives its stated budget.
+          svc_start_ts=$(date +%s)
+          svc_elapsed=0
+          svc_ready=false
+          while [ "$svc_elapsed" -lt "$svc_timeout" ]; do
+            addrs=$(kubectl get endpointslices -n "$NS" \
+              -l "kubernetes.io/service-name=$FRONTEND_SVC" \
+              -o jsonpath='{range .items[*]}{range .endpoints[?(@.conditions.ready==true)]}{.addresses[0]}{"\n"}{end}{end}' 2>/dev/null | grep -c . || true)
+            if [ "${addrs:-0}" -gt 0 ]; then
+              echo "✓ Service $FRONTEND_SVC has $addrs ready endpoint address(es)"
+              svc_ready=true
+              break
+            fi
+            echo "No ready endpoints for $FRONTEND_SVC yet (${svc_elapsed}s/${svc_timeout}s)..."
+            sleep 10
+            svc_elapsed=$(( $(date +%s) - svc_start_ts ))
+          done
+
+          if [ "$svc_ready" != true ]; then
+            echo "ERROR: Service $FRONTEND_SVC has no ready endpoints after ${svc_timeout}s"
+            kubectl get endpointslices -n "$NS" -l "kubernetes.io/service-name=$FRONTEND_SVC" -o yaml || true
+            kubectl get svc "$FRONTEND_SVC" -n "$NS" -o yaml || true
+            "$RUNNER_TEMP/dump-diagnostics.sh" no-service-endpoints || true
+            exit 1
+          fi
+
+          # Expected worker instance count = every non-frontend service. Counting
+          # instead of grepping for specific role names keeps this generic across
+          # the 2-worker tests (Prefill/Decode) and the 3-worker ones that add an
+          # Enc service, so a missing worker cannot slip past on any of them.
+          EXPECTED_WORKERS=$(kubectl get dynamographdeployment "$TEST_NAME" -n "$NS" \
+            -o go-template='{{range $name, $svc := .spec.services}}{{if ne $svc.componentType "frontend"}}{{if $svc.replicas}}{{$svc.replicas}}{{else}}1{{end}}{{"\n"}}{{end}}{{end}}' \
+            2>/dev/null | awk 'NF {s += $1} END {print s + 0}')
+          if [ -z "$EXPECTED_WORKERS" ] || [ "$EXPECTED_WORKERS" -le 0 ]; then
+            echo "ERROR: could not determine expected worker count from DynamoGraphDeployment $TEST_NAME"
+            kubectl get dynamographdeployment "$TEST_NAME" -n "$NS" -o yaml || true
+            "$RUNNER_TEMP/dump-diagnostics.sh" no-expected-worker-count || true
+            exit 1
+          fi
+
+          # Query the frontend's /health through the apiserver proxy: the runner
+          # has no cluster DNS and no guarantee of in-cluster reachability, so
+          # `kubectl get --raw` is the portable way in. /health lists every
+          # instance the frontend has discovered -- the same assertion the bench
+          # pod makes later, made here where a failure is attributable to the
+          # deployment rather than to the benchmark.
+          echo ""
+          echo "Waiting for Frontend to discover all $EXPECTED_WORKERS worker endpoint(s)..."
+          # 30 min, matching timeout_sec for the same check inside the bench pod.
+          # Registration normally lands in seconds once pods are Ready; the long
+          # budget is a safety net for slow discovery propagation, not model load.
+          health_timeout=1800
+          health_start_ts=$(date +%s)
+          health_elapsed=0
+          workers_ready=false
+          health_response=""
+          while [ "$health_elapsed" -lt "$health_timeout" ]; do
+            health_response=$(kubectl get --raw \
+              "/api/v1/namespaces/$NS/services/$FRONTEND_SVC:8000/proxy/health" 2>&1 || echo "")
+
+            # Count this deployment's *.generate instances (prefill.generate,
+            # backend.generate for decode, encode.generate when present).
+            worker_count=$(printf '%s' "$health_response" \
+              | jq -r '.endpoints[]? // empty' 2>/dev/null \
+              | grep "$TEST_NAME" | grep -c '\.generate$' || true)
+            status=$(printf '%s' "$health_response" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+
+            if [ "${worker_count:-0}" -ge "$EXPECTED_WORKERS" ] && [ "$status" = "healthy" ]; then
+              echo "✓ Frontend reports $worker_count/$EXPECTED_WORKERS worker endpoints registered, status=healthy"
+              printf '%s' "$health_response" | jq '.endpoints' 2>/dev/null || printf '%s\n' "$health_response"
+              workers_ready=true
+              break
+            fi
+            echo "Waiting for workers (${health_elapsed}s/${health_timeout}s): ${worker_count:-0}/$EXPECTED_WORKERS registered, status=$status"
+            sleep 10
+            health_elapsed=$(( $(date +%s) - health_start_ts ))
+          done
+
+          if [ "$workers_ready" != true ]; then
+            echo "ERROR: Frontend reported only ${worker_count:-0}/$EXPECTED_WORKERS worker endpoints within ${health_timeout}s"
+            echo "Last /health response:"
+            printf '%s\n' "$health_response"
+            kubectl get pods -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME" -o wide || true
+            "$RUNNER_TEMP/dump-diagnostics.sh" workers-not-registered || true
             exit 1
           fi
 
@@ -461,6 +639,10 @@ jobs:
           # Wait for benchmark pod to be created and Ready (max 10 minutes)
           timeout_sec=600
           check_interval=10
+          # Elapsed comes from wall clock, not a running sum of the sleeps: each
+          # pass also spends time in kubectl calls, which a sum cannot see, so a
+          # counted total under-reports and the loop outlives its stated budget.
+          start_ts=$(date +%s)
           elapsed=0
           while [ $elapsed -lt $timeout_sec ]; do
             BENCHMARK_POD=$(kubectl get pods -n "$NS" -l job-name="$TEST_NAME-bench" -o name 2>/dev/null | head -n1)
@@ -477,11 +659,11 @@ jobs:
               fi
             fi
             sleep $check_interval
-            elapsed=$((elapsed + check_interval))
+            elapsed=$(( $(date +%s) - start_ts ))
           done
 
           if [ $elapsed -ge $timeout_sec ]; then
-            echo "ERROR: Benchmark pod did not become Ready within 10 minutes"
+            echo "ERROR: Benchmark pod did not become Ready within 10 minutes (after ${elapsed}s)"
             echo "Pods currently in namespace:"
             kubectl get pods -n "$NS" --no-headers || true
             "$RUNNER_TEMP/dump-diagnostics.sh" bench-not-ready || true
