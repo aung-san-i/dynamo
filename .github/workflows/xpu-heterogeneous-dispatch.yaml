@@ -61,7 +61,7 @@ on:
         description: 'XPU base/runtime image tag used when building'
         required: false
         type: string
-        default: '752a3a504485790a2e8491cacbb35c137339ad34-xpu'
+        default: 'ee0da84ab9e04ac7610e28580af62c365e898389-xpu'
 
 concurrency:
   group: pr-xpu-${{ github.ref_name }}
@@ -267,7 +267,13 @@ jobs:
   heterog-test-px-dn:
     name: "Heterog: XPU Prefill + NVIDIA Decode"
     needs: [resolve-inputs]
+    # always() is required, not decorative: without a status function the
+    # implicit success() evaluates over the whole ancestor closure, so a skipped
+    # build-xpu (xpu_image_source == 'provided') skips this job even though
+    # resolve-inputs succeeded. Gating is still done by the explicit
+    # resolve-inputs check below. Matches heterog-test-pn-dx.
     if: >-
+      always() &&
       needs.resolve-inputs.result == 'success' &&
       (inputs.test_selection == 'both' ||
       inputs.test_selection == 'px-dn')
@@ -286,7 +292,6 @@ jobs:
       nvidia_node: "nvidia_node"
       model: 'Qwen/Qwen3-0.6B'
       tensor_parallel: '1'
-      log_dir_name: "dynamo-heterog-logs-px-dn"
 
   heterog-test-pn-dx:
     name: "Heterog: NVIDIA Prefill + XPU Decode"
@@ -294,7 +299,6 @@ jobs:
     if: >-
       always() &&
       needs.resolve-inputs.result == 'success' &&
-      needs.heterog-test-px-dn.result != 'cancelled' &&
       (inputs.test_selection == 'both' ||
       inputs.test_selection == 'pn-dx')
     uses: ./.github/workflows/epd-test-template.yml
@@ -312,7 +316,6 @@ jobs:
       nvidia_node: "nvidia_node"
       model: 'Qwen/Qwen3-0.6B'
       tensor_parallel: '1'
-      log_dir_name: "dynamo-heterog-logs-pn-dx"
 
   # ============================================================================
   # STATUS CHECK
