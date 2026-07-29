@@ -85,6 +85,78 @@ jobs:
           echo "xpu_base_image=${{ inputs.xpu_base_image }}"
           echo "xpu_base_image_tag=${{ inputs.xpu_base_image_tag }}"
 
+      - name: Summarize dispatch inputs
+        # workflow_dispatch inputs are not recorded anywhere a reader can see
+        # after the fact: the run page shows only the workflow name, and the step
+        # above is a click deep in a log that scrolls away. Put them in the job
+        # summary so "what was this run actually given?" is answerable from the
+        # run page itself. Runs unconditionally -- unlike the build-xpu summaries
+        # below, which vanish entirely when xpu_image_source is 'provided'.
+        shell: bash
+        env:
+          TEST_SELECTION: ${{ inputs.test_selection }}
+          INPUT_CHECKOUT_COMMIT: ${{ inputs.CHECKOUT_COMMIT }}
+          XPU_BUILD_CHECKOUT_COMMIT: ${{ inputs.xpu_build_checkout_commit }}
+          XPU_IMAGE_SOURCE: ${{ inputs.xpu_image_source }}
+          INPUT_DOCKER_IMAGE_XPU: ${{ inputs.docker_image_xpu }}
+          INPUT_DOCKER_IMAGE_GPU: ${{ inputs.docker_image_gpu }}
+          XPU_RESOURCE_TEMPLATE: ${{ inputs.xpu_resource_template }}
+          NVIDIA_RESOURCE_TEMPLATE: ${{ inputs.nvidia_resource_template }}
+          XPU_BASE_IMAGE: ${{ inputs.xpu_base_image }}
+          XPU_BASE_IMAGE_TAG: ${{ inputs.xpu_base_image_tag }}
+        run: |
+          set -uo pipefail
+
+          # Values are free-form user input, so pass them as arguments rather
+          # than interpolating them into the script body.
+          # row LABEL VALUE            -> plain value, "-" when empty
+          # code_row LABEL VALUE NOTE  -> `value` plus an optional unformatted
+          #                               note, so "(defaulted)" stays outside
+          #                               the code span rather than reading as
+          #                               part of the image ref / SHA.
+          row() { printf '| %s | %s |\n' "$1" "${2:--}" >> "$GITHUB_STEP_SUMMARY"; }
+          code_row() {
+            if [ -n "${2:-}" ]; then
+              printf '| %s | `%s`%s |\n' "$1" "$2" "${3:+ $3}" >> "$GITHUB_STEP_SUMMARY"
+            else
+              row "$1" "${3:-}"
+            fi
+          }
+
+          {
+            echo "### ⚙️ Dispatch Inputs"
+            echo "| Input | Value |"
+            echo "|-------|-------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          row      "Test selection"   "$TEST_SELECTION"
+          row      "XPU image source" "$XPU_IMAGE_SOURCE"
+          if [ -n "$INPUT_CHECKOUT_COMMIT" ]; then
+            code_row "Test checkout commit" "$INPUT_CHECKOUT_COMMIT"
+          else
+            code_row "Test checkout commit" "$GITHUB_SHA" "(workflow trigger commit)"
+          fi
+          code_row "XPU image"                    "$INPUT_DOCKER_IMAGE_XPU"
+          code_row "NVIDIA image"                 "$INPUT_DOCKER_IMAGE_GPU"
+          code_row "XPU ResourceClaimTemplate"    "$XPU_RESOURCE_TEMPLATE"
+          code_row "NVIDIA ResourceClaimTemplate" "$NVIDIA_RESOURCE_TEMPLATE"
+
+          # The build-only inputs are noise when no build happens -- the XPU
+          # image came from the 'XPU image' row above instead.
+          if [ "$XPU_IMAGE_SOURCE" = "build" ]; then
+            if [ -n "$XPU_BUILD_CHECKOUT_COMMIT" ]; then
+              code_row "XPU build checkout commit" "$XPU_BUILD_CHECKOUT_COMMIT"
+            else
+              code_row "XPU build checkout commit" \
+                "${INPUT_CHECKOUT_COMMIT:-$GITHUB_SHA}" "(inherited)"
+            fi
+            code_row "XPU base image" "${XPU_BASE_IMAGE}:${XPU_BASE_IMAGE_TAG}"
+          fi
+
+          # Blank line terminates the table, so anything appended after this
+          # step is not swallowed as a malformed extra row.
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
   # ============================================================================
   # OPTIONAL XPU IMAGE BUILD
   # ============================================================================
@@ -258,6 +330,27 @@ jobs:
           echo "docker_image_gpu=${INPUT_DOCKER_IMAGE_GPU}" >> "$GITHUB_OUTPUT"
           echo "xpu_resource_template=${XPU_RESOURCE_TEMPLATE}" >> "$GITHUB_OUTPUT"
           echo "nvidia_resource_template=${NVIDIA_RESOURCE_TEMPLATE}" >> "$GITHUB_OUTPUT"
+
+          # These are the values the tests actually ran with, after defaulting
+          # and after the provided-vs-built choice was made. The Dispatch Inputs
+          # table above shows what was requested; this one shows what was used,
+          # which is what a failure has to be reproduced against months later.
+          {
+            echo "### 🧩 Resolved Test Configuration"
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            printf '| XPU image | `%s` |\n'    "$docker_image_xpu"
+            printf '| NVIDIA image | `%s` |\n' "$INPUT_DOCKER_IMAGE_GPU"
+            printf '| Test checkout commit | `%s` |\n' "$checkout_commit"
+            printf '| XPU ResourceClaimTemplate | `%s` |\n'    "$XPU_RESOURCE_TEMPLATE"
+            printf '| NVIDIA ResourceClaimTemplate | `%s` |\n' "$NVIDIA_RESOURCE_TEMPLATE"
+            if [[ "$XPU_IMAGE_SOURCE" == "build" ]]; then
+              echo "| XPU image origin | built by this run's \`build-xpu\` job |"
+            else
+              echo "| XPU image origin | provided as a workflow input |"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
 
   # ============================================================================
