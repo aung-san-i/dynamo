@@ -87,7 +87,7 @@ concurrency:
 
 jobs:
   print-inputs:
-    runs-on: ubuntu-latest
+    runs-on: xpu-heterogeneous-ubuntu-latest
     steps:
       - name: Print workflow inputs
         shell: bash
@@ -520,7 +520,7 @@ jobs:
           retention-days: 7
 
   resolve-inputs:
-    runs-on: ubuntu-latest
+    runs-on: xpu-heterogeneous-ubuntu-latest
     needs: [build-xpu, build-nvidia]
     if: always()
     outputs:
@@ -673,7 +673,7 @@ jobs:
   # ============================================================================
 
   xpu-status-check:
-    runs-on: ubuntu-latest
+    runs-on: xpu-heterogeneous-ubuntu-latest
     needs: [build-xpu, build-nvidia, resolve-inputs, heterog-test-px-dn, heterog-test-pn-dx]
     if: always()
     steps:

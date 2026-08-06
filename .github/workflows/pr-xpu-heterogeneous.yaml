@@ -52,7 +52,7 @@ jobs:
       (startsWith(github.event.comment.body, '/run_xpu_heterogeneous') ||
       startsWith(github.event.comment.body, '/run_xpu_heterog')) &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
-    runs-on: ubuntu-latest
+    runs-on: xpu-heterogeneous-ubuntu-latest
     outputs:
       has_xpu_label: ${{ steps.pr-info.outputs.has_xpu_label }}
       checkout_ref: ${{ steps.pr-info.outputs.checkout_ref }}
@@ -162,7 +162,7 @@ jobs:
   changed-files:
     needs: [guard]
     if: needs.guard.outputs.has_xpu_label == 'true'
-    runs-on: ubuntu-latest
+    runs-on: xpu-heterogeneous-ubuntu-latest
     outputs:
       core: ${{ (github.event_name == 'schedule' || github.event_name == 'issue_comment') && 'true' || steps.changes.outputs.core }}
       vllm: ${{ (github.event_name == 'schedule' || github.event_name == 'issue_comment') && 'true' || steps.changes.outputs.vllm }}
@@ -628,7 +628,7 @@ jobs:
   resolve-images:
     needs: [guard, changed-files, build-nvidia]
     if: always() && needs.changed-files.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: xpu-heterogeneous-ubuntu-latest
     outputs:
       docker_image_gpu: ${{ steps.resolve.outputs.docker_image_gpu }}
     steps:
@@ -766,7 +766,7 @@ jobs:
   # ============================================================================
 
   xpu-status-check:
-    runs-on: ubuntu-latest
+    runs-on: xpu-heterogeneous-ubuntu-latest
     needs: [guard, changed-files, build-xpu, build-nvidia, resolve-images, heterog-test-px-dn, heterog-test-pn-dx]
     if: always() && needs.guard.outputs.has_xpu_label == 'true'
     steps:
