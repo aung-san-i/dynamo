@@ -216,6 +216,26 @@ const testCases = [
     desc: 'helm file triggers deploy'
   },
 
+  // XPU Tests
+  {
+    file: '.github/workflows/pr-xpu-heterog.yaml',
+    expect: { core: false, vllm: true, examples: false },
+    desc: 'pr-xpu-heterog workflow triggers vllm'
+  },
+  {
+    file: '.github/workflows/epd-test-template.yml',
+    expect: { core: false, vllm: true, examples: false },
+    desc: 'epd-test-template workflow triggers vllm'
+  },
+  {
+    file: '.ci/test/dynamo-heterog/k8s/tests/px-dn.yaml',
+    expect: { core: false, vllm: true, examples: false },
+    desc: 'heterogeneous vllm test manifest triggers vllm'
+  },
+  {
+    file: '.ci/test/dynamo-heterog/k8s/tests/pn-dx.yaml',
+    expect: { core: false, vllm: true, examples: false },
+    desc: 'heterogeneous vllm test manifest triggers vllm'
   // Framework snapshot lifecycle: backend filter + that framework's DynamoCheckpoint filter
   {
     file: 'components/src/dynamo/vllm/snapshot.py',
