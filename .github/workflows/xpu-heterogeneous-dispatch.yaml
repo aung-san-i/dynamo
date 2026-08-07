@@ -25,22 +25,29 @@ on:
         required: false
         type: string
         default: ''
-      # Blank => this run builds the image; non-blank => that image is tested
-      # as-is. There is deliberately no separate "source" switch: a build/provided
+      # The literal word BUILD (any case) => this run builds the image; anything
+      # else is treated as an image ref and tested as-is. Both default to a
+      # known-good ref, so an all-defaults dispatch tests those two and builds
+      # nothing.
+      #
+      # A SENTINEL, NOT AN EMPTY FIELD. Emptiness cannot work here: GitHub
+      # substitutes an input's default whenever a dispatch field is submitted
+      # blank, so `inputs.docker_image_xpu == ''` is unreachable for any input
+      # carrying a non-empty default -- clearing the box yields the default ref,
+      # the build job never triggers, and the run silently tests the pinned image
+      # instead. A non-empty sentinel survives that substitution.
+      #
+      # There is also deliberately no separate "source" switch: a build/provided
       # choice alongside a ref makes two states expressible that cannot be
       # honoured -- "provided" with no ref (nothing to test) and "build" with a
-      # ref (a value that must be silently ignored). Emptiness carries the same
-      # information with neither state representable.
-      #
-      # Both default to a known-good image, so an all-defaults dispatch tests
-      # those two and builds nothing. CLEAR a field to build that image instead.
+      # ref (a value that must be silently ignored).
       docker_image_xpu:
-        description: 'XPU image to test (clear to build one from xpu_build_checkout_commit)'
+        description: 'XPU image to test, or BUILD to build one from xpu_build_checkout_commit'
         required: false
         type: string
         default: 'sc09super01-srv.intel.com/dynamo/dynamo-vllm-runtime-xpu:30415619006-9764ba0'
       docker_image_gpu:
-        description: 'NVIDIA GPU image to test (clear to build one from CHECKOUT_COMMIT)'
+        description: 'NVIDIA GPU image to test, or BUILD to build one from CHECKOUT_COMMIT'
         required: false
         type: string
         default: 'nvcr.io/nvidia/ai-dynamo/vllm-runtime-nightly:20260727-769ee07'
@@ -108,8 +115,7 @@ jobs:
         # above is a click deep in a log that scrolls away. Put them in the job
         # summary so "what was this run actually given?" is answerable from the
         # run page itself. Runs unconditionally -- unlike the build-xpu summaries
-        # below, which vanish entirely when an XPU image ref was supplied (the
-        # default).
+        # below, which vanish entirely unless the XPU input was set to BUILD.
         shell: bash
         env:
           TEST_SELECTION: ${{ inputs.test_selection }}
@@ -154,14 +160,14 @@ jobs:
           fi
           # image_row LABEL REF BUILD_JOB -> the ref when one was given, else a
           # note naming the job that builds it. Not code_row's third argument:
-          # that appends to a NON-empty value, so it would decorate a supplied
-          # ref with a "building" note. Here the two cases are exclusive, and a
-          # bare "-" would read as "no image at all" rather than "being built".
+          # that appends to a NON-empty value, and the BUILD sentinel is itself
+          # non-empty, so it would render as `BUILD` plus a note rather than as a
+          # plain "building via ..." line.
           image_row() {
-            if [ -n "$2" ]; then
-              code_row "$1" "$2"
-            else
+            if [ "$(printf '%s' "$2" | tr '[:lower:]' '[:upper:]')" = "BUILD" ]; then
               row "$1" "building via \`$3\`"
+            else
+              code_row "$1" "$2"
             fi
           }
 
@@ -172,7 +178,7 @@ jobs:
 
           # The build-only inputs are noise when no build happens -- the XPU
           # image came from the 'XPU image' row above instead.
-          if [ -z "$INPUT_DOCKER_IMAGE_XPU" ]; then
+          if [ "$(printf '%s' "$INPUT_DOCKER_IMAGE_XPU" | tr '[:lower:]' '[:upper:]')" = "BUILD" ]; then
             if [ -n "$XPU_BUILD_CHECKOUT_COMMIT" ]; then
               code_row "XPU build checkout commit" "$XPU_BUILD_CHECKOUT_COMMIT"
             else
@@ -191,8 +197,11 @@ jobs:
   # ============================================================================
   build-xpu:
     needs: [print-inputs]
-    # No XPU image ref supplied => build one. See the input comments above.
-    if: inputs.docker_image_xpu == ''
+    # BUILD sentinel => build; any other value is an image ref to test as-is. See
+    # the input comments above for why this is not an emptiness check.
+    # GitHub expression string comparison is case-insensitive, so this also
+    # matches "build" and "Build"; the shell side upper-cases to match.
+    if: inputs.docker_image_xpu == 'BUILD'
     runs-on: xpu-heterogeneous-ubuntu-latest
     outputs:
       image: ${{ steps.push.outputs.registry_image_tag }}
@@ -375,8 +384,9 @@ jobs:
   #      subject to Docker Hub anonymous pull limits.
   build-nvidia:
     needs: [print-inputs]
-    # No GPU image ref supplied => build one. See the input comments above.
-    if: inputs.docker_image_gpu == ''
+    # BUILD sentinel => build; any other value is an image ref to test as-is.
+    # Case-insensitive, as in build-xpu above.
+    if: inputs.docker_image_gpu == 'BUILD'
     runs-on: xpu-heterogeneous-ubuntu-latest
     outputs:
       image: ${{ steps.push.outputs.registry_image_tag }}
@@ -549,25 +559,37 @@ jobs:
 
           checkout_commit="${INPUT_CHECKOUT_COMMIT:-$DEFAULT_CHECKOUT_COMMIT}"
 
-          # A blank ref means the matching build job ran, so take its output;
-          # otherwise the ref is what gets tested. The build result still has to
-          # be checked: the job can fail, and testing nothing at all is worse
-          # than failing here. There is no "ref required" branch any more -- a
-          # blank ref is a valid request to build, not a missing value.
+          # The BUILD sentinel means the matching build job ran, so take its
+          # output; any other value is an image ref and is tested as-is. The build
+          # result still has to be checked: the job can fail, and testing nothing
+          # at all is worse than failing here.
+          #
+          # Upper-cased before comparing because bash [[ == ]] is case-SENSITIVE,
+          # unlike the GitHub expressions in the two job `if:` gates. Without this
+          # a dispatch of "build" would trigger the build job but then be read as
+          # an image ref here, and the tests would try to pull "build".
           #
           # Both devices resolve identically, so one helper covers them instead of
           # two near-identical blocks that can drift apart.
           resolve_image() { # DEVICE INPUT_REF BUILD_JOB BUILD_RESULT BUILT_REF
-            if [[ -n "$2" ]]; then
+            if [[ "${2^^}" != "BUILD" ]]; then
+              # Unreachable from the dispatch form -- a cleared field takes the
+              # default -- but a caller with an explicitly empty value would
+              # otherwise resolve to "", and an empty image ref fails much later
+              # inside the test template with a far less obvious message.
+              if [[ -z "$2" ]]; then
+                echo "$1 image is empty; give an image ref or BUILD" >&2
+                return 1
+              fi
               printf '%s' "$2"
               return
             fi
             if [[ "$4" != "success" ]]; then
-              echo "$1 image was left blank to be built, but $3 did not succeed (result: '$4')" >&2
+              echo "$1 image was set to BUILD, but $3 did not succeed (result: '$4')" >&2
               return 1
             fi
             if [[ -z "$5" ]]; then
-              echo "$1 image was left blank to be built, but $3 produced no image output" >&2
+              echo "$1 image was set to BUILD, but $3 produced no image output" >&2
               return 1
             fi
             printf '%s' "$5"
@@ -597,12 +619,12 @@ jobs:
             printf '| Test checkout commit | `%s` |\n' "$checkout_commit"
             printf '| XPU ResourceClaimTemplate | `%s` |\n'    "$XPU_RESOURCE_TEMPLATE"
             printf '| NVIDIA ResourceClaimTemplate | `%s` |\n' "$NVIDIA_RESOURCE_TEMPLATE"
-            if [[ -z "$INPUT_DOCKER_IMAGE_XPU" ]]; then
+            if [[ "${INPUT_DOCKER_IMAGE_XPU^^}" == "BUILD" ]]; then
               echo "| XPU image origin | built by this run's \`build-xpu\` job |"
             else
               echo "| XPU image origin | provided as a workflow input |"
             fi
-            if [[ -z "$INPUT_DOCKER_IMAGE_GPU" ]]; then
+            if [[ "${INPUT_DOCKER_IMAGE_GPU^^}" == "BUILD" ]]; then
               echo "| NVIDIA image origin | built by this run's \`build-nvidia\` job |"
             else
               echo "| NVIDIA image origin | provided as a workflow input |"
