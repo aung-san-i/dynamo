@@ -100,7 +100,16 @@ runs:
         #     to its default behaviour (deepens history and diffs against the previous
         #     commit). Callers short-circuit outputs to true for main/release anyway.
         if [[ "${{ github.ref_name }}" =~ ^pull-request/([0-9]+)$ ]]; then
-          BASE=$(gh pr view "${BASH_REMATCH[1]}" --json baseRefName -q '.baseRefName')
+          # --repo, not implicit resolution: gh otherwise infers the repo from the
+          # workspace's git remotes, and a self-hosted runner reusing a checkout
+          # that has more than one (origin + upstream + a fork) makes that
+          # ambiguous -- gh refuses with "No default remote repository has been
+          # set" and the step dies. github.repository is the repo the run belongs
+          # to, which is also where a fork PR lives (this path only fires on push
+          # to the copy-pr-bot pull-request/N branch, always in the base repo), so
+          # it is right for fork and non-fork PRs alike. Matches the explicit
+          # repos/${{ github.repository }} path in the gh api call just below.
+          BASE=$(gh pr view "${BASH_REMATCH[1]}" --repo "${{ github.repository }}" --json baseRefName -q '.baseRefName')
           # Compare API returns the true merge-base (fork point), not the branch tip.
           BASE_SHA=$(gh api "repos/${{ github.repository }}/compare/${BASE}...${{ github.sha }}" \
             --jq '.merge_base_commit.sha')
