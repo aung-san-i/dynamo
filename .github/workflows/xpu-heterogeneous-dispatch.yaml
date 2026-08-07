@@ -61,16 +61,20 @@ on:
         required: false
         type: string
         default: 'onenvidia-rdma-kueue'
+      # One field, "repo:tag", replacing the former xpu_base_image +
+      # xpu_base_image_tag pair. Split on the LAST colon in build-xpu, because a
+      # registry host may itself carry a port (host:5000/img:tag).
+      #
+      # DEFAULT => pass no --build-arg at all, so the build falls back to the
+      # values baked into the rendered Dockerfile by container/render.py from
+      # container/context.yaml (vllm: xpu: => vllm/vllm-openai-xpu:v0.26.0). That
+      # is the repo default, and pinning it here would silently go stale the next
+      # time context.yaml moves.
       xpu_base_image:
-        description: 'XPU base/runtime image repository used when building'
+        description: 'XPU base/runtime image as repo:tag when building, or DEFAULT to use container/context.yaml'
         required: false
         type: string
-        default: 'public.ecr.aws/q9t5s3a7/vllm-ci-test-repo'
-      xpu_base_image_tag:
-        description: 'XPU base/runtime image tag used when building'
-        required: false
-        type: string
-        default: 'ee0da84ab9e04ac7610e28580af62c365e898389-xpu'
+        default: 'DEFAULT'
 
 # SHARED CONSTANT group — must stay byte-identical to the block in
 # pr-xpu-heterogeneous.yaml. Do NOT add github.workflow or github.ref to this
@@ -107,7 +111,6 @@ jobs:
           echo "xpu_resource_template=${{ inputs.xpu_resource_template }}"
           echo "nvidia_resource_template=${{ inputs.nvidia_resource_template }}"
           echo "xpu_base_image=${{ inputs.xpu_base_image }}"
-          echo "xpu_base_image_tag=${{ inputs.xpu_base_image_tag }}"
 
       - name: Summarize dispatch inputs
         # workflow_dispatch inputs are not recorded anywhere a reader can see
@@ -126,7 +129,6 @@ jobs:
           XPU_RESOURCE_TEMPLATE: ${{ inputs.xpu_resource_template }}
           NVIDIA_RESOURCE_TEMPLATE: ${{ inputs.nvidia_resource_template }}
           XPU_BASE_IMAGE: ${{ inputs.xpu_base_image }}
-          XPU_BASE_IMAGE_TAG: ${{ inputs.xpu_base_image_tag }}
         run: |
           set -uo pipefail
 
@@ -185,7 +187,13 @@ jobs:
               code_row "XPU build checkout commit" \
                 "${INPUT_CHECKOUT_COMMIT:-$GITHUB_SHA}" "(inherited)"
             fi
-            code_row "XPU base image" "${XPU_BASE_IMAGE}:${XPU_BASE_IMAGE_TAG}"
+            # DEFAULT is not an image ref, so show what it MEANS rather than
+            # printing the sentinel back at the reader.
+            if [ "$(printf '%s' "$XPU_BASE_IMAGE" | tr '[:lower:]' '[:upper:]')" = "DEFAULT" ]; then
+              row "XPU base image" "repo default from \`container/context.yaml\`"
+            else
+              code_row "XPU base image" "$XPU_BASE_IMAGE"
+            fi
           fi
 
           # Blank line terminates the table, so anything appended after this
@@ -234,7 +242,6 @@ jobs:
         shell: bash
         env:
           XPU_BASE_IMAGE: ${{ inputs.xpu_base_image }}
-          XPU_BASE_IMAGE_TAG: ${{ inputs.xpu_base_image_tag }}
         run: |
           set -x
 
@@ -242,13 +249,32 @@ jobs:
           SHORT_SHA="$(git rev-parse HEAD | cut -c1-7)"
           IMAGE_TAG="${IMAGE_NAME}:${{ github.run_id }}-${SHORT_SHA}"
 
+          # DEFAULT => pass nothing, so the ARG defaults render.py baked into the
+          # Dockerfile from container/context.yaml apply (vllm: xpu: =>
+          # vllm/vllm-openai-xpu:v0.26.0). Anything else is a "repo:tag" override
+          # fanned out to the same five build args this step has always set.
           BUILD_ARGS=()
-          if [[ -n "$XPU_BASE_IMAGE" && -n "$XPU_BASE_IMAGE_TAG" ]]; then
-            BUILD_ARGS+=(--build-arg "BASE_IMAGE=${XPU_BASE_IMAGE}")
+          if [[ "${XPU_BASE_IMAGE^^}" != "DEFAULT" ]]; then
+            # Split on the LAST colon: a registry host can carry its own port, so
+            # "host:5000/img:tag" must divide into "host:5000/img" + "tag".
+            # ${var%:*} / ${var##*:} rather than a bare ${var%%:*}, which would
+            # cut at the port instead.
+            XPU_BASE_IMAGE_REPO="${XPU_BASE_IMAGE%:*}"
+            XPU_BASE_IMAGE_TAG="${XPU_BASE_IMAGE##*:}"
+
+            # No colon at all, or an empty half: refuse rather than build the
+            # wrong thing. A tagless ref would silently become ":latest", and a
+            # ref like "img:" would produce an unusable empty tag.
+            if [[ "$XPU_BASE_IMAGE" != *:* || -z "$XPU_BASE_IMAGE_REPO" || -z "$XPU_BASE_IMAGE_TAG" ]]; then
+              echo "::error::xpu_base_image must be 'repo:tag' or DEFAULT; got '${XPU_BASE_IMAGE}'"
+              exit 1
+            fi
+
+            BUILD_ARGS+=(--build-arg "BASE_IMAGE=${XPU_BASE_IMAGE_REPO}")
             BUILD_ARGS+=(--build-arg "BASE_IMAGE_TAG=${XPU_BASE_IMAGE_TAG}")
-            BUILD_ARGS+=(--build-arg "RUNTIME_IMAGE=${XPU_BASE_IMAGE}")
+            BUILD_ARGS+=(--build-arg "RUNTIME_IMAGE=${XPU_BASE_IMAGE_REPO}")
             BUILD_ARGS+=(--build-arg "RUNTIME_IMAGE_TAG=${XPU_BASE_IMAGE_TAG}")
-            BUILD_ARGS+=(--build-arg "WHEEL_BUILDER_IMAGE=${XPU_BASE_IMAGE}:${XPU_BASE_IMAGE_TAG}")
+            BUILD_ARGS+=(--build-arg "WHEEL_BUILDER_IMAGE=${XPU_BASE_IMAGE_REPO}:${XPU_BASE_IMAGE_TAG}")
           fi
 
           echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
