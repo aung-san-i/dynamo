@@ -55,6 +55,13 @@ ENV NIXL_PLUGIN_DIR=${NIXL_LIB_DIR}/plugins
 ENV LD_LIBRARY_PATH=${NIXL_LIB_DIR}:${NIXL_PLUGIN_DIR}:/usr/local/ucx/lib:/usr/local/ucx/lib/ucx:${TORCH_LIB_DIR}:${LD_LIBRARY_PATH:-}
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+# --- CI validation marker (PR #23) — remove before merging -------------------
+# Present only to trip the `vllm` path filter (container/templates/vllm_*) so
+# changed-files sets vllm=true and build-xpu renders and builds this template on
+# XPU hardware. Under test: the oneAPI block below, which sets
+# ONEAPI_ROOT=/opt/intel/oneapi — the tree the upstream comment earlier in this
+# file states was removed in vLLM 0.27.1's XPU image.
+# -----------------------------------------------------------------------------
 {% if device == "xpu" %}
 # oneAPI env for XPU detection: the base no longer bakes setvars.sh and Dynamo
 # resets ENTRYPOINT to [], so without these XPU devices are not detected.
