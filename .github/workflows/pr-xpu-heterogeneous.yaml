@@ -202,7 +202,7 @@ jobs:
           #     GPU_TAG="20260727-769ee07"
           # Tag only -- GPU_PATH must keep matching GPU_REPO for the registry API
           # calls below, so do not fold a full image reference in here.
-          GPU_TAG="20260727-769ee07"
+          GPU_TAG="latest"
           # ---------------------------------------------------------------------
 
           GPU_IMAGE="${GPU_REPO}:${GPU_TAG}"
