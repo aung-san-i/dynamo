@@ -1,0 +1,137 @@
+# Keeps this fork's main up to date with the upstream project by opening a PR.
+#
+# Nothing is ever pushed to upstream, and main is never written to directly.
+# The job only points a branch at upstream's tip and opens a PR against main,
+# so conflicts surface as ordinary PR conflicts and can be resolved in the UI.
+#
+# Requires the SYNC_UPSTREAM_PAT repository secret: a PAT carrying
+# Contents: read/write, Workflows: read/write and Pull requests: read/write.
+# The Workflows permission is mandatory, not optional - upstream regularly
+# changes files under .github/workflows/, and the default GITHUB_TOKEN is
+# forbidden from pushing commits that touch them.
+name: Sync fork with upstream
+
+on:
+  schedule:
+    # 06:17 UTC daily. Off-round minute on purpose: GitHub delays cron that
+    # fires exactly on the hour, when everyone else's jobs are queued.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ai-dynamo/dynamo
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: main
+  SYNC_BRANCH_PREFIX: sync/upstream-
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          # Full history: merge-base and rev-list below need it.
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_UPSTREAM_PAT }}
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          # Fully-qualified refspec on both sides: an abbreviated one can
+          # resolve to the wrong ref, or delete the destination.
+          git fetch --no-tags upstream \
+            "refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          git rev-parse --verify "refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+      - name: Check whether upstream has new commits
+        id: check
+        run: |
+          upstream_sha="$(git rev-parse "refs/remotes/upstream/${UPSTREAM_BRANCH}")"
+          echo "upstream_sha=${upstream_sha}" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor \
+               "${upstream_sha}" "refs/remotes/origin/${TARGET_BRANCH}"; then
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            echo "${TARGET_BRANCH} already contains ${upstream_sha}. Nothing to sync." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            behind="$(git rev-list --count \
+              "refs/remotes/origin/${TARGET_BRANCH}..${upstream_sha}")"
+            echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+            echo "behind=${behind}" >> "$GITHUB_OUTPUT"
+            echo "${TARGET_BRANCH} is missing ${behind} upstream commit(s)." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Find an already-open sync PR
+        # Reuse one rather than stacking a new PR every day it goes unmerged.
+        if: steps.check.outputs.needs_sync == 'true'
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_PAT }}
+        run: |
+          branch="$(gh pr list --repo "$GITHUB_REPOSITORY" \
+            --state open --base "$TARGET_BRANCH" --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith(env.SYNC_BRANCH_PREFIX))
+                   | .headRefName] | first // empty')"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+
+      - name: Point the sync branch at upstream's tip
+        if: steps.check.outputs.needs_sync == 'true'
+        id: push
+        run: |
+          branch="${{ steps.existing.outputs.branch }}"
+          if [ -z "${branch}" ]; then
+            branch="${SYNC_BRANCH_PREFIX}$(date -u +%Y%m%d)"
+            echo "Creating ${branch}"
+          else
+            echo "Reusing open sync branch ${branch}"
+          fi
+          # Deliberately not --force. If this would not be a fast-forward,
+          # something unexpected happened upstream and the job should fail.
+          git push origin \
+            "${{ steps.check.outputs.upstream_sha }}:refs/heads/${branch}"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+
+      - name: Open the sync PR
+        if: steps.check.outputs.needs_sync == 'true' && steps.existing.outputs.branch == ''
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_PAT }}
+          SYNC_BRANCH: ${{ steps.push.outputs.branch }}
+          UPSTREAM_SHA: ${{ steps.check.outputs.upstream_sha }}
+          BEHIND: ${{ steps.check.outputs.behind }}
+        run: |
+          cat > "${RUNNER_TEMP}/pr-body.md" <<EOF
+          Automated fork sync from ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}.
+
+          The head branch points at upstream's tip ${UPSTREAM_SHA} verbatim. No merge
+          was performed in CI, so any conflicts with ${TARGET_BRANCH} appear here as
+          ordinary PR conflicts.
+
+          Upstream commits missing from ${TARGET_BRANCH} when this PR opened: ${BEHIND}
+
+          Opened by .github/workflows/sync-upstream.yaml
+          EOF
+          gh pr create --repo "$GITHUB_REPOSITORY" \
+            --base "$TARGET_BRANCH" \
+            --head "$SYNC_BRANCH" \
+            --title "Sync ${TARGET_BRANCH} with ${UPSTREAM_REPO} ($(date -u +%Y-%m-%d))" \
+            --body-file "${RUNNER_TEMP}/pr-body.md"
+
+      - name: Report open sync PRs
+        if: steps.check.outputs.needs_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_PAT }}
+        run: |
+          gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+            --base "$TARGET_BRANCH" --json number,headRefName,url \
+            --jq '.[] | "PR #\(.number)  \(.headRefName)  \(.url)"' \
+            >> "$GITHUB_STEP_SUMMARY"
