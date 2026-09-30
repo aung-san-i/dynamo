@@ -136,6 +136,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number || '' }}
+          # The pull_request payload carries neither .issue.number nor
+          # .issue.pull_request, so the slash-command branch below cannot resolve
+          # a PR number from it. Both of these are empty for every other event.
+          PR_NUMBER_EVENT: ${{ github.event.pull_request.number || '' }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
           PHASE: ${{ inputs.phase }}
           BUILD_NVIDIA_MODE: ${{ inputs.build_nvidia_image }}
         run: |
@@ -242,6 +247,32 @@ jobs:
             BUILD_NVIDIA="$(resolve_nvidia "${PR_FROM_BRANCH}")"
             echo "build_nvidia_image=${BUILD_NVIDIA}" >> "$GITHUB_OUTPUT"
             echo "Push to ${GITHUB_REF_NAME}; running XPU CI at ${GITHUB_SHA}"
+            echo "build_nvidia_image=${BUILD_NVIDIA}"
+            exit 0
+          fi
+
+          # ---- pre-merge, pull_request (the sync PR) -------------------------
+          # Must precede the slash-command branch below, which is the fallthrough
+          # and assumes an issue_comment payload: a pull_request event carries no
+          # .issue.number, so without this branch every PR run would die on
+          # "Could not resolve pull request number" and report red forever.
+          #
+          # No xpu label gate here, matching the push branch above. This path
+          # backs a REQUIRED status check, so it must reach a verdict on its own;
+          # a label a human forgot to apply would otherwise read as a pass. The
+          # label keeps its meaning on the slash-command path below.
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            echo "has_xpu_label=true" >> "$GITHUB_OUTPUT"
+            # The PR head, NOT GITHUB_SHA. On a pull_request event GITHUB_SHA is
+            # GitHub's own refs/pull/N/merge commit, which exists only inside the
+            # run and is never what lands. sync-upstream.yaml already merges the
+            # base into the branch when it creates it (see its "Create the sync
+            # branch" step), so the head commit here IS the commit that merges --
+            # which is the whole point of testing it.
+            echo "checkout_ref=${PR_HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            BUILD_NVIDIA="$(resolve_nvidia "${PR_NUMBER_EVENT}")"
+            echo "build_nvidia_image=${BUILD_NVIDIA}" >> "$GITHUB_OUTPUT"
+            echo "PR #${PR_NUMBER_EVENT}; running XPU CI at ${PR_HEAD_SHA}"
             echo "build_nvidia_image=${BUILD_NVIDIA}"
             exit 0
           fi

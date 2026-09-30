@@ -161,7 +161,7 @@ jobs:
           if [ "${MERGED}" = "true" ]; then
             state_note="${TARGET_BRANCH} was merged into this branch by CI, so it opens already up to date and needs no Update branch click. The head commit is that merge, which is also what the test suite runs against."
           else
-            state_note="CONFLICT: ${TARGET_BRANCH} does not merge cleanly into upstream's tip, so the branch was left at ${UPSTREAM_SHA} un-updated and the test suite was not requested. Resolve the conflict here, then request the suite by commenting /run_xpu_heterogeneous."
+            state_note="CONFLICT: ${TARGET_BRANCH} does not merge cleanly into upstream's tip, so the branch was left at ${UPSTREAM_SHA} un-updated. Resolve the conflict here; that pushes a new head commit, which starts the test suite automatically. No slash command is needed."
           fi
           cat > "${RUNNER_TEMP}/pr-body.md" <<EOF
           Automated fork sync from ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}.
@@ -182,50 +182,36 @@ jobs:
           # gh prints the PR URL; the number is its last path segment.
           echo "pr_number=${pr_url##*/}" >> "$GITHUB_OUTPUT"
 
-      - name: Request the XPU heterogeneous suite on the sync PR
-        # pr-xpu-heterogeneous.yaml has no pull_request trigger, so merely opening
-        # a PR runs nothing. Its push trigger matches only pull-request/<n>
-        # branches, and on push events its core/vllm outputs come from a paths
-        # filter - so upstream commits that miss those paths would skip the
-        # heterogeneous tests entirely and report a green run that tested nothing.
-        #
-        # The issue_comment path forces core and vllm to true, so the full suite
-        # always runs, and it checks out refs/pull/<n>/head, which is upstream's
-        # code. That makes a slash command the only trigger equivalent to the
-        # nightly run.
-        #
-        # Order matters: the label must be applied before the comment, because
-        # that workflow's guard job reads the PR's labels when the comment event
-        # fires and skips everything if the xpu label is absent.
-        #
-        # Runs once per new sync PR, which - now that each sync gets its own
-        # branch - means once per distinct upstream tip. The suite holds a single
-        # global hardware slot shared with ordinary PR CI and two nightly crons,
-        # so if contention becomes a problem, gate this step further rather than
-        # reintroducing branch reuse (see the create step for why reuse failed).
-        #
-        # The create step already merged the base into this branch, so the head
-        # commit the suite runs against IS the commit that will merge. That is the
-        # whole reason the update happens in CI rather than being left to an
-        # "Update branch" click, which would create a new head and orphan these
-        # results - leaving the merged commit untested.
-        #
-        # Skipped when the base did not merge cleanly. Such a PR cannot merge
-        # until the conflict is resolved, so spending an exclusive hardware slot
-        # on it is wasted; request the suite by hand afterwards.
-        if: >-
-          steps.check.outputs.needs_sync == 'true' &&
-          steps.plan.outputs.exists == 'false' &&
-          steps.push.outputs.merged == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_PAT }}
-          PR_NUMBER: ${{ steps.open.outputs.pr_number }}
-        run: |
-          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label xpu
-          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --body "/run_xpu_heterogeneous"
-          echo "Requested the XPU heterogeneous suite on PR #${PR_NUMBER}." \
-            >> "$GITHUB_STEP_SUMMARY"
+      # NO STEP REQUESTS THE XPU HETEROGENEOUS SUITE ANY MORE.
+      #
+      # pr-xpu-heterogeneous.yaml now carries a pull_request trigger scoped to
+      # sync/upstream-* head refs, so opening this PR starts the suite by itself.
+      # The step that used to post /run_xpu_heterogeneous was removed rather than
+      # kept as a second request, because an issue_comment run executes in the
+      # DEFAULT-BRANCH context: its check run is filed against main's tip, not
+      # against this PR's head commit, so it could never satisfy a required status
+      # check on this PR however the job was named. Now that the pull_request path
+      # files a verdict on the right commit, a comment would only queue a SECOND
+      # full pipeline on the single global xpu-heterog-hardware slot to re-derive
+      # a result already in hand.
+      #
+      # Both properties that made a slash command the right choice before are
+      # preserved deliberately:
+      #   - the full suite still always runs. pr-xpu-heterogeneous.yaml passes
+      #     force_all_tests: true for a sync/upstream-* head ref, so no paths
+      #     filter can decide an upstream commit needs no testing.
+      #   - the tested commit is still the commit that merges. The guard job in
+      #     xpu-heterogeneous-run.yml checks out the PR head, and the create step
+      #     above has already merged the base into it.
+      #
+      # The `xpu` label went with that step. It gated only the issue_comment path,
+      # and the pull_request path deliberately ignores it: a required check must
+      # not report a pass because a label was missing. Re-add the label here if it
+      # is wanted for filtering, but nothing reads it on this path.
+      #
+      # The conflict case needs no special handling now. Such a PR opens without a
+      # suite result and cannot merge anyway; resolving the conflict pushes a new
+      # head commit, which fires `synchronize` and runs the suite automatically.
 
       - name: Report open sync PRs
         if: steps.check.outputs.needs_sync == 'true'
