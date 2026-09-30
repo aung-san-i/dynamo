@@ -103,6 +103,7 @@ jobs:
 
       - name: Open the sync PR
         if: steps.check.outputs.needs_sync == 'true' && steps.existing.outputs.branch == ''
+        id: open
         env:
           GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_PAT }}
           SYNC_BRANCH: ${{ steps.push.outputs.branch }}
@@ -120,11 +121,44 @@ jobs:
 
           Opened by .github/workflows/sync-upstream.yaml
           EOF
-          gh pr create --repo "$GITHUB_REPOSITORY" \
+          pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" \
             --base "$TARGET_BRANCH" \
             --head "$SYNC_BRANCH" \
             --title "Sync ${TARGET_BRANCH} with ${UPSTREAM_REPO} ($(date -u +%Y-%m-%d))" \
-            --body-file "${RUNNER_TEMP}/pr-body.md"
+            --body-file "${RUNNER_TEMP}/pr-body.md")"
+          echo "Opened ${pr_url}"
+          # gh prints the PR URL; the number is its last path segment.
+          echo "pr_number=${pr_url##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Request the XPU heterogeneous suite on the sync PR
+        # pr-xpu-heterogeneous.yaml has no pull_request trigger, so merely opening
+        # a PR runs nothing. Its push trigger matches only pull-request/<n>
+        # branches, and on push events its core/vllm outputs come from a paths
+        # filter - so upstream commits that miss those paths would skip the
+        # heterogeneous tests entirely and report a green run that tested nothing.
+        #
+        # The issue_comment path forces core and vllm to true, so the full suite
+        # always runs, and it checks out refs/pull/<n>/head, which is upstream's
+        # code. That makes a slash command the only trigger equivalent to the
+        # nightly run.
+        #
+        # Order matters: the label must be applied before the comment, because
+        # that workflow's guard job reads the PR's labels when the comment event
+        # fires and skips everything if the xpu label is absent.
+        #
+        # Only on a newly created PR, deliberately. The suite holds a single
+        # global hardware slot, so firing it on every daily fast-forward of a
+        # long-lived sync PR would starve ordinary PR CI.
+        if: steps.check.outputs.needs_sync == 'true' && steps.existing.outputs.branch == ''
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_PAT }}
+          PR_NUMBER: ${{ steps.open.outputs.pr_number }}
+        run: |
+          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label xpu
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "/run_xpu_heterogeneous"
+          echo "Requested the XPU heterogeneous suite on PR #${PR_NUMBER}." \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report open sync PRs
         if: steps.check.outputs.needs_sync == 'true'
