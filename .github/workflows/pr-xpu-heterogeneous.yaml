@@ -40,6 +40,18 @@ on:
   push:
     branches:
       - "pull-request/[0-9]+"
+  # Fires on every PR into main so `xpu-status-check` REPORTS on every PR: a
+  # required context that never reports blocks its PR forever. The `run` job
+  # below then narrows what actually EXECUTES to sync/upstream-* branches, and
+  # xpu-status-check counts the resulting `skipped` as a pass -- so every other
+  # PR gets a green context without touching the XPU hardware.
+  #
+  # This is the only trigger here whose check attaches to the PR's OWN head
+  # commit. An issue_comment run executes in the default-branch context, so its
+  # result is filed against main's tip and can never satisfy a rule on the PR,
+  # however the job is named.
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -112,11 +124,31 @@ jobs:
   # the `guard` job it used to sit on.
   #
   # The push path needs no gate: only copy-pr-bot writes pull-request/N.
+  #
+  # The pull_request path is restricted to the branches sync-upstream.yaml
+  # creates (its SYNC_BRANCH_PREFIX is `sync/upstream-`). Both clauses are
+  # load-bearing:
+  #   head.repo.full_name == github.repository -- github.head_ref is the branch
+  #     name in the HEAD repo, so without this a fork PR could name its branch
+  #     sync/upstream-anything and aim this self-hosted hardware, this internal
+  #     registry and this cluster at code nobody reviewed.
+  #   startsWith(github.head_ref, 'sync/upstream-') -- every other PR skips this
+  #     job, and xpu-status-check reports that skip as a pass. That is what makes
+  #     the required context universal while the pipeline stays sync-only.
+  #
+  # Spelled out per event rather than the previous
+  # `github.event_name != 'issue_comment'`: that negation admitted any trigger
+  # added to `on:` later by default, which is how an unreviewed event reaches the
+  # cluster without anyone editing this condition.
   run:
     name: XPU Heterogeneous
     if: >-
-      github.event_name != 'issue_comment' ||
-      (github.event.issue.pull_request &&
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.head_ref, 'sync/upstream-')) ||
+      github.event_name == 'push' ||
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
       (startsWith(github.event.comment.body, '/run_xpu_heterogeneous') ||
       startsWith(github.event.comment.body, '/run_xpu_heterog')) &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
@@ -128,7 +160,14 @@ jobs:
       #   github.event_name == 'schedule' || github.event_name == 'issue_comment'
       # expression for this file's remaining triggers: a slash command runs
       # everything, a copy-pr-bot push stays diff-gated by changed-files.
-      force_all_tests: ${{ github.event_name == 'issue_comment' }}
+      #
+      # A sync PR forces everything on for the same reason sync-upstream.yaml
+      # originally reached for a slash command: upstream commits that touch
+      # neither the core nor the vllm paths would otherwise skip the
+      # heterogeneous tests and report a green run that tested nothing. A sync
+      # PR carries whatever upstream changed, so no paths filter can decide on
+      # its behalf that it does not need testing.
+      force_all_tests: ${{ github.event_name == 'issue_comment' || startsWith(github.head_ref, 'sync/upstream-') }}
       # Opt-in per PR via the build_nvidia_image label; absent => the pinned
       # nvcr.io image. Only pre-merge may pass 'pr-label' -- there is no PR to
       # read on the other two callers, and the reusable workflow rejects it.
