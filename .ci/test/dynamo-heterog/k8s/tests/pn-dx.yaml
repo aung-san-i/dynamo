@@ -235,6 +235,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # (the operator injects ENABLE=n) -- but with an empty EXPORTER: its
+            # prometheus is a plugin neither image builds, and loading it throws.
+            - name: NIXL_TELEMETRY_ENABLE
+              value: "y"
+            - name: NIXL_TELEMETRY_EXPORTER
+              value: ""
             - name: PYTHONHASHSEED
               value: "0"
             - name: UCX_TLS
