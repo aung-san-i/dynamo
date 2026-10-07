@@ -140,6 +140,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # (the operator injects ENABLE=n) -- but with an empty EXPORTER: its
+            # prometheus is a plugin neither image builds, and loading it throws.
+            - name: NIXL_TELEMETRY_ENABLE
+              value: "y"
+            - name: NIXL_TELEMETRY_EXPORTER
+              value: ""
             - name: PYTHONHASHSEED
               value: "0"
             - name: UCX_TLS
@@ -159,7 +165,7 @@ spec:
             - name: VLLM_LOGGING_LEVEL
               value: "INFO"
             - name: VLLM_KV_CACHE_LAYOUT
-              value: "NHD"
+              value: "HND"
           resources:
             claims:
               - name: intel-gpu-rdma-resource
@@ -236,6 +242,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # (the operator injects ENABLE=n) -- but with an empty EXPORTER: its
+            # prometheus is a plugin neither image builds, and loading it throws.
+            - name: NIXL_TELEMETRY_ENABLE
+              value: "y"
+            - name: NIXL_TELEMETRY_EXPORTER
+              value: ""
             - name: UCX_TLS
               value: "ib,rc,ud,rc_verbs,ud_verbs,cuda_copy"
             - name: UCX_IB_ROCE_REACHABILITY_MODE
@@ -253,7 +265,7 @@ spec:
             - name: VLLM_LOGGING_LEVEL
               value: "INFO"
             - name: VLLM_KV_CACHE_LAYOUT
-              value: "NHD"
+              value: "HND"
           resources:
             claims:
               - name: gpu-rdma-resource
