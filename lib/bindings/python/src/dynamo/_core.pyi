@@ -1823,7 +1823,7 @@ class KvRouterConfig:
         use_remote_indexer: bool = False,
         serve_indexer: bool = False,
         enable_session_prefix_index: bool = False,
-        shared_cache_multiplier: float = 0.0,
+        shared_cache_multiplier: Optional[float] = None,
         shared_cache_type: str = "none",
         router_predicted_ttl_secs: Optional[float] = None,
         conditional_disagg_enabled: bool = False,
@@ -1901,7 +1901,7 @@ class KvRouterConfig:
                 Lineage is fed from two sources: routing-lookup matches, and stored-block KV events that carry a session ID. Stored blocks without a session ID do not update lineage.
                 The index neither holds nor restores KV cache, so a match is a routing hint rather than a guarantee that the blocks are still resident.
                 The index retains at most 16,384 least-recently-used sessions and opportunistically reclaims unreferenced logical leaves.
-            shared_cache_multiplier: Credit multiplier for shared cache hits beyond the device prefix (default: 0.0).
+            shared_cache_multiplier: Deprecated; set this in the default policy parameters. Omitted values use the policy default (0.5 when shared cache is enabled).
             shared_cache_type: External shared KV cache type, "none" or "hicache" (default: "none").
             conditional_disagg_enabled: Enable conditional-disagg bypass from prefill to decode (default: False).
             conditional_disagg_policy: Conditional-disagg policy, one of "isl_bounding", "prefill_load", or "isl_or_load" (default: "isl_bounding").
@@ -2022,6 +2022,8 @@ class MockEngineArgs:
         trtllm: Optional[TrtllmArgs] = None,
         max_model_len: Optional[int] = None,
         ais_perf_config: Optional[Mapping[str, Any]] = None,
+        kv_cache_bytes_per_token: Optional[int] = None,
+        native_host_offload: Optional[Mapping[str, Any]] = None,
     ) -> None:
         ...
 
@@ -2072,6 +2074,16 @@ class MockEngineArgs:
 
     @property
     def engine_type(self) -> str: ...
+
+    @property
+    def kv_cache_bytes_per_token(self) -> Optional[int]:
+        """KV-cache bytes per token for G2 host blocks; defaults to kv_bytes_per_token."""
+        ...
+
+    @property
+    def native_host_offload(self) -> Optional[Dict[str, Any]]:
+        """AISimulate native G2 host-offload config (vLLM), or None when disabled."""
+        ...
 
     @property
     def response_replay_trace_path(self) -> Optional[os.PathLike[str]]: ...
@@ -2214,6 +2226,7 @@ async def register_model(
     ignore_weights: bool = False,
     max_gpu_lora_count: Optional[int] = None,
     model_aliases: Optional[List[str]] = None,
+    skip_model_assets: bool = False,
 ) -> None:
     """
     Attach the model at path to the given endpoint, and advertise it as model_type.
@@ -2223,9 +2236,15 @@ async def register_model(
         - `lora_name`: The served model name for the LoRA model
         - `base_model_path`: Path to the base model that the LoRA extends
 
-    For TensorBased models (using ModelInput.Tensor), HuggingFace downloads are skipped
-    and a minimal model card is registered directly. Use model_path as the display name
-    for these models. Pass tensor protocol metadata through `tensor_model_config`.
+    For TensorBased, Images, Videos, and Realtime models, Hugging Face
+    downloads are skipped and a minimal model card is registered directly. Their
+    model_path may be an external service identifier. Pass tensor protocol metadata
+    through `tensor_model_config` for TensorBased models.
+
+    External adapters that do not need model assets can pass `skip_model_assets=True`
+    to register a minimal card without fetching or loading weights, configuration,
+    or tokenizer files. Audio models retain their metadata by default; external
+    audio adapters must explicitly opt in. Audio aliases are preserved in both paths.
 
     Model serving readiness:
         `worker_type` and `needs` describe the worker's processing stage and
@@ -2530,14 +2549,20 @@ def run_mocker_trace_replay(
     capture_planner_details: bool = True,
     scaling_policy: Optional[Any] = None,
     agentic_lanes: Optional[int] = None,
+    execution_model: Optional[str] = None,
+    weka_nested_timestamp_basis: Optional[Literal["auto", "absolute", "relative"]] = None,
     capture_telemetry: bool = False,
     telemetry_sample_interval_ms: float = 1_000.0,
     telemetry_callback: Optional[ReplayTelemetryCallback] = None,
     telemetry_jsonl_path: Optional[str | os.PathLike[str]] = None,
+    kv_event_lag_ms: Optional[float] = None,
 ) -> _OfflineReplayResult | Dict[str, Any]:
     """Replay mocker trace files and return the simulation report.
 
     Supports aggregated or disaggregated engine configurations.
+
+    ``weka_nested_timestamp_basis`` applies only to Weka traces. Omission uses
+    AISimulate's automatic selection; explicit absolute or relative overrides it.
 
     Offline replay returns an internal native result consumed by
     ``dynamo.replay``; online replay retains the summary dictionary.
@@ -2566,6 +2591,12 @@ def run_mocker_trace_replay(
     ``wall_time_ms``; time the outer call for end-to-end persistence overhead.
     The JSONL target is opened on the first sample; after a write failure,
     completed prior lines remain and the failing final line may be partial.
+
+    ``kv_event_lag_ms`` delays the KV cache events (blocks stored and removed)
+    the router's indexer observes by that much simulated time. Prefill and
+    request completions stay immediate, as a live router observes them in-band
+    on the response path. ``None`` or ``0`` keeps synchronous updates. Offline
+    KV-router replay only.
     """
     ...
 
@@ -2624,6 +2655,7 @@ def run_mocker_synthetic_trace_replay(
     telemetry_sample_interval_ms: float = 1_000.0,
     telemetry_callback: Optional[ReplayTelemetryCallback] = None,
     telemetry_jsonl_path: Optional[str | os.PathLike[str]] = None,
+    kv_event_lag_ms: Optional[float] = None,
 ) -> _OfflineReplayResult | Dict[str, Any]:
     """Replay a synthetic mocker workload without requiring a trace file.
 
@@ -3129,8 +3161,7 @@ class KvRouter:
 
         Args:
             token_ids: List of token IDs to evaluate.
-            router_config_override: Optional router configuration override for
-                                   score-credit fields.
+            router_config_override: Deprecated and ignored; this query returns raw cache hits.
             block_mm_infos: Optional block-level multimodal metadata aligned to
                            request blocks.
             lora_name: Optional LoRA adapter name for adapter-aware matching.

@@ -9,11 +9,13 @@ use std::sync::Arc;
 use dynamo_mocker::common::perf_model::PerfModel;
 use dynamo_mocker::common::protocols::{
     DirectRequest, EngineType as RsMockerEngineType, MockEngineArgs as RsMockEngineArgs,
-    PreemptionMode as RsPreemptionMode, ReasoningConfig as RsReasoningConfig,
-    SglangArgs as RsSglangArgs, TrtllmArgs as RsTrtllmArgs, WorkerType as RsWorkerType,
+    NativeHostOffloadConfig, PreemptionMode as RsPreemptionMode,
+    ReasoningConfig as RsReasoningConfig, SglangArgs as RsSglangArgs, TrtllmArgs as RsTrtllmArgs,
+    WorkerType as RsWorkerType,
 };
 use dynamo_mocker::loadgen::{
     ArrivalSpec, DelaySpec, DynamoRequestTrace, LengthSpec, SyntheticTraceSpec, Trace as RsTrace,
+    TraceFileFormat, WekaImportOptions, WekaNestedTimestampBasis, WekaResolvedTimestampBasis,
 };
 use dynamo_mocker::replay::{
     ReplayArgsMode, ReplayRuntimeObservers, ReplayScalingDecision, ReplayScalingPolicy,
@@ -50,6 +52,7 @@ struct OfflineReplayTelemetry {
 #[derive(Debug)]
 pub struct OfflineReplayResult {
     report: dynamo_mocker::replay::TraceSimulationReport,
+    weka_nested_timestamp_basis: Option<WekaResolvedTimestampBasis>,
     lifecycle_operations: Vec<dynamo_mocker::replay::LifecycleOperation>,
     capture_per_request: bool,
     coverage: OfflineReplayCoverage,
@@ -62,6 +65,7 @@ impl OfflineReplayResult {
         capture_per_request: bool,
         capture_planner_details: bool,
         runtime_evidence: dynamo_mocker::replay::OfflineRuntimeEvidence,
+        weka_nested_timestamp_basis: Option<WekaResolvedTimestampBasis>,
         telemetry: Option<OfflineReplayTelemetry>,
     ) -> Self {
         let dynamo_mocker::replay::OfflineRuntimeEvidence {
@@ -75,6 +79,7 @@ impl OfflineReplayResult {
         };
         Self {
             report,
+            weka_nested_timestamp_basis,
             lifecycle_operations,
             capture_per_request,
             coverage,
@@ -87,9 +92,7 @@ impl OfflineReplayResult {
 impl OfflineReplayResult {
     #[getter]
     fn summary(&self, py: Python<'_>) -> PyResult<PyObject> {
-        pythonize(py, &self.report)
-            .map(Bound::unbind)
-            .map_err(to_pyerr)
+        replay_summary_to_python(py, &self.report, self.weka_nested_timestamp_basis)
     }
 
     #[getter]
@@ -127,6 +130,21 @@ impl OfflineReplayResult {
     }
 }
 
+fn replay_summary_to_python(
+    py: Python<'_>,
+    report: &dynamo_mocker::replay::TraceSimulationReport,
+    weka_nested_timestamp_basis: Option<WekaResolvedTimestampBasis>,
+) -> PyResult<PyObject> {
+    let summary = pythonize(py, report).map_err(to_pyerr)?;
+    if let Some(basis) = weka_nested_timestamp_basis {
+        summary.set_item(
+            "weka_nested_timestamp_basis",
+            pythonize(py, &basis).map_err(to_pyerr)?,
+        )?;
+    }
+    Ok(summary.unbind())
+}
+
 fn parse_mocker_engine_type(engine_type: &str) -> PyResult<RsMockerEngineType> {
     match engine_type {
         "vllm" => Ok(RsMockerEngineType::Vllm),
@@ -157,6 +175,18 @@ fn parse_preemption_mode(preemption_mode: &str) -> PyResult<RsPreemptionMode> {
             "preemption_mode must be either 'lifo' or 'fifo', got '{other}'"
         ))),
     }
+}
+
+fn parse_native_host_offload(
+    config: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<NativeHostOffloadConfig>> {
+    config
+        .map(|config| {
+            pythonize::depythonize(config).map_err(|error| {
+                PyValueError::new_err(format!("invalid native_host_offload: {error}"))
+            })
+        })
+        .transpose()
 }
 
 #[pyclass]
@@ -268,7 +298,7 @@ impl MockEngineArgs {
 #[pymethods]
 impl MockEngineArgs {
     #[new]
-    #[pyo3(signature = (engine_type="vllm", num_gpu_blocks=None, block_size=0, max_num_seqs=Some(256), max_num_batched_tokens=Some(8192), enable_prefix_caching=true, enable_chunked_prefill=true, speedup_ratio=1.0, decode_speedup_ratio=1.0, dp_size=1, startup_time=None, worker_type="aggregated", planner_profile_data=None, ais_nextn=None, ais_nextn_accept_rates=None, ais_mtp_seed=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_local_indexer=false, bootstrap_port=None, handoff_session_timeout_ms=300000, kv_bytes_per_token=None, kv_transfer_bandwidth=None, kv_transfer_timing_mode="full_prompt", reasoning=None, response_replay_trace_path=None, zmq_kv_events_port=None, zmq_replay_port=None, preemption_mode="lifo", router_queue_policy=None, sglang=None, trtllm=None, max_model_len=None, ais_perf_config=None))]
+    #[pyo3(signature = (engine_type="vllm", num_gpu_blocks=None, block_size=0, max_num_seqs=Some(256), max_num_batched_tokens=Some(8192), enable_prefix_caching=true, enable_chunked_prefill=true, speedup_ratio=1.0, decode_speedup_ratio=1.0, dp_size=1, startup_time=None, worker_type="aggregated", planner_profile_data=None, ais_nextn=None, ais_nextn_accept_rates=None, ais_mtp_seed=None, gpu_memory_utilization=None, mem_fraction_static=None, free_gpu_memory_fraction=None, enable_local_indexer=false, bootstrap_port=None, handoff_session_timeout_ms=300000, kv_bytes_per_token=None, kv_transfer_bandwidth=None, kv_transfer_timing_mode="full_prompt", reasoning=None, response_replay_trace_path=None, zmq_kv_events_port=None, zmq_replay_port=None, preemption_mode="lifo", router_queue_policy=None, sglang=None, trtllm=None, max_model_len=None, ais_perf_config=None, kv_cache_bytes_per_token=None, native_host_offload=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -307,6 +337,8 @@ impl MockEngineArgs {
         trtllm: Option<TrtllmArgs>,
         max_model_len: Option<usize>,
         ais_perf_config: Option<&Bound<'_, PyAny>>,
+        kv_cache_bytes_per_token: Option<usize>,
+        native_host_offload: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let engine_type = parse_mocker_engine_type(engine_type)?;
         let worker_type = parse_worker_type(worker_type)?;
@@ -351,6 +383,8 @@ impl MockEngineArgs {
             .bootstrap_port(bootstrap_port)
             .handoff_session_timeout_ms(handoff_session_timeout_ms)
             .kv_bytes_per_token(kv_bytes_per_token)
+            .kv_cache_bytes_per_token(kv_cache_bytes_per_token)
+            .native_host_offload(parse_native_host_offload(native_host_offload)?)
             .kv_transfer_bandwidth(kv_transfer_bandwidth)
             .kv_transfer_timing_mode(kv_transfer_timing_mode)
             .reasoning(reasoning.map(|config| config.inner()))
@@ -501,6 +535,16 @@ impl MockEngineArgs {
     #[getter]
     fn kv_bytes_per_token(&self) -> Option<usize> {
         self.inner.kv_bytes_per_token
+    }
+
+    #[getter]
+    fn kv_cache_bytes_per_token(&self) -> Option<usize> {
+        self.inner.kv_cache_bytes_per_token
+    }
+
+    #[getter]
+    fn native_host_offload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        pythonize(py, &self.inner.native_host_offload).map_err(to_pyerr)
     }
 
     #[getter]
@@ -748,6 +792,31 @@ impl MockEngineArgs {
     }
 }
 
+/// KV event lag is an offline KV-router replay knob; `None` means synchronous updates.
+fn validate_kv_event_lag_ms(
+    lag_ms: Option<f64>,
+    replay_mode: &str,
+    router_mode: &str,
+) -> PyResult<f64> {
+    let lag_ms = lag_ms.unwrap_or(0.0);
+    if !lag_ms.is_finite() || lag_ms < 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "kv_event_lag_ms must be finite and non-negative, got {lag_ms}"
+        )));
+    }
+    if lag_ms > 0.0 && replay_mode != "offline" {
+        return Err(PyValueError::new_err(
+            "kv_event_lag_ms only supports replay_mode='offline'",
+        ));
+    }
+    if lag_ms > 0.0 && router_mode != "kv_router" {
+        return Err(PyValueError::new_err(
+            "kv_event_lag_ms only supports router_mode='kv_router'",
+        ));
+    }
+    Ok(lag_ms)
+}
+
 fn replay_canonical_path(path: &Path) -> Option<PathBuf> {
     path.canonicalize().ok().or_else(|| {
         let file_name = path.file_name()?;
@@ -793,7 +862,7 @@ fn replay_paths_equal(left: &Path, right: &Path) -> bool {
 }
 
 #[pyfunction]
-#[pyo3(signature = (trace_files, extra_engine_args=None, prefill_engine_args=None, decode_engine_args=None, router_config=None, ais_perf_config=None, num_workers=1, num_prefill_workers=1, num_decode_workers=1, replay_concurrency=None, replay_mode="offline", router_mode="round_robin", arrival_speedup_ratio=1.0, trace_block_size=None, trace_format="mooncake", trace_shared_prefix_ratio=0.0, trace_num_prefix_groups=0, report_jsonl_path=None, max_sim_time_ms=None, model_name=None, sla_ttft_ms=None, sla_itl_ms=None, sla_e2e_ms=None, capture_per_request=false, capture_planner_details=true, scaling_policy=None, agentic_lanes=None, capture_telemetry=false, telemetry_sample_interval_ms=1_000.0, telemetry_callback=None, telemetry_jsonl_path=None))]
+#[pyo3(signature = (trace_files, extra_engine_args=None, prefill_engine_args=None, decode_engine_args=None, router_config=None, ais_perf_config=None, num_workers=1, num_prefill_workers=1, num_decode_workers=1, replay_concurrency=None, replay_mode="offline", router_mode="round_robin", arrival_speedup_ratio=1.0, trace_block_size=None, trace_format="mooncake", trace_shared_prefix_ratio=0.0, trace_num_prefix_groups=0, report_jsonl_path=None, max_sim_time_ms=None, model_name=None, sla_ttft_ms=None, sla_itl_ms=None, sla_e2e_ms=None, capture_per_request=false, capture_planner_details=true, scaling_policy=None, agentic_lanes=None, execution_model=None, weka_nested_timestamp_basis=None, capture_telemetry=false, telemetry_sample_interval_ms=1_000.0, telemetry_callback=None, telemetry_jsonl_path=None, kv_event_lag_ms=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn run_mocker_trace_replay(
     py: Python<'_>,
@@ -824,11 +893,15 @@ pub fn run_mocker_trace_replay(
     capture_planner_details: bool,
     scaling_policy: Option<Py<PyAny>>,
     agentic_lanes: Option<isize>,
+    execution_model: Option<String>,
+    weka_nested_timestamp_basis: Option<&str>,
     capture_telemetry: bool,
     telemetry_sample_interval_ms: f64,
     telemetry_callback: Option<Py<PyAny>>,
     telemetry_jsonl_path: Option<PathBuf>,
+    kv_event_lag_ms: Option<f64>,
 ) -> PyResult<PyObject> {
+    let kv_event_lag_ms = validate_kv_event_lag_ms(kv_event_lag_ms, replay_mode, router_mode)?;
     if telemetry_jsonl_path.as_deref().is_some_and(|path| {
         report_jsonl_path
             .as_deref()
@@ -861,6 +934,25 @@ pub fn run_mocker_trace_replay(
     )?;
     let router_mode = parse_replay_router_mode(router_mode)?;
     let trace_format = parse_trace_file_format(trace_format)?;
+    let weka_options =
+        parse_weka_import_options(trace_format, weka_nested_timestamp_basis).map_err(to_pyerr)?;
+    let execution_model = match execution_model {
+        Some(model) if model.trim().is_empty() => {
+            return Err(PyValueError::new_err("execution_model must be non-empty"));
+        }
+        Some(model) => Some(model.trim().to_string()),
+        None => None,
+    };
+    if matches!(
+        trace_format,
+        dynamo_mocker::loadgen::TraceFileFormat::AgenticMooncake
+            | dynamo_mocker::loadgen::TraceFileFormat::Weka
+    ) && execution_model.is_none()
+    {
+        return Err(PyValueError::new_err(
+            "agentic execution requires a configured target model",
+        ));
+    }
     dynamo_mocker::loadgen::validate_trace_files(trace_format, &trace_files).map_err(to_pyerr)?;
     let prefill_load_estimator = load_replay_prefill_load_estimator(
         py,
@@ -943,9 +1035,26 @@ pub fn run_mocker_trace_replay(
                 "agentic_lanes requires trace_format='agentic_mooncake', 'weka', or 'dynamo'"
             );
         }
-        if trace_format == dynamo_mocker::loadgen::TraceFileFormat::Dynamo {
-            let trace =
-                DynamoRequestTrace::from_request_trace_files(&trace_files, trace_block_size)?;
+        if matches!(
+            trace_format,
+            TraceFileFormat::Dynamo | TraceFileFormat::Weka
+        ) {
+            let (trace, resolved_basis) = if trace_format == TraceFileFormat::Weka {
+                let (graph, basis) = dynamo_mocker::loadgen::load_weka_agentic_graph_with_options(
+                    &trace_files[0],
+                    trace_block_size,
+                    weka_options,
+                )?;
+                (DynamoRequestTrace::Agentic(graph), Some(basis))
+            } else {
+                (
+                    DynamoRequestTrace::from_request_trace_files(&trace_files, trace_block_size)?,
+                    None,
+                )
+            };
+            if matches!(&trace, DynamoRequestTrace::Agentic(_)) && execution_model.is_none() {
+                anyhow::bail!("agentic execution requires a configured target model");
+            }
             return run_loaded_dynamo_request_trace(
                 args_selection,
                 trace,
@@ -962,7 +1071,8 @@ pub fn run_mocker_trace_replay(
                 sla,
                 scaling_policy,
                 telemetry,
-            );
+            )
+            .map(|report| (report, resolved_basis));
         }
 
         let trace_block_size = trace_block_size.unwrap_or(512);
@@ -1088,20 +1198,27 @@ pub fn run_mocker_trace_replay(
                 )
             }
         }
+        .map(|report| (report, None))
     };
     let report_result = if let Some(callback) = scaling_policy {
-        run(
-            Some(Box::new(PyReplayScalingPolicy {
-                callback,
-                capture_lifecycle_evidence: capture_planner_details,
-                callback_error: scaling_callback_error
-                    .clone()
-                    .expect("scaling error slot exists with callback"),
-            })),
-            telemetry,
-        )
+        dynamo_mocker::replay::with_kv_event_lag_ms(kv_event_lag_ms, || {
+            run(
+                Some(Box::new(PyReplayScalingPolicy {
+                    callback,
+                    capture_lifecycle_evidence: capture_planner_details,
+                    callback_error: scaling_callback_error
+                        .clone()
+                        .expect("scaling error slot exists with callback"),
+                })),
+                telemetry,
+            )
+        })
+        .and_then(|result| result)
     } else {
-        py.allow_threads(move || run(None, telemetry))
+        py.allow_threads(move || {
+            dynamo_mocker::replay::with_kv_event_lag_ms(kv_event_lag_ms, || run(None, telemetry))
+                .and_then(|result| result)
+        })
     };
     // Always finish the sink so buffered I/O errors are observed even when the
     // replay failed. Preserve the replay/callback error as the primary error.
@@ -1110,7 +1227,7 @@ pub fn run_mocker_trace_replay(
         telemetry_writer,
         telemetry_sample_interval_ms,
     );
-    let report = report_result.map_err(|error| {
+    let (report, resolved_weka_basis) = report_result.map_err(|error| {
         replay_run_err_to_pyerr(
             error,
             scaling_callback_error.as_ref(),
@@ -1134,12 +1251,13 @@ pub fn run_mocker_trace_replay(
                 record_per_request,
                 capture_planner_details,
                 runtime_evidence,
+                resolved_weka_basis,
                 telemetry,
             ),
         )
         .map(Py::into_any);
     }
-    pythonize(py, &report).map(Bound::unbind).map_err(to_pyerr)
+    replay_summary_to_python(py, &report, resolved_weka_basis)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1254,10 +1372,8 @@ fn run_loaded_dynamo_request_trace(
             }
         }
         DynamoRequestTrace::Agentic(trace) => {
-            anyhow::ensure!(
-                scaling_policy.is_none(),
-                "scaling_policy replay does not support agentic Dynamo request traces"
-            );
+            // TODO(aisimulate): cap requests admitted by agentic Workload inputs;
+            // max_in_flight currently does not constrain this admission source.
             if replay_concurrency.is_some() {
                 anyhow::bail!(
                     "agentic Dynamo request traces are not supported with replay_concurrency"
@@ -1267,7 +1383,7 @@ fn run_loaded_dynamo_request_trace(
                 .normalize_starts()
                 .speed_up_timing(arrival_speedup_ratio)?;
             match (args_selection, replay_mode) {
-                (ReplayArgsSelection::Aggregated(args), "offline") => dynamo_mocker::replay::simulate_agentic_trace_workload_with_router_mode_and_telemetry(
+                (ReplayArgsSelection::Aggregated(args), "offline") => dynamo_mocker::replay::simulate_agentic_trace_workload_with_router_mode_and_runtime_observers(
                     *args,
                     router_config,
                     prefill_load_estimator,
@@ -1278,7 +1394,7 @@ fn run_loaded_dynamo_request_trace(
                     max_sim_time_ms,
                     agentic_lanes,
                     sla,
-                    telemetry,
+                    take_runtime_observers(&mut scaling_policy, &mut telemetry),
                 ),
                 (ReplayArgsSelection::Aggregated(args), "online") => dynamo_mocker::replay::simulate_agentic_trace_live_workload_with_router_mode_and_options(
                     *args,
@@ -1291,7 +1407,7 @@ fn run_loaded_dynamo_request_trace(
                     agentic_lanes,
                     sla,
                 ),
-                (ReplayArgsSelection::Disagg(config), "offline") => dynamo_mocker::replay::simulate_agentic_trace_workload_disagg_with_router_mode_and_telemetry(
+                (ReplayArgsSelection::Disagg(config), "offline") => dynamo_mocker::replay::simulate_agentic_trace_workload_disagg_with_router_mode_and_runtime_observers(
                     *config,
                     router_config,
                     prefill_load_estimator,
@@ -1301,7 +1417,7 @@ fn run_loaded_dynamo_request_trace(
                     max_sim_time_ms,
                     agentic_lanes,
                     sla,
-                    telemetry,
+                    take_runtime_observers(&mut scaling_policy, &mut telemetry),
                 ),
                 (ReplayArgsSelection::Disagg(_), "online") => anyhow::bail!(
                     "online P/D agentic replay is not supported"
@@ -1340,7 +1456,7 @@ fn write_per_request_jsonl(
 }
 
 #[pyfunction]
-#[pyo3(signature = (input_tokens, output_tokens, request_count, extra_engine_args=None, prefill_engine_args=None, decode_engine_args=None, router_config=None, ais_perf_config=None, num_workers=1, num_prefill_workers=1, num_decode_workers=1, replay_concurrency=None, replay_mode="offline", router_mode="round_robin", arrival_speedup_ratio=1.0, request_rate=None, arrival_interval_ms=None, arrival_seed=42, turns_per_session=1, shared_prefix_ratio=0.0, num_prefix_groups=0, inter_turn_delay_ms=0.0, model_name=None, sla_ttft_ms=None, sla_itl_ms=None, sla_e2e_ms=None, capture_per_request=false, capture_planner_details=true, scaling_policy=None, capture_telemetry=false, telemetry_sample_interval_ms=1_000.0, telemetry_callback=None, telemetry_jsonl_path=None))]
+#[pyo3(signature = (input_tokens, output_tokens, request_count, extra_engine_args=None, prefill_engine_args=None, decode_engine_args=None, router_config=None, ais_perf_config=None, num_workers=1, num_prefill_workers=1, num_decode_workers=1, replay_concurrency=None, replay_mode="offline", router_mode="round_robin", arrival_speedup_ratio=1.0, request_rate=None, arrival_interval_ms=None, arrival_seed=42, turns_per_session=1, shared_prefix_ratio=0.0, num_prefix_groups=0, inter_turn_delay_ms=0.0, model_name=None, sla_ttft_ms=None, sla_itl_ms=None, sla_e2e_ms=None, capture_per_request=false, capture_planner_details=true, scaling_policy=None, capture_telemetry=false, telemetry_sample_interval_ms=1_000.0, telemetry_callback=None, telemetry_jsonl_path=None, kv_event_lag_ms=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn run_mocker_synthetic_trace_replay(
     py: Python<'_>,
@@ -1377,7 +1493,9 @@ pub fn run_mocker_synthetic_trace_replay(
     telemetry_sample_interval_ms: f64,
     telemetry_callback: Option<Py<PyAny>>,
     telemetry_jsonl_path: Option<PathBuf>,
+    kv_event_lag_ms: Option<f64>,
 ) -> PyResult<PyObject> {
+    let kv_event_lag_ms = validate_kv_event_lag_ms(kv_event_lag_ms, replay_mode, router_mode)?;
     if capture_per_request && replay_mode != "offline" {
         return Err(PyValueError::new_err(
             "capture_per_request only supports replay_mode='offline'",
@@ -1682,18 +1800,24 @@ pub fn run_mocker_synthetic_trace_replay(
         }
     };
     let report_result = if let Some(callback) = scaling_policy {
-        run(
-            Some(Box::new(PyReplayScalingPolicy {
-                callback,
-                capture_lifecycle_evidence: capture_planner_details,
-                callback_error: scaling_callback_error
-                    .clone()
-                    .expect("scaling error slot exists with callback"),
-            })),
-            telemetry,
-        )
+        dynamo_mocker::replay::with_kv_event_lag_ms(kv_event_lag_ms, || {
+            run(
+                Some(Box::new(PyReplayScalingPolicy {
+                    callback,
+                    capture_lifecycle_evidence: capture_planner_details,
+                    callback_error: scaling_callback_error
+                        .clone()
+                        .expect("scaling error slot exists with callback"),
+                })),
+                telemetry,
+            )
+        })
+        .and_then(|result| result)
     } else {
-        py.allow_threads(move || run(None, telemetry))
+        py.allow_threads(move || {
+            dynamo_mocker::replay::with_kv_event_lag_ms(kv_event_lag_ms, || run(None, telemetry))
+                .and_then(|result| result)
+        })
     };
     // Always finish the sink so buffered I/O errors are observed even when the
     // replay failed. Preserve the replay/callback error as the primary error.
@@ -1719,6 +1843,7 @@ pub fn run_mocker_synthetic_trace_replay(
                 record_per_request,
                 capture_planner_details,
                 runtime_evidence,
+                None,
                 telemetry,
             ),
         )
@@ -2066,6 +2191,30 @@ fn parse_replay_router_mode(
             other
         ))),
     }
+}
+
+fn parse_weka_import_options(
+    trace_format: TraceFileFormat,
+    nested_timestamp_basis: Option<&str>,
+) -> anyhow::Result<WekaImportOptions> {
+    let Some(basis) = nested_timestamp_basis else {
+        return Ok(WekaImportOptions::default());
+    };
+    let nested_timestamp_basis = match basis {
+        "auto" => WekaNestedTimestampBasis::Auto,
+        "absolute" => WekaNestedTimestampBasis::Absolute,
+        "relative" => WekaNestedTimestampBasis::Relative,
+        _ => anyhow::bail!(
+            "weka_nested_timestamp_basis must be 'auto', 'absolute', or 'relative', got '{basis}'"
+        ),
+    };
+    anyhow::ensure!(
+        trace_format == TraceFileFormat::Weka,
+        "weka_nested_timestamp_basis requires trace_format='weka'"
+    );
+    Ok(WekaImportOptions {
+        nested_timestamp_basis,
+    })
 }
 
 fn parse_trace_file_format(
