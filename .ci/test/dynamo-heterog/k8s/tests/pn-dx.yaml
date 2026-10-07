@@ -217,7 +217,7 @@ spec:
                 --block-size 64 \
                 --max-num-seqs 40 \
                 --gpu-memory-utilization 0.7 \
-                --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both", "kv_buffer_device":"xpu", "enable_permute_local_kv":"True", "kv_connector_extra_config": {"enforce_handshake_compat": true}}'
+                --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both", "kv_buffer_device":"xpu", "enable_permute_local_kv":"True", "kv_connector_extra_config": {"enforce_handshake_compat": false}}'
           securityContext:
             runAsUser: 0
             capabilities:
