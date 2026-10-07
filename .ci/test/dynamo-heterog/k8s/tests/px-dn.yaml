@@ -165,7 +165,7 @@ spec:
             - name: VLLM_LOGGING_LEVEL
               value: "INFO"
             - name: VLLM_KV_CACHE_LAYOUT
-              value: "NHD"
+              value: "HND"
           resources:
             claims:
               - name: intel-gpu-rdma-resource
@@ -265,7 +265,7 @@ spec:
             - name: VLLM_LOGGING_LEVEL
               value: "INFO"
             - name: VLLM_KV_CACHE_LAYOUT
-              value: "NHD"
+              value: "HND"
           resources:
             claims:
               - name: gpu-rdma-resource
