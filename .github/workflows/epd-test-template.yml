@@ -67,6 +67,11 @@ on:
         required: false
         type: string
         default: ''
+      expect_benchmark_result:
+        description: 'Whether the bench Job emits vllm-bench results to validate (Successful/Failed requests). Set false for functional tests (e.g. omni-ar-dit-2nodes) where pass/fail is the bench Job exit code.'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -677,6 +682,13 @@ jobs:
                 exit 1
               fi
 
+              # Functional tests (expect_benchmark_result=false) self-validate in the
+              # bench script and gate on its exit code; the Succeeded phase is the pass.
+              if [ "${{ inputs.expect_benchmark_result }}" != "true" ]; then
+                echo "✓ Functional test passed"
+                exit 0
+              fi
+
               # Parse benchmark results
               SUCCESSFUL_REQUESTS=$(echo "$LOGS" | grep -oP 'Successful requests:\s+\K\d+' || echo "")
               FAILED_REQUESTS=$(echo "$LOGS" | grep -oP 'Failed requests:\s+\K\d+' || echo "")
@@ -749,6 +761,16 @@ jobs:
           INPUT_TEST_NAME: ${{ inputs.test_name }}
         run: |
           echo "Generating performance summary JSON..."
+
+          # Functional tests produce no benchmark metrics; emit a minimal summary
+          # instead of parsing (which would yield malformed JSON with empty fields).
+          if [ "${{ inputs.expect_benchmark_result }}" != "true" ]; then
+            echo "Functional test; writing functional perf_summary.json"
+            printf '{"test_name": "%s", "type": "functional", "timestamp": "%s"}\n' \
+              "$INPUT_TEST_NAME" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+              > "$UPLOAD_LOG_DIR/perf_summary.json"
+            exit 0
+          fi
 
           # Find benchmark pod log file
           BENCHMARK_LOG=""
