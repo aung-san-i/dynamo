@@ -31,13 +31,14 @@
 # Not ar/dit: both sides read model_stage with getattr() off engine_args, which the
 # 0.30 compat property returns as a plain dict, so both take the same f"stage{id}".
 #
-# MODEL NOTE: GLM-Image (34G) is pre-staged in the HF cache on the pytorch NFS
-# export, which both worker pods mount read-write at /models with
-# HF_HOME=/models/huggingface. OMNI_MODEL stays the plain hub id and HF resolves
-# it from that cache; HF_HUB_OFFLINE=1 keeps it from reaching for the network and
-# makes dynamo rewrite the id to whichever snapshot refs/main points at
-# (omni/args.py -> vllm get_model_path). Nothing here pins a revision, so a
-# re-synced cache is picked up with no edit. That rewrite also sets
+# MODEL NOTE: GLM-Image (34G) lives in the HF cache under /models/huggingface
+# (HF_HOME), on the /software/data/pytorch host path each worker pod mounts
+# read-write. This cluster does not pre-stage it, so HF_HUB_OFFLINE=0: the first
+# run downloads it into that cache (34G, inside the template's readiness wait)
+# and later runs reuse it. OMNI_MODEL stays the plain hub id, and dynamo rewrites
+# it to whichever snapshot refs/main points at (omni/args.py -> vllm
+# get_model_path, which calls snapshot_download). Nothing here pins a revision,
+# so a newer upstream snapshot is picked up with no edit. That rewrite also sets
 # served_model_name to the hub id, so /v1/models still advertises
 # "zai-org/GLM-Image" rather than a snapshot path -- which is what the bench Job
 # sends as SERVED_MODEL_NAME in its request payloads. The two must stay in sync.
@@ -51,10 +52,10 @@
 # OMNI_MODEL is outside that allow-list, so it survives rendering and is
 # expanded by the pod's shell.
 #
-# Consequence of HF_HUB_OFFLINE=1: if the model is ever absent from the cache the
-# pods fail fast instead of silently pulling 34G through the proxy mid-test. If
-# the cache is wiped, re-stage it (or drop HF_HUB_OFFLINE for one run) rather than
-# waiting on a download inside the test.
+# Consequence of HF_HUB_OFFLINE=0: a run that finds no cached copy downloads 34G
+# before its pods go Ready, so the first run (and any run after the cache is
+# wiped) is slow. With HF_HUB_OFFLINE=1 the same cache miss failed every stage
+# at startup with LocalEntryNotFoundError, which is what the first CI run hit.
 #
 # Do NOT point HF_HOME at /mnt/weka: that mount is readOnly: true in every test
 # manifest here, and huggingface_hub writes lock files under the cache root even
@@ -311,10 +312,10 @@ spec:
                 - "SYS_ADMIN"
                 - "SYS_RAWIO"
           env:
-            # Hub id, resolved from the pre-staged HF cache under HF_HOME rather
-            # than downloaded: HF_HUB_OFFLINE=1 makes dynamo rewrite this to the
+            # Hub id, downloaded into the HF cache under HF_HOME on first use
+            # (HF_HUB_OFFLINE=0) and reused after. dynamo rewrites it to the
             # snapshot that refs/main points at (omni/args.py get_model_path), so
-            # a re-synced cache is picked up with no edit here. The rewrite also
+            # a newer snapshot is picked up with no edit here. The rewrite also
             # sets served_model_name to this id, so /v1/models keeps advertising
             # "zai-org/GLM-Image" instead of the snapshot path.
             - name: OMNI_MODEL
@@ -363,13 +364,13 @@ spec:
               value: "1"
             - name: PYTHONHASHSEED
               value: "0"
-            # Resolve OMNI_MODEL from the local cache instead of contacting the hub.
-            # This is what triggers dynamo's repo-id -> snapshot rewrite in
-            # omni/args.py, which follows refs/main, so a re-synced cache is
-            # picked up automatically. It also makes a cache miss fail fast
-            # rather than silently pulling 34G through the proxy mid-test.
+            # Downloads on: GLM-Image is not pre-staged on this cluster, so with
+            # "1" every stage failed with LocalEntryNotFoundError. "0" lets HF
+            # fetch it into HF_HOME on first use and reuse the cache afterwards.
+            # dynamo's repo-id -> snapshot rewrite (omni/args.py get_model_path)
+            # still runs: it calls snapshot_download either way.
             - name: HF_HUB_OFFLINE
-              value: "1"
+              value: "0"
             - name: HF_HOME
               value: /models/huggingface
             - name: TRANSFORMERS_CACHE
@@ -495,13 +496,13 @@ spec:
               value: ""
             - name: PYTHONHASHSEED
               value: "0"
-            # Resolve OMNI_MODEL from the local cache instead of contacting the hub.
-            # This is what triggers dynamo's repo-id -> snapshot rewrite in
-            # omni/args.py, which follows refs/main, so a re-synced cache is
-            # picked up automatically. It also makes a cache miss fail fast
-            # rather than silently pulling 34G through the proxy mid-test.
+            # Downloads on: GLM-Image is not pre-staged on this cluster, so with
+            # "1" every stage failed with LocalEntryNotFoundError. "0" lets HF
+            # fetch it into HF_HOME on first use and reuse the cache afterwards.
+            # dynamo's repo-id -> snapshot rewrite (omni/args.py get_model_path)
+            # still runs: it calls snapshot_download either way.
             - name: HF_HUB_OFFLINE
-              value: "1"
+              value: "0"
             - name: HF_HOME
               value: /models/huggingface
             - name: TRANSFORMERS_CACHE
@@ -635,8 +636,9 @@ spec:
               value: ""
             - name: PYTHONHASHSEED
               value: "0"
+            # Downloads on, as in Ar and Dit (see their HF_HUB_OFFLINE comment).
             - name: HF_HUB_OFFLINE
-              value: "1"
+              value: "0"
             - name: HF_HOME
               value: /models/huggingface
             - name: TRANSFORMERS_CACHE
