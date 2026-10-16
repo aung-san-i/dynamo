@@ -1,0 +1,47 @@
+# DeviceClass for an SR-IOV virtual function (VF) of a Mellanox/NVIDIA ConnectX
+# NIC whose link is up, as published by dra.net.
+#
+# The PF classes (deviceclass-sc09*-connectx*.yaml) pin one physical port by
+# ifName + PCI address, so each node has exactly one matching device and only
+# one pod per node can hold it. With VFs enabled on that port, each VF is its
+# own RDMA device; this class matches any of them, so two pods on one node can
+# each get one.
+#
+# Not node-specific: the pod's nodeSelector (dynamo.intel.com/node) already
+# decides which node's devices are candidates, as for the PF classes.
+#   sc09super16-a100: ConnectX-5 VFs 0000:2e:00.2 - 0000:2e:00.5
+#     (lspci: "MT27800 Family [ConnectX-5 Virtual Function]")
+#   sc09intel01-b60:  ConnectX-6 Dx VFs
+#     (lspci: "ConnectX Family mlx5Gen Virtual Function")
+# Both names end in "Virtual Function", which is what the pciDevice selector
+# keys on; PFs never match it.
+#
+# state == "up": the same guard the PF classes use. A VF reads up only when its
+# own netdev has been brought up on the host (`ip link set <vf> up`, with
+# `ip link set <pf> vf N state auto`) -- enabling the VFs is not enough, they
+# come up DOWN and this class then matches nothing. Neither setting survives a
+# reboot unless it is put in the host's network configuration.
+#
+# Kueue: add this class under intel.com/rdma in kueue-manager-config's
+# resources.deviceClassMappings, or Kueue does not count VF claims as RDMA.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: rdma-dranet-mlx5-vf-up
+spec:
+  selectors:
+    - cel:
+        expression: device.driver == "dra.net"
+    - cel:
+        expression: device.attributes["dra.net"].rdma == true
+    - cel:
+        expression: has(device.attributes["dra.net"].pciDevice) && device.attributes["dra.net"].pciDevice.contains("Virtual Function")
+    - cel:
+        expression: device.attributes["dra.net"].state == "up"
+
+
+# kubectl apply -f deviceclass-rdma-dranet-mlx5-vf-up.yaml
+
+# Which devices does it match on each node? (expect 4 VFs per node, never a PF)
+# Strips an optional dra.net/ prefix from attribute names, so it reads either form.
+# kubectl get resourceslices -o json | jq -r '.items[] | select(.spec.driver=="dra.net") | .spec.nodeName as $n | .spec.devices[] | (.attributes | with_entries(.key |= sub("^dra\\.net/";"")) | map_values(.string // .bool // .int // .version)) as $a | select($a.rdma == true and (($a.pciDevice // "") | contains("Virtual Function")) and $a.state == "up") | "MATCH  \($n)  \(.name)  \($a.pciAddress)  \($a.ifName)"'
