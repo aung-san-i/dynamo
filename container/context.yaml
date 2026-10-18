@@ -108,9 +108,9 @@ vllm:
   xpu:
     base_image: vllm/vllm-openai-xpu
     runtime_image: vllm/vllm-openai-xpu
-    base_image_tag: v0.29.0
-    runtime_image_tag: v0.29.0
-    baseline_sbom: vllm-openai-xpu@96db42e2
+    base_image_tag: v0.32.0
+    runtime_image_tag: v0.32.0
+    baseline_sbom: vllm-openai-xpu@20509fab
   cpu:
     base_image: ubuntu
     runtime_image: vllm/vllm-openai-cpu
