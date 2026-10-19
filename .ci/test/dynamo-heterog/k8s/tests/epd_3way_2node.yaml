@@ -342,6 +342,47 @@ spec:
             - /bin/sh
             - -c
             - |
+              # Wait for Prefill's download before starting. Prefill and Dec share
+              # ${NVIDIA_NODE}'s HF cache (/software/data/pytorch -> /models), and on
+              # a model's first run both download it at once: Prefill holds the
+              # blob lock and Dec's downloader fails on it instead of waiting
+              # ("Lock acquisition failed: .../blobs/<hash>.lock") -- CrashLoopBackOff,
+              # which the template's readiness wait fails on at once.
+              #   complete (index + every shard it lists, folder not growing) -> start
+              #   folder still growing (Prefill downloading)                  -> wait
+              #   no growth for 120s and not complete (nobody downloading)    -> start,
+              #     and let this worker download it itself, as before
+              #   45 min                                                     -> start anyway
+              # M, not MODEL: envsubst fills in a bare MODEL reference at render
+              # time, before this shell runs; the :- default form survives it.
+              M="${MODEL:-Qwen/Qwen3-VL-8B-Instruct}"
+              D="${HF_HOME:-/models/huggingface}/hub/models--$(echo "$M" | sed 's|/|--|g')"
+              waited=0; still=0; prev=-1
+              while :; do
+                now=$(du -sk "$D" 2>/dev/null | cut -f1); now=${now:-0}
+                if [ "$now" = "$prev" ]; then still=$((still + 10)); else still=0; fi
+                prev=$now
+                if [ "$still" -gt 0 ] && python -c 'import glob, json, os, sys
+              for s in glob.glob(os.path.join(sys.argv[1], "snapshots", "*")):
+                  i = os.path.join(s, "model.safetensors.index.json")
+                  if os.path.isfile(os.path.join(s, "config.json")) and os.path.isfile(i):
+                      if all(os.path.isfile(os.path.join(s, f)) for f in set(json.load(open(i))["weight_map"].values())):
+                          sys.exit(0)
+              sys.exit(1)' "$D"; then
+                  echo "$M is fully downloaded in $D (${now} KiB); starting after ${waited}s"
+                  break
+                fi
+                if [ "$still" -ge 120 ]; then
+                  echo "$M not complete and not growing for ${still}s (${now} KiB); starting, this worker downloads it"
+                  break
+                fi
+                if [ "$waited" -ge 2700 ]; then
+                  echo "Gave up waiting for $M after ${waited}s (${now} KiB); starting anyway"
+                  break
+                fi
+                echo "Waiting for $M to finish downloading: ${now} KiB in $D (${waited}s)"
+                sleep 10; waited=$((waited + 10))
+              done
               TRANSFER_LOCAL=0 \
               python -m dynamo.vllm \
                 --model ${MODEL:-Qwen/Qwen3-VL-8B-Instruct} \
