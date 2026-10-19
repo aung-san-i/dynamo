@@ -389,6 +389,8 @@ vllm:
   - 'components/src/dynamo/vllm/**'
   - 'components/src/dynamo/artifacts/vllm/**'
   - 'container/templates/vllm_*'
+  # Heterogeneous EPD/P-D test manifests are consumed by PR-XPU and manual EPD workflows.
+  - '.ci/test/dynamo-heterog/k8s/tests/**'
   - '!**/*.md'
   - '!**/*.rst'
 
