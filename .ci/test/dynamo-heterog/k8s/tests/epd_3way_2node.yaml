@@ -160,6 +160,15 @@ spec:
               value: "ib,rc,ud,rc_verbs,ud_verbs,ze_copy"
             - name: UCX_IB_ROCE_REACHABILITY_MODE
               value: "all"
+            # RoCE GID 1 = the RoCE v2 GID of the link-local IPv6 (fe80) address,
+            # which every up interface has. A VF loses its IPv4 address after a
+            # test uses it (dranet moves it out and back, and nothing re-applies
+            # a hand-set address), leaving only GIDs 0/1; Prefill on such a VF
+            # then failed to reach Enc's IPv4 GID (ibv_create_ah ... sgid_index=1
+            # dgid=::ffff:192.180.180.10: Invalid argument). Same index on every
+            # NIXL worker here so both ends of each connection use fe80 GIDs.
+            - name: UCX_IB_GID_INDEX
+              value: "1"
             - name: UCX_MEMTYPE_CACHE
               value: "0"
             # vLLM 0.30 reads telemetry on every completed transfer, so it must be on
@@ -271,6 +280,15 @@ spec:
               value: "ib,rc,ud,cuda_ipc,cuda_copy"
             - name: UCX_IB_ROCE_REACHABILITY_MODE
               value: "all"
+            # RoCE GID 1 = the RoCE v2 GID of the link-local IPv6 (fe80) address,
+            # which every up interface has. A VF loses its IPv4 address after a
+            # test uses it (dranet moves it out and back, and nothing re-applies
+            # a hand-set address), leaving only GIDs 0/1; Prefill on such a VF
+            # then failed to reach Enc's IPv4 GID (ibv_create_ah ... sgid_index=1
+            # dgid=::ffff:192.180.180.10: Invalid argument). Same index on every
+            # NIXL worker here so both ends of each connection use fe80 GIDs.
+            - name: UCX_IB_GID_INDEX
+              value: "1"
             - name: UCX_MEMTYPE_CACHE
               value: "0"
             # vLLM 0.30 reads telemetry on every completed transfer, so it must be on
@@ -423,6 +441,15 @@ spec:
               value: "ib,rc,ud,cuda_ipc,cuda_copy"
             - name: UCX_IB_ROCE_REACHABILITY_MODE
               value: "all"
+            # RoCE GID 1 = the RoCE v2 GID of the link-local IPv6 (fe80) address,
+            # which every up interface has. A VF loses its IPv4 address after a
+            # test uses it (dranet moves it out and back, and nothing re-applies
+            # a hand-set address), leaving only GIDs 0/1; Prefill on such a VF
+            # then failed to reach Enc's IPv4 GID (ibv_create_ah ... sgid_index=1
+            # dgid=::ffff:192.180.180.10: Invalid argument). Same index on every
+            # NIXL worker here so both ends of each connection use fe80 GIDs.
+            - name: UCX_IB_GID_INDEX
+              value: "1"
             - name: UCX_MEMTYPE_CACHE
               value: "0"
             # vLLM 0.30 reads telemetry on every completed transfer, so it must be on
