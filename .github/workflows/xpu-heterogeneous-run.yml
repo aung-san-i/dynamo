@@ -1085,7 +1085,13 @@ jobs:
       nvidia_resource_template: "onenvidia-rdma-vf-kueue"
       xpu_node: "xpu_node"
       nvidia_node: "nvidia_node"
-      # No model / tensor_parallel: Qwen/Qwen3-VL-32B-Instruct-FP8 from the manifest.
+      # No model / tensor_parallel: Qwen/Qwen3-VL-8B-Instruct (bf16) from the
+      # manifest. Not the internal suite's Qwen3-VL-32B-Instruct-FP8: that ran
+      # on H200 (141 GB), and on this cluster's A100 (80 GB) the 32B left each
+      # NVIDIA worker 38.6 GiB of KV cache against 64 GiB needed for one
+      # max-length (262144-token) request, so both crashed at startup. The 8B
+      # needs ~36 GiB and has ~55 GiB free. e-pd-2nodes keeps the 32B on the
+      # same cards only because it sets --kv-cache-dtype fp8 (half the KV size).
 
   # Functional, not a throughput benchmark: the bench Job drives
   # /v1/images/generations, validates the PNG signature and exits non-zero on
