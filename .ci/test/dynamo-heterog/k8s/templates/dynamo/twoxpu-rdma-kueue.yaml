@@ -1,0 +1,42 @@
+# ResourceClaimTemplate for 2 Intel GPUs (XPU) + 1 operational ConnectX-6 Dx RDMA NIC.
+#
+# Same as onexpu-rdma-kueue.yaml with the xpu request raised from count: 1 to
+# count: 2. One pod claiming this template sees both cards, which is what a
+# TP=2 worker needs (px-dn-hnd-tp2's XPU prefill). It is NOT a template for two
+# pods that each want one card -- that is a count: 1 template over a pool of
+# cards (see px-dx.yaml).
+#
+# The RDMA request is unchanged: still exactly one NIC, the one cabled on the
+# XPU node. NIXL in a TP=2 worker drives both cards through that one NIC.
+#
+# Kueue accounting (kueue-queues.yaml): one claim of this template consumes
+# intel.com/xpu=2 and intel.com/rdma=1. A px-dn-hnd-tp2 run is therefore
+# xpu 2/4, gpu 1/8, rdma 2/2 -- it fits, and like every P/D run it holds the
+# whole RDMA quota while it runs.
+#
+# Kueue v0.18 does not support ResourceClaimTemplate device requests that use
+# firstAvailable, so both requests use exactly, as in onexpu-rdma-kueue.yaml.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: twoxpu-rdma-kueue
+  namespace: dynamo-system
+spec:
+  spec:
+    devices:
+      requests:
+        - name: xpu
+          exactly:
+            allocationMode: ExactCount
+            count: 2
+            deviceClassName: gpu.intel.com
+        - name: rdma
+          exactly:
+            allocationMode: ExactCount
+            count: 1
+            deviceClassName: sc09intel01-b60-ens8191f0np0-connectx6
+
+
+# kubectl apply -n dynamo-system -f twoxpu-rdma-kueue.yaml
+
+# kubectl get resourceclaimtemplate -n dynamo-system twoxpu-rdma-kueue -o jsonpath='{range .spec.spec.devices.requests[*]}{.name}{" -> "}{.exactly.count}{" x "}{.exactly.deviceClassName}{"\n"}{end}'
