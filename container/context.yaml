@@ -111,6 +111,11 @@ vllm:
     base_image_tag: v0.31.0
     runtime_image_tag: v0.31.0
     baseline_sbom: vllm-openai-xpu@95ac8150
+    # Match vllm-omni to the v0.31.0 base, as cuda13.0 does. The shared
+    # vllm_omni_ref below (v0.29.0rc1) is for the v0.29.0 cpu image; on XPU it
+    # rejected GLM-Image's stage config ("Stage 0 (diffusion) has explicit
+    # engine argument(s) with no structured config owner").
+    vllm_omni_ref: "v0.31.0rc1"
   cpu:
     base_image: ubuntu
     runtime_image: vllm/vllm-openai-cpu
