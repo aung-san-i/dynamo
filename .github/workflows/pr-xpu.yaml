@@ -23,7 +23,7 @@ jobs:
   # ============================================================================
 
   guard:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       has_xpu_label: ${{ steps.pr-info.outputs.has_xpu_label }}
     steps:
@@ -57,7 +57,7 @@ jobs:
   changed-files:
     needs: [guard]
     if: needs.guard.outputs.has_xpu_label == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       core: ${{ github.event_name == 'schedule' && 'true' || steps.changes.outputs.core }}
       vllm: ${{ github.event_name == 'schedule' && 'true' || steps.changes.outputs.vllm }}
