@@ -935,25 +935,39 @@ jobs:
           # Frontend, usually) runs the operator's default entrypoint; the
           # <pod>-describe.txt next to its log shows what the container actually
           # ran.
+          #
+          # The runners' yq is the Python one (a jq wrapper), not mikefarah's Go
+          # yq: expressions are jq syntax, -r prints raw strings, -y prints YAML,
+          # and values go in with --arg. strenv() and unquoted key output are Go
+          # yq only -- using them wrote `commands/"decode"-command.yaml`, and
+          # upload-artifact rejects a `"` in a path, failing the whole upload.
+          # The filename is reduced to [a-z0-9._-] so whatever yq prints can
+          # never again cost the artifact.
           rendered="$local_dir/deploy-test-rendered.yaml"
           if [ -s "$rendered" ]; then
             mkdir -p "$upload_dir/commands"
-            yq 'select(.kind == "DynamoGraphDeployment") | .spec.services | keys | .[]' "$rendered" |
+            yq -r 'select(.kind == "DynamoGraphDeployment") | .spec.services | keys[]' "$rendered" |
             while IFS= read -r svc; do
               [ -n "$svc" ] || continue
-              out="$upload_dir/commands/$(printf '%s' "$svc" | tr '[:upper:]' '[:lower:]')-command.yaml"
-              {
+              out="$upload_dir/commands/$(printf '%s' "$svc" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '_')-command.yaml"
+              if {
                 echo "# Service $svc of ${TEST_NAME:-?}, from deploy-test-rendered.yaml"
-                SVC="$svc" yq 'select(.kind == "DynamoGraphDeployment") | .spec.services[strenv(SVC)].extraPodSpec.mainContainer | {"image": .image, "command": .command, "args": .args, "env": .env} | with_entries(select(.value != null))' "$rendered"
-              } > "$out" || echo "WARNING: could not write $out"
-              echo "Wrote $out"
+                yq -y --arg svc "$svc" 'select(.kind == "DynamoGraphDeployment") | .spec.services[$svc].extraPodSpec.mainContainer | {"image": .image, "command": .command, "args": .args, "env": .env} | with_entries(select(.value != null))' "$rendered"
+              } > "$out"; then
+                echo "Wrote $out"
+              else
+                echo "WARNING: could not write $out"
+              fi
             done
             out="$upload_dir/commands/bench-job-command.yaml"
-            {
+            if {
               echo "# Benchmark Job of ${TEST_NAME:-?}, from deploy-test-rendered.yaml"
-              yq 'select(.kind == "Job") | .spec.template.spec.containers[0] | {"image": .image, "command": .command, "args": .args, "env": .env} | with_entries(select(.value != null))' "$rendered"
-            } > "$out" || echo "WARNING: could not write $out"
-            echo "Wrote $out"
+              yq -y 'select(.kind == "Job") | .spec.template.spec.containers[0] | {"image": .image, "command": .command, "args": .args, "env": .env} | with_entries(select(.value != null))' "$rendered"
+            } > "$out"; then
+              echo "Wrote $out"
+            else
+              echo "WARNING: could not write $out"
+            fi
           else
             echo "No rendered manifest at $rendered; commands/ not written"
           fi
