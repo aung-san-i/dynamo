@@ -349,26 +349,37 @@ spec:
               # `$MODEL_PATH` is not in that list, so it survives to the shell.
               MODEL_PATH="${MODEL:-Qwen/Qwen3-VL-32B-Instruct-FP8}"
 
-              # Anything this Job wants in the run artifact goes in $ARTIFACT_DIR;
-              # save_artifacts copies it to the shared-NFS drop box (POD_LOG_DIR)
-              # that the workflow collects. Called on every exit path via the trap
-              # below, and again right after the curl test so the transcript is
-              # already on NFS if what follows is killed outright (a SIGKILL runs
-              # no trap).
+              # Anything this Job wants in the run artifact goes in $ARTIFACT_DIR.
+              # save_artifacts prints each file into this pod's log between
+              # "@@ci-artifact-begin <name>" and "@@ci-artifact-end <name>" lines;
+              # the workflow's "Stage all logs for upload" step cuts them back out
+              # into bench/<name> in the artifact. The log is the only way out: the
+              # pod has exited before the workflow collects, and POD_LOG_DIR, the
+              # drop box this used to copy into, was never set or mounted.
+              # Called on every exit path via the trap below, and again right after
+              # the curl test so the transcript is already in the log if what
+              # follows is killed outright (a SIGKILL runs no trap); the workflow
+              # keeps the last copy.
               ARTIFACT_DIR=/tmp/ci-artifacts
               mkdir -p "$ARTIFACT_DIR"
               save_artifacts() {
-                if [ ! -d "$POD_LOG_DIR" ]; then
-                  echo "WARNING: $POD_LOG_DIR missing; artifacts stay inside this pod"
-                  return 0
-                fi
                 for f in "$ARTIFACT_DIR"/*; do
-                  [ -e "$f" ] || continue
-                  if cp "$f" "$POD_LOG_DIR/"; then
-                    echo "Saved $(basename "$f") to $POD_LOG_DIR"
-                  else
-                    echo "WARNING: failed to copy $(basename "$f") to $POD_LOG_DIR"
-                  fi
+                  [ -f "$f" ] || continue
+                  name=$(basename "$f")
+                  case "$name" in
+                    *.png)
+                      # Binary: base64 here, decoded by the workflow.
+                      echo "@@ci-artifact-begin-b64 $name"
+                      base64 "$f"
+                      ;;
+                    *)
+                      echo "@@ci-artifact-begin $name"
+                      cat "$f"
+                      # An end marker glued onto an unterminated last line is lost.
+                      if [ -n "$(tail -c1 "$f")" ]; then echo; fi
+                      ;;
+                  esac
+                  echo "@@ci-artifact-end $name"
                 done
               }
               trap save_artifacts EXIT
@@ -554,7 +565,14 @@ spec:
               echo "  REQUEST_RATE: ${REQUEST_RATE}"
               echo ""
 
-              vllm bench serve \
+              # The exact command line and the benchmark's output each become their
+              # own file in the run artifact (bench/bench_serve-command.txt,
+              # bench/bench_serve.log), cut out of this pod's log at the marker
+              # lines below. The argument list is built once with `set --`, so the
+              # saved command cannot drift from the one that runs. Arguments with
+              # anything beyond [A-Za-z0-9_./:=,-] are single-quoted, so the saved
+              # line pastes back into a shell as is.
+              set -- vllm bench serve \
                 --backend openai-chat \
                 --base-url "http://$FRONTEND_HOST:$FRONTEND_PORT" \
                 --endpoint /v1/chat/completions \
@@ -573,6 +591,18 @@ spec:
                 --percentile-metrics ttft,tpot,itl,e2el \
                 --metric-percentiles 50,90,99 \
                 --ignore-eos
+              echo "@@ci-artifact-begin bench_serve-command.txt"
+              for arg in "$@"; do
+                case "$arg" in
+                  *[!A-Za-z0-9_./:=,-]*) printf "'%s' " "$arg" ;;
+                  *) printf '%s ' "$arg" ;;
+                esac
+              done
+              echo
+              echo "@@ci-artifact-end bench_serve-command.txt"
+              echo "@@ci-artifact-begin bench_serve.log"
+              "$@"
+              echo "@@ci-artifact-end bench_serve.log"
 
               echo ""
               echo "========================================="

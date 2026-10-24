@@ -437,6 +437,13 @@ spec:
               echo "========================================="
               echo "Curl test completed (logs saved to /tmp/curl_test.log)"
               echo "========================================="
+              # The transcript becomes its own file in the run artifact,
+              # bench/curl_test.log: the workflow's "Stage all logs for upload"
+              # step cuts it out of this pod's log at the marker lines. The pod
+              # has exited by then, so /tmp itself is never reachable.
+              echo "@@ci-artifact-begin curl_test.log"
+              cat /tmp/curl_test.log
+              echo "@@ci-artifact-end curl_test.log"
 
               echo "========================================="
               echo "Running PX-DN Benchmark (Prefill XPU, Decode NVIDIA)"
@@ -453,7 +460,14 @@ spec:
               echo "  REQUEST_RATE: ${REQUEST_RATE}"
               echo ""
 
-              vllm bench serve \
+              # The exact command line and the benchmark's output each become their
+              # own file in the run artifact (bench/bench_serve-command.txt,
+              # bench/bench_serve.log), cut out of this pod's log at the marker
+              # lines below. The argument list is built once with `set --`, so the
+              # saved command cannot drift from the one that runs. Arguments with
+              # anything beyond [A-Za-z0-9_./:=,-] are single-quoted, so the saved
+              # line pastes back into a shell as is.
+              set -- vllm bench serve \
                 --backend openai \
                 --base-url "http://$FRONTEND_HOST:$FRONTEND_PORT" \
                 --endpoint /v1/completions \
@@ -469,7 +483,19 @@ spec:
                 --percentile-metrics ttft,tpot,itl,e2el \
                 --metric-percentiles 50,90,99 \
                 --ignore-eos
+              echo "@@ci-artifact-begin bench_serve-command.txt"
+              for arg in "$@"; do
+                case "$arg" in
+                  *[!A-Za-z0-9_./:=,-]*) printf "'%s' " "$arg" ;;
+                  *) printf '%s ' "$arg" ;;
+                esac
+              done
+              echo
+              echo "@@ci-artifact-end bench_serve-command.txt"
+              echo "@@ci-artifact-begin bench_serve.log"
+              "$@"
               BENCH_RC=$?
+              echo "@@ci-artifact-end bench_serve.log"
 
               echo ""
               echo "========================================="
