@@ -1,0 +1,615 @@
+# px-dx Test: XPU Prefill + XPU Decode on ONE node (Text-only LLM)
+# The px-dn topology with decode moved off NVIDIA onto a second card of the same
+# XPU host. ${NVIDIA_NODE} places the bench Job only; it claims no device.
+#
+# Both workers name the same ${XPU_RESOURCE_TEMPLATE} and nothing is derived from
+# it: one ResourceClaim is minted per pod and DRA never gives one device to two
+# claims, so each worker gets one card of the pair.
+#
+# The template must therefore be `count: 1` over a pool of >=2 cards, not
+# `count: 2` (which would demand 4). Its RDMA request must also be a VF, not
+# the physical port: the XPU node has one cabled port, and a port cannot be
+# shared between pods (dranet moves the netdev into the pod's netns). The SR-IOV
+# VFs of that port are separate RDMA devices, so each worker gets its own.
+# xpu-heterogeneous-run.yml passes onexpu-rdma-vf-kueue (1 XPU + 1 VF).
+#
+# DRA allocates one card per pod (count: 1), making only that card visible to the
+# container. TENSOR_PARALLEL must stay 1 for the same reason.
+#
+# Usage by hand:
+#   export DOCKER_IMAGE_XPU="..." DOCKER_IMAGE_GPU="..." XPU_RESOURCE_TEMPLATE="..."
+#   export TEST_NAME="px-dx" MODEL="Qwen/Qwen3-0.6B" TENSOR_PARALLEL="1"
+#   kubectl apply -f <(envsubst < px-dx.yaml) -n dynamo-system
+#   kubectl wait --for=condition=Ready pod -l dynamo.nvidia.com/graph=px-dx -n dynamo-system --timeout=20m
+#
+# Cleanup:
+#   kubectl delete -f px-dx.yaml -n dynamo-system
+---
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: ${TEST_NAME}
+  namespace: dynamo-system
+spec:
+  backendFramework: vllm
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "3"
+      extraPodSpec:
+        nodeSelector:
+          dynamo.intel.com/node: ${XPU_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+        mainContainer:
+          image: ${DOCKER_IMAGE_XPU}
+          env:
+            - name: DYN_STORE_KV
+              value: "mem"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+            - name: PYTHONHASHSEED
+              value: "0"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+
+    Prefill:
+      componentType: worker
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "3"
+      extraPodSpec:
+        nodeSelector:
+          dynamo.intel.com/node: ${XPU_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+        resourceClaims:
+          # One card + one VF, minted from the same template the Decode worker
+          # names. With count 1 over a pool of >= 2 cards, this claim takes one
+          # of the pair and Decode's takes the other.
+          - name: intel-gpu-rdma-resource
+            resourceClaimTemplateName: ${XPU_RESOURCE_TEMPLATE}
+        mainContainer:
+          image: ${DOCKER_IMAGE_XPU}
+          workingDir: /workspace
+          command:
+            - /bin/sh
+            - -c
+            - |
+              xpu-smi discovery || true
+              python -m dynamo.vllm \
+                --model ${MODEL:-Qwen/Qwen3-0.6B} \
+                --tensor-parallel-size ${TENSOR_PARALLEL:-1} \
+                --disaggregation-mode prefill \
+                --dtype bfloat16 \
+                --enforce-eager \
+                --block-size 64 \
+                --gpu-memory-utilization 0.7 \
+                --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}' \
+                --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both", "kv_buffer_device":"xpu"}'
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - "IPC_LOCK"
+                - "SYS_PTRACE"
+                - "SYS_ADMIN"
+                - "SYS_RAWIO"
+          env:
+            - name: MODEL
+              value: "$MODEL"
+            - name: TENSOR_PARALLEL
+              value: "$TENSOR_PARALLEL"
+            - name: DYN_STORE_KV
+              value: "mem"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: DYN_VLLM_KV_EVENT_PORT
+              value: "20080"
+            - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+              value: "20098"
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: PYTHONHASHSEED
+              value: "0"
+            - name: UCX_TLS
+              value: "ib,rc,ud,rc_verbs,ud_verbs,ze_copy"
+            - name: UCX_IB_ROCE_REACHABILITY_MODE
+              value: "all"
+            - name: UCX_MEMTYPE_CACHE
+              value: "0"
+            # vLLM 0.30 reads telemetry on every completed transfer, so it must be on
+            # (the operator injects ENABLE=n) -- but with an empty EXPORTER: its
+            # prometheus is a plugin neither image builds, and loading it throws.
+            - name: NIXL_TELEMETRY_ENABLE
+              value: "y"
+            - name: NIXL_TELEMETRY_EXPORTER
+              value: ""
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HF_HUB_OFFLINE
+              value: "0"
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+            - name: VLLM_KV_CACHE_LAYOUT
+              value: "NHD"
+          resources:
+            claims:
+              - name: intel-gpu-rdma-resource
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+
+    Decode:
+      componentType: worker
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "3"
+      extraPodSpec:
+        nodeSelector:
+          dynamo.intel.com/node: ${XPU_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+        resourceClaims:
+          # Same template as Prefill, separate claim: a device already allocated to
+          # Prefill's claim is no candidate for this one, so this worker
+          # necessarily lands on the other card of the pair.
+          - name: intel-gpu-rdma-resource
+            resourceClaimTemplateName: ${XPU_RESOURCE_TEMPLATE}
+        mainContainer:
+          image: ${DOCKER_IMAGE_XPU}
+          workingDir: /workspace
+          command:
+            - /bin/sh
+            - -c
+            - |
+              xpu-smi discovery || true
+              python -m dynamo.vllm \
+                --model ${MODEL:-Qwen/Qwen3-0.6B} \
+                --tensor-parallel-size ${TENSOR_PARALLEL:-1} \
+                --disaggregation-mode decode \
+                --dtype bfloat16 \
+                --enforce-eager \
+                --block-size 64 \
+                --gpu-memory-utilization 0.7 \
+                --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both", "kv_buffer_device":"xpu"}'
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - "IPC_LOCK"
+                - "SYS_PTRACE"
+                - "SYS_ADMIN"
+                - "SYS_RAWIO"
+          env:
+            - name: MODEL
+              value: "$MODEL"
+            - name: TENSOR_PARALLEL
+              value: "$TENSOR_PARALLEL"
+            - name: DYN_STORE_KV
+              value: "mem"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+              value: "20098"
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: PYTHONHASHSEED
+              value: "0"
+            - name: UCX_TLS
+              value: "ib,rc,ud,rc_verbs,ud_verbs,ze_copy"
+            - name: UCX_IB_ROCE_REACHABILITY_MODE
+              value: "all"
+            - name: UCX_MEMTYPE_CACHE
+              value: "0"
+            # vLLM 0.30 reads telemetry on every completed transfer, so it must be on
+            # (the operator injects ENABLE=n) -- but with an empty EXPORTER: its
+            # prometheus is a plugin neither image builds, and loading it throws.
+            - name: NIXL_TELEMETRY_ENABLE
+              value: "y"
+            - name: NIXL_TELEMETRY_EXPORTER
+              value: ""
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HF_HUB_OFFLINE
+              value: "0"
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+            - name: VLLM_KV_CACHE_LAYOUT
+              value: "NHD"
+          resources:
+            claims:
+              - name: intel-gpu-rdma-resource
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${TEST_NAME}-bench
+  namespace: dynamo-system
+  labels:
+    kueue.x-k8s.io/queue-name: dynamo-queue
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ${TEST_NAME}-bench
+        app.kubernetes.io/part-of: px-dx
+        kueue.x-k8s.io/queue-name: dynamo-queue
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${TEST_NAME}-k8s-service-discovery
+      # Deliberately NOT the XPU node: `vllm bench serve` probes hardware on
+      # import and has only ever run from the GPU image here. It claims no
+      # accelerator, so this leaves both XPU cards to the workers.
+      nodeSelector:
+        dynamo.intel.com/node: ${NVIDIA_NODE}
+      imagePullSecrets:
+        - name: amr-caas-registry
+      volumes:
+        - name: pytorch-models
+          hostPath:
+            path: /software/data/pytorch
+            type: Directory
+        - name: weka-models
+          hostPath:
+            path: /mnt/weka
+            type: Directory
+      containers:
+        - name: benchmark-runner
+          image: ${DOCKER_IMAGE_GPU}
+          workingDir: /workspace
+          command:
+            - /bin/sh
+            - -c
+            - |
+              FRONTEND_HOST="${TEST_NAME}-frontend.dynamo-system.svc.cluster.local"
+
+              # The model this Job benchmarks. MODEL is empty when the workflow
+              # passes no model input, so this test's own default is applied here,
+              # by the shell, where `:-` means something -- envsubst does not
+              # implement it. The result is held under a DIFFERENT name because
+              # every `$MODEL` in this script is substituted at render time (MODEL
+              # is in envsubst's variable list) and would arrive already empty;
+              # `$MODEL_PATH` is not in that list, so it survives to the shell.
+              MODEL_PATH="${MODEL:-Qwen/Qwen3-0.6B}"
+
+              # Files for the run artifact go in $ARTIFACT_DIR. save_artifacts
+              # prints each one into this pod's log between
+              # "@@ci-artifact-begin <name>" and "@@ci-artifact-end <name>" lines;
+              # the workflow's "Stage all logs for upload" step cuts them back out
+              # into bench/<name> in the artifact. The log is the only way out: the
+              # pod has exited before the workflow collects, and POD_LOG_DIR, the
+              # drop box this used to copy into, was never set or mounted.
+              # Runs on every exit path, and again right after the curl test (a
+              # SIGKILL later would run no trap); the workflow keeps the last copy.
+              ARTIFACT_DIR=/tmp/ci-artifacts
+              mkdir -p "$ARTIFACT_DIR"
+              save_artifacts() {
+                for f in "$ARTIFACT_DIR"/*; do
+                  [ -f "$f" ] || continue
+                  name=$(basename "$f")
+                  case "$name" in
+                    *.png)
+                      # Binary: base64 here, decoded by the workflow.
+                      echo "@@ci-artifact-begin-b64 $name"
+                      base64 "$f"
+                      ;;
+                    *)
+                      echo "@@ci-artifact-begin $name"
+                      cat "$f"
+                      # An end marker glued onto an unterminated last line is lost.
+                      if [ -n "$(tail -c1 "$f")" ]; then echo; fi
+                      ;;
+                  esac
+                  echo "@@ci-artifact-end $name"
+                done
+              }
+              trap save_artifacts EXIT
+              trap 'save_artifacts; exit 143' TERM INT
+
+              echo "========================================="
+              echo "Endpoint and FrontEnd Health Check"
+              echo "========================================="
+
+              # Wait for all worker endpoints (prefill, decode) for this deployment
+              echo "Waiting for all worker endpoints (prefill, decode) to be registered..."
+              timeout_sec=600
+              poll_sec=30
+              max_attempts=$((timeout_sec / poll_sec))
+              workers_ready=false
+              for attempt in $(seq 1 "$max_attempts"); do
+                health_response=$(curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health" 2>/dev/null || echo "")
+
+                # Check for both required workers for px-dx deployment
+                # Note: decode worker with --disaggregation-mode decode still registers as backend.generate
+                has_prefill=$(echo "$health_response" | grep -c "${TEST_NAME}.*prefill.generate" || true)
+                has_decode=$(echo "$health_response" | grep -c "${TEST_NAME}.*backend.generate" || true)
+                frontend_status=$(echo "$health_response" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+
+                if [ "$has_prefill" -gt 0 ] && [ "$has_decode" -gt 0 ] && [ "$frontend_status" = "healthy" ]; then
+                  echo "All worker endpoints registered (attempt ${attempt}/${max_attempts})"
+                  echo "Registered endpoints for px-dx:"
+                  echo "$health_response" | grep "${TEST_NAME}" | grep -E "prefill.generate|backend.generate" || true
+                  workers_ready=true
+                  break
+                fi
+                echo "Attempt ${attempt}/${max_attempts}: waiting for all workers"
+                echo "Status: prefill=$has_prefill, decode=$has_decode"
+                sleep "$poll_sec"
+              done
+
+              if [ "$workers_ready" != "true" ]; then
+                echo "ERROR: timeout waiting for all worker endpoints"
+                echo "Final status: prefill=$has_prefill, decode=$has_decode, frontend_status=$frontend_status"
+                echo "Final health check response:"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health" || true
+                exit 1
+              fi
+
+              # Wait for model to be discoverable via /v1/models before starting benchmark to avoid test instability
+              echo "========================================="
+              echo "Model Registration Check"
+              echo "========================================="
+
+              model_ready=false
+              timeout_sec=180
+              poll_sec=15
+              max_attempts=$((timeout_sec / poll_sec))
+              for attempt in $(seq 1 "$max_attempts"); do
+                if curl --noproxy '*' -sf "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models" 2>/dev/null | grep -Fq '"id":"'; then
+                  echo "Model registration check passed (attempt ${attempt}/${max_attempts})"
+                  model_ready=true
+                  break
+                fi
+                echo "Attempt ${attempt}/${max_attempts}: model not registered yet"
+                sleep "$poll_sec"
+              done
+
+              if [ "$model_ready" != "true" ]; then
+                echo "ERROR: timeout waiting for model registration"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models" || true
+                exit 1
+              fi
+
+              # Redirect curl test output to separate log file (and console)
+              {
+                echo "========================================="
+                echo "Curl Smoke Test - $(date)"
+                echo "========================================="
+                echo ""
+
+                echo "--- /v1/models ---"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models"
+                echo ""
+
+                echo "--- /v1/completions (text-only with retry) ---"
+              } 2>&1 | tee "$ARTIFACT_DIR/curl_test.log"
+
+              # One variable on the wire and in the log, so they cannot drift.
+              # Closed factual prefix, not an open instruction, so the answer
+              # is checkable on content: the continuation has to say Paris.
+              ENDPOINT="http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/completions"
+              REQUEST_BODY="{
+                \"model\": \"${MODEL_PATH}\",
+                \"prompt\": \"The capital city of France is\",
+                \"max_tokens\": 256,
+                \"temperature\": 0.7
+              }"
+              echo "--- request sent to the frontend ---"
+              {
+                echo "endpoint: POST $ENDPOINT"
+                echo "request body:"
+                printf '%s\n' "$REQUEST_BODY"
+              } | tee "$ARTIFACT_DIR/input-prompt-curl-req.log"
+
+              # Prose half is reference only, for whoever reads the artifact; the
+              # expected-keywords: line is what the quality check enforces.
+              {
+                echo ""
+                echo "sample-expected-response:"
+                echo " Paris. Paris is the largest city in France and its political, economic and cultural centre, sitting on the river Seine in the north of the country."
+                echo ""
+                echo "expected-keywords: min 1 of Paris"
+              } >> "$ARTIFACT_DIR/input-prompt-curl-req.log"
+              echo "sample-expected-response and expected-keywords appended to $ARTIFACT_DIR/input-prompt-curl-req.log"
+
+              text_success=false
+              text_timeout=180
+              text_interval=15
+              text_max_attempts=$((text_timeout / text_interval))
+              {
+                for attempt in $(seq 1 "$text_max_attempts"); do
+                  echo "Text completion request attempt ${attempt}/${text_max_attempts}..."
+                  response=$(curl --noproxy '*' -sS -X POST "$ENDPOINT" \
+                    -H "Content-Type: application/json" \
+                    -d "$REQUEST_BODY" 2>&1)
+
+                  echo "$response"
+                  # The response body itself, not just the transcript, so the
+                  # artifact carries something machine-readable. Last attempt wins.
+                  printf '%s\n' "$response" > "$ARTIFACT_DIR/curl_response.json"
+
+                  # Check if response contains error indicators
+                  if echo "$response" | grep -qE 'Service Unavailable|Connection refused|error'; then
+                    echo "Text completion attempt ${attempt} failed (service not ready), retrying in ${text_interval}s..."
+                    sleep "$text_interval"
+                  else
+                    echo "Text completion request completed (attempt ${attempt}/${text_max_attempts})"
+                    text_success=true
+                    break
+                  fi
+                done
+
+                if [ "$text_success" != "true" ]; then
+                  echo "WARNING: text completion curl request failed after ${text_max_attempts} attempts"
+                fi
+                echo ""
+                echo "Curl smoke test complete"
+              } 2>&1 | tee -a "$ARTIFACT_DIR/curl_test.log"
+
+              echo ""
+              echo "========================================="
+              echo "Curl test completed (logs saved to $ARTIFACT_DIR/curl_test.log)"
+              echo "========================================="
+              save_artifacts
+
+              echo "========================================="
+              echo "Running PX-DX Benchmark (Prefill and Decode on two cards of one XPU host)"
+              echo "========================================="
+              echo ""
+              echo "Configuration:"
+              echo "  FRONTEND_HOST: $FRONTEND_HOST"
+              echo "  FRONTEND_PORT: ${FRONTEND_PORT}"
+              echo "  MODEL: ${MODEL_PATH}"
+              echo "  ISL: ${ISL}"
+              echo "  OSL: ${OSL}"
+              echo "  CONC: ${CONC}"
+              echo "  NUM_PROMPTS: ${NUM_PROMPTS}"
+              echo "  REQUEST_RATE: ${REQUEST_RATE}"
+              echo ""
+
+              # The exact command line and the benchmark's output each become their
+              # own file in the run artifact (bench/bench_serve-command.txt,
+              # bench/bench_serve.log), cut out of this pod's log at the marker
+              # lines below. The argument list is built once with `set --`, so the
+              # saved command cannot drift from the one that runs. Arguments with
+              # anything beyond [A-Za-z0-9_./:=,-] are single-quoted, so the saved
+              # line pastes back into a shell as is.
+              set -- vllm bench serve \
+                --backend openai \
+                --base-url "http://$FRONTEND_HOST:$FRONTEND_PORT" \
+                --endpoint /v1/completions \
+                --model "$MODEL_PATH" \
+                --dataset-name random \
+                --tokenizer "$MODEL_PATH" \
+                --num-prompts "$NUM_PROMPTS" \
+                --random-input-len "$ISL" \
+                --random-output-len "$OSL" \
+                --max-concurrency "$CONC" \
+                --request-rate "$REQUEST_RATE" \
+                --ready-check-timeout-sec 120 \
+                --percentile-metrics ttft,tpot,itl,e2el \
+                --metric-percentiles 50,90,99 \
+                --ignore-eos
+              echo "@@ci-artifact-begin bench_serve-command.txt"
+              for arg in "$@"; do
+                case "$arg" in
+                  *[!A-Za-z0-9_./:=,-]*) printf "'%s' " "$arg" ;;
+                  *) printf '%s ' "$arg" ;;
+                esac
+              done
+              echo
+              echo "@@ci-artifact-end bench_serve-command.txt"
+              echo "@@ci-artifact-begin bench_serve.log"
+              "$@"
+              echo "@@ci-artifact-end bench_serve.log"
+
+              echo ""
+              echo "========================================="
+              echo "Benchmark Complete"
+              echo "========================================="
+          env:
+            - name: FRONTEND_PORT
+              value: "8000"
+            - name: MODEL
+              value: "$MODEL"
+            - name: ISL
+              value: "1024"
+            - name: OSL
+              value: "256"
+            - name: CONC
+              value: "8"
+            - name: NUM_PROMPTS
+              value: "100"
+            - name: REQUEST_RATE
+              value: "inf"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HF_HUB_OFFLINE
+              value: "0"
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
