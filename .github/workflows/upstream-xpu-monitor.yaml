@@ -1,0 +1,251 @@
+# Watches the XPU test runs in upstream ai-dynamo/dynamo and reports what they
+# really mean.
+#
+# Read-only. It reads upstream's public run history and job logs, and writes
+# this run's job summary. Nothing is pushed anywhere, and no secret is needed:
+# the default GITHUB_TOKEN can read a public repo.
+#
+# Upstream's green or red badge often says nothing about XPU
+# (see XPU-CI-FAILURE-REPORT.md). So every upstream run is put in one group:
+#   tested-fail  an XPU build or test job failed. The cause is read from its log.
+#   tested-pass  the XPU build and test jobs ran, and the run passed.
+#   not-tested   green, but every XPU job was skipped: the PR has no `xpu`
+#                label (guard), or no core/vLLM file changed (changed-files).
+#   file-error   0 jobs. GitHub could not read a branch's copy of the workflow
+#                file, so nothing was tested and nothing failed.
+#   other        failed or cancelled for a reason outside the XPU build and
+#                test jobs, e.g. a job that never got a runner.
+#   running      still in progress. Only seen in a manual run with `hours` set.
+# xpu-status-check is never blamed. It only repeats the result of the jobs
+# before it.
+name: Upstream XPU monitor
+
+on:
+  schedule:
+    # 00:23, 06:23, 12:23 and 18:23 UTC. Off-round minute on purpose: GitHub
+    # delays cron that fires exactly on the hour, when everyone else's jobs are
+    # queued.
+    - cron: "23 0,6,12,18 * * *"
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "Look back this many hours from now instead of the scheduled 6 h slot. Keep it under about 48: every run costs one API call against a 1000-per-hour limit."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-xpu-monitor
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ai-dynamo/dynamo
+  SLOT_SECONDS: 21600
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Pick the time window
+        id: window
+        env:
+          HOURS: ${{ inputs.hours }}
+        run: |
+          set -euo pipefail
+          now="$(date -u +%s)"
+          if [ -n "${HOURS}" ]; then
+            case "${HOURS}" in
+              *[!0-9]*) echo "::error::hours must be a whole number, got '${HOURS}'"; exit 1 ;;
+            esac
+            start=$(( now - HOURS * 3600 ))
+            end="${now}"
+          else
+            # The 6 h slot that ENDED one full slot ago. Its runs have had at
+            # least 6 h to finish. Each scheduled run takes the next slot, so a
+            # run that starts late neither skips runs nor reports them twice.
+            end=$(( now / SLOT_SECONDS * SLOT_SECONDS - SLOT_SECONDS ))
+            start=$(( end - SLOT_SECONDS ))
+          fi
+          fmt() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+          # created=A..B includes both ends, so stop one second short of the
+          # next slot's start.
+          echo "range=$(fmt "${start}")..$(fmt $(( end - 1 )))" >> "$GITHUB_OUTPUT"
+
+      - name: Sort upstream XPU runs into groups
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RANGE: ${{ steps.window.outputs.range }}
+        run: |
+          set -euo pipefail
+          R="${UPSTREAM_REPO}"
+          rows="${RUNNER_TEMP}/rows.tsv"   # group, workflow, run, branch, detail
+          : > "${rows}"
+
+          # The XPU build and test jobs. When PR-XPU calls xpu-ci.yaml they are
+          # named "xpu-ci-vllm / build-xpu" and so on. cleanup-xpu is left out
+          # on purpose: it tests nothing, so its failure lands in "other".
+          XPU_JOB='(^|/ )(build-xpu|test-xpu[A-Za-z0-9-]*)$'
+
+          # Every known cause found in a failed job's log, from the causes in
+          # XPU-CI-FAILURE-REPORT.md. One log can hold several.
+          cause() {
+            local log="$1" m found=()
+            if m="$(grep -m1 -oE "No module named '[^']+'" "${log}")"; then
+              found+=("module missing from the XPU image: ${m}")
+            fi
+            if grep -q 'auditwheel: command not found' "${log}"; then
+              found+=("auditwheel missing from the wheel build")
+            fi
+            if grep -q 'Address already in use' "${log}"; then
+              found+=("port collision: Address already in use")
+            fi
+            if m="$(grep -m1 -oE 'Timeout >[0-9.]+s' "${log}")"; then
+              found+=("pytest timeout: ${m}")
+            fi
+            if m="$(grep -m1 -oE "unexpected keyword argument '[^']+'" "${log}")"; then
+              found+=("API change: ${m}")
+            fi
+            if grep -qE 'Temporary failure in name resolution|TLS handshake timeout|i/o timeout|net/http: request canceled' "${log}"; then
+              found+=("network trouble on the XPU runner")
+            fi
+            if [ "${#found[@]}" -eq 0 ]; then
+              # Job log lines start with a timestamp; drop it.
+              m="$(grep -m1 -E '##\[error\]|Error:|FAILED ' "${log}" \
+                | sed -E 's/^[0-9]{4}-[0-9T:.-]+Z //' | cut -c1-200 || true)"
+              found+=("unclassified: ${m:-no error line found}")
+            fi
+            local IFS=';'
+            echo "${found[*]}"
+          }
+
+          # $1 group, $2 workflow, $3 run link, $4 branch, $5 detail
+          add() {
+            local detail="${5//|/\\|}"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "${detail//$'\t'/ }" >> "${rows}"
+          }
+
+          classify() {
+            local wf="$1" id="$2" status="$3" concl="$4" branch="$5" url="$6"
+            local ref="[${id}](${url})" jobs n ran failed detail=""
+            if [[ "${branch}" =~ ^pull-request/([0-9]+)$ ]]; then
+              branch="[PR #${BASH_REMATCH[1]}](https://github.com/${R}/pull/${BASH_REMATCH[1]})"
+            fi
+
+            if [ "${status}" != "completed" ]; then
+              add running "${wf}" "${ref}" "${branch}" "status ${status}"
+              return
+            fi
+
+            jobs="$(gh api --paginate "repos/${R}/actions/runs/${id}/jobs?per_page=100" \
+              --jq '.jobs[] | {id, name, conclusion, runner_name}' | jq -s .)"
+            n="$(jq length <<<"${jobs}")"
+
+            if [ "${n}" -eq 0 ]; then
+              if [ "${concl}" = "failure" ]; then
+                add file-error "${wf}" "${ref}" "${branch}" "0 jobs: GitHub could not read the workflow file on this branch"
+              else
+                add other "${wf}" "${ref}" "${branch}" "0 jobs, conclusion ${concl}"
+              fi
+              return
+            fi
+
+            if [ "${concl}" = "cancelled" ]; then
+              detail="$(jq -r '[.[] | select(.conclusion == "cancelled" and (.runner_name // "") == "") | .name] | join(", ")' <<<"${jobs}")"
+              add other "${wf}" "${ref}" "${branch}" \
+                "run cancelled${detail:+; never got a runner: ${detail}}"
+              return
+            fi
+
+            failed="$(jq -c --arg re "${XPU_JOB}" \
+              '.[] | select((.name | test($re)) and (.conclusion == "failure" or .conclusion == "timed_out"))' <<<"${jobs}")"
+            if [ -n "${failed}" ]; then
+              local jid jname jconcl log
+              while read -r j; do
+                jid="$(jq -r .id <<<"${j}")"
+                jname="$(jq -r .name <<<"${j}")"
+                jconcl="$(jq -r .conclusion <<<"${j}")"
+                log="${RUNNER_TEMP}/job-${jid}.log"
+                if gh api "repos/${R}/actions/jobs/${jid}/logs" > "${log}" 2>/dev/null; then
+                  detail+="**${jname}** (${jconcl}): $(cause "${log}")<br>"
+                else
+                  detail+="**${jname}** (${jconcl}): log not available<br>"
+                fi
+              done <<<"${failed}"
+              add tested-fail "${wf}" "${ref}" "${branch}" "${detail}"
+              return
+            fi
+
+            ran="$(jq -r --arg re "${XPU_JOB}" \
+              '[.[] | select((.name | test($re)) and .conclusion != "skipped")] | length' <<<"${jobs}")"
+
+            if [ "${concl}" = "success" ] && [ "${ran}" -gt 0 ]; then
+              detail="$(jq -r --arg re "${XPU_JOB}" \
+                '[.[] | select((.name | test($re)) and .conclusion == "success") | .name | sub("^.*/ "; "")] | join(", ")' <<<"${jobs}")"
+              add tested-pass "${wf}" "${ref}" "${branch}" "passed: ${detail}"
+              return
+            fi
+
+            if [ "${concl}" = "success" ]; then
+              if jq -e '.[] | select(.name == "changed-files" and .conclusion == "skipped")' <<<"${jobs}" >/dev/null; then
+                detail="no xpu label: guard skipped every later job"
+              else
+                detail="no core or vLLM file changed: changed-files skipped the XPU jobs"
+              fi
+              add not-tested "${wf}" "${ref}" "${branch}" "${detail}"
+              return
+            fi
+
+            # Failed, but no XPU build or test job failed.
+            detail="$(jq -r '[.[] | select(.name != "xpu-status-check" and (.name | endswith("/ xpu-status-check") | not)
+                                     and (.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled"))
+                              | "\(.name) (\(.conclusion))"] | join(", ")' <<<"${jobs}")"
+            add other "${wf}" "${ref}" "${branch}" \
+              "conclusion ${concl}; ${detail:-every job passed but the run is marked ${concl}}"
+          }
+
+          for wf in pr-xpu.yaml xpu-ci.yaml; do
+            gh api --paginate "repos/${R}/actions/workflows/${wf}/runs?created=${RANGE}&per_page=100" \
+              --jq '.workflow_runs[] | [.id, .status, (.conclusion // "-"), .head_branch, .html_url] | @tsv' \
+            | while IFS=$'\t' read -r id status concl branch url; do
+                classify "${wf}" "${id}" "${status}" "${concl}" "${branch}" "${url}"
+              done
+          done
+
+          count() { awk -F'\t' -v g="$1" '$1 == g' "${rows}" | wc -l; }
+          table() {
+            echo "| Workflow | Run | Branch | Detail |"
+            echo "|---|---|---|---|"
+            awk -F'\t' -v g="$1" '$1 == g { printf "| %s | %s | %s | %s |\n", $2, $3, $4, $5 }' "${rows}"
+          }
+
+          {
+            echo "## Upstream XPU runs in ${R}, created ${RANGE} UTC"
+            echo
+            echo "| Group | Runs |"
+            echo "|---|---|"
+            for g in tested-fail tested-pass not-tested file-error other running; do
+              echo "| ${g} | $(count "${g}") |"
+            done
+            for g in tested-fail other file-error tested-pass running; do
+              [ "$(count "${g}")" -gt 0 ] || continue
+              echo
+              echo "### ${g}"
+              echo
+              table "${g}"
+            done
+            if [ "$(count not-tested)" -gt 0 ]; then
+              echo
+              echo "<details><summary>not-tested: green, but no XPU job ran</summary>"
+              echo
+              table not-tested
+              echo
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
