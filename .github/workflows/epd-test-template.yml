@@ -67,6 +67,11 @@ on:
         required: false
         type: string
         default: ''
+      expect_benchmark_result:
+        description: 'Whether the bench Job emits vllm-bench results to validate (Successful/Failed requests). Set false for functional tests (e.g. omni-ar-dit-2nodes) where pass/fail is the bench Job exit code.'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -526,10 +531,13 @@ jobs:
 
           # Query the frontend's /health through the apiserver proxy: the runner
           # has no cluster DNS and no guarantee of in-cluster reachability, so
-          # `kubectl get --raw` is the portable way in. /health lists every
-          # instance the frontend has discovered -- the same assertion the bench
-          # pod makes later, made here where a failure is attributable to the
-          # deployment rather than to the benchmark.
+          # `kubectl get --raw` is the portable way in. /health?instances=true
+          # lists every instance the frontend has discovered -- the same
+          # assertion the bench pod makes later, made here where a failure is
+          # attributable to the deployment rather than to the benchmark.
+          # Plain /health is status-only since ai-dynamo/dynamo#16454 (see the
+          # /health NOTE in xpu-heterogeneous-run.yml), so the query parameter
+          # is required; older nightlies ignore it.
           echo ""
           echo "Waiting for Frontend to report status=healthy with worker endpoints..."
           # 30 min, matching timeout_sec for the same check inside the bench pod.
@@ -542,7 +550,7 @@ jobs:
           health_response=""
           while [ "$health_elapsed" -lt "$health_timeout" ]; do
             health_response=$(kubectl get --raw \
-              "/api/v1/namespaces/$NS/services/$FRONTEND_SVC:8000/proxy/health" 2>&1 || echo "")
+              "/api/v1/namespaces/$NS/services/$FRONTEND_SVC:8000/proxy/health?instances=true" 2>&1 || echo "")
 
             # Count this deployment's *.generate instances (prefill.generate,
             # backend.generate for decode, encode.generate when present).
@@ -677,6 +685,13 @@ jobs:
                 exit 1
               fi
 
+              # Functional tests (expect_benchmark_result=false) self-validate in the
+              # bench script and gate on its exit code; the Succeeded phase is the pass.
+              if [ "${{ inputs.expect_benchmark_result }}" != "true" ]; then
+                echo "✓ Functional test passed"
+                exit 0
+              fi
+
               # Parse benchmark results
               SUCCESSFUL_REQUESTS=$(echo "$LOGS" | grep -oP 'Successful requests:\s+\K\d+' || echo "")
               FAILED_REQUESTS=$(echo "$LOGS" | grep -oP 'Failed requests:\s+\K\d+' || echo "")
@@ -731,8 +746,9 @@ jobs:
       - name: Collect logs
         if: always()
         run: |
-          # Final snapshot into LOCAL_LOG_DIR (runner-local; not uploaded -- only
-          # UPLOAD_LOG_DIR ships in the artifact). Reuses the shared helper, which
+          # Final snapshot into LOCAL_LOG_DIR (runner-local; "Stage all logs for
+          # upload" below copies it into UPLOAD_LOG_DIR, which is what ships in the
+          # artifact). Reuses the shared helper, which
           # guards against an empty TEST_NAME and captures current + previous
           # logs, describe, and events. If an earlier step already failed it
           # wrote a subdir snapshot (e.g. pod-error/) that survives here.
@@ -749,6 +765,16 @@ jobs:
           INPUT_TEST_NAME: ${{ inputs.test_name }}
         run: |
           echo "Generating performance summary JSON..."
+
+          # Functional tests produce no benchmark metrics; emit a minimal summary
+          # instead of parsing (which would yield malformed JSON with empty fields).
+          if [ "${{ inputs.expect_benchmark_result }}" != "true" ]; then
+            echo "Functional test; writing functional perf_summary.json"
+            printf '{"test_name": "%s", "type": "functional", "timestamp": "%s"}\n' \
+              "$INPUT_TEST_NAME" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+              > "$UPLOAD_LOG_DIR/perf_summary.json"
+            exit 0
+          fi
 
           # Find benchmark pod log file
           BENCHMARK_LOG=""
@@ -856,19 +882,31 @@ jobs:
           echo "✓ Generated perf_summary.json:"
           head -20 "$UPLOAD_LOG_DIR/perf_summary.json"
 
-      - name: Stage failure diagnostics for upload
-        if: failure()
+      - name: Stage all logs for upload
+        if: always()
         shell: bash
         run: |
           set -u
-          # On success the artifact ships only perf_summary.json + the bench log.
-          # On failure the pod diagnostics live solely in LOCAL_LOG_DIR (plus
-          # failure subdirs like pod-error/), so they never reach the downloadable
-          # artifact. Copy just those files -- pod *.log, *-previous.log, and
-          # *-describe.txt -- into UPLOAD_LOG_DIR, preserving the subdir layout,
-          # so a failed run is debuggable from the artifact alone.
+          # Everything collected for this test goes into the artifact, pass or
+          # fail: each pod's log (frontend, prefill, decode, encode, bench) in its
+          # own file, its describe, events, pod lists, the rendered manifest, the
+          # deploy log, and any failure subdir (pod-error/, bench-failed/, ...).
+          # This step used to run on failure only, so a passing run shipped just
+          # perf_summary.json and the bench log, and its server logs never left
+          # the runner.
+          #
+          # Two folders are derived on top of the raw copies:
+          #   commands/  one file per service in the rendered manifest -- image,
+          #              command, args and env exactly as handed to the pod --
+          #              plus one for the bench Job.
+          #   bench/     files the bench pod printed into its own log between
+          #              "@@ci-artifact-begin <name>" / "@@ci-artifact-end <name>"
+          #              lines: curl transcript, the exact `vllm bench serve`
+          #              command and its output, the omni PNG (base64). The pod has
+          #              exited by the time this runs, so nothing can be copied off
+          #              it; its log is the only way out.
           # Guard against the vars being unset (e.g. the Prepare step failed
-          # before writing GITHUB_ENV) so set -u doesn't abort this failure hook.
+          # before writing GITHUB_ENV) so set -u doesn't abort this hook.
           local_dir="${LOCAL_LOG_DIR:-}"
           upload_dir="${UPLOAD_LOG_DIR:-}"
           if [ -z "$local_dir" ] || [ -z "$upload_dir" ]; then
@@ -881,6 +919,11 @@ jobs:
           fi
           mkdir -p "$upload_dir"
           cd "$local_dir" || exit 0
+
+          # Raw copies, subdir layout preserved. Empty files are skipped:
+          # dump-diagnostics.sh writes a <pod>-previous.log for every pod, and it
+          # stays empty unless that container restarted. The helper script is
+          # not a log.
           staged=0
           while IFS= read -r -d '' f; do
             dest="$upload_dir/$f"
@@ -888,8 +931,111 @@ jobs:
             if cp "$f" "$dest"; then
               staged=$((staged + 1))
             fi
-          done < <(find . \( -name '*.log' -o -name '*-describe.txt' \) -type f -print0)
-          echo "Staged $staged failure-diagnostic file(s) into $upload_dir"
+          done < <(find . -type f -size +0 ! -name dump-diagnostics.sh -print0)
+          echo "Staged $staged collected file(s) into $upload_dir"
+
+          # commands/: one file per service. A service with no command here (the
+          # Frontend, usually) runs the operator's default entrypoint; the
+          # <pod>-describe.txt next to its log shows what the container actually
+          # ran.
+          #
+          # The runners' yq is the Python one (a jq wrapper), not mikefarah's Go
+          # yq: expressions are jq syntax, -r prints raw strings, -y prints YAML,
+          # and values go in with --arg. strenv() and unquoted key output are Go
+          # yq only -- using them wrote `commands/"decode"-command.yaml`, and
+          # upload-artifact rejects a `"` in a path, failing the whole upload.
+          # The filename is reduced to [a-z0-9._-] so whatever yq prints can
+          # never again cost the artifact.
+          #
+          # Each <name>-command.yaml gets a plain-text twin, <name>-command.sh:
+          # -y folds a multi-line script into one quoted string full of \n, which
+          # is exact but unreadable and cannot be pasted. For `/bin/sh -c
+          # <script>` the .sh holds the script verbatim, one flag per line as in
+          # the test yaml; any other command is joined and shell-quoted. A
+          # service with no command (the Frontend) gets no .sh.
+          rendered="$local_dir/deploy-test-rendered.yaml"
+          sh_filter='((.command // []) + (.args // [])) | if length == 0 then empty elif length >= 3 and .[1] == "-c" then .[2] else map(@sh) | join(" ") end'
+          # write_sh <out> <header> <yq args...>
+          write_sh() {
+            local out=$1 header=$2 script
+            shift 2
+            if ! script=$(yq -r "$@" "$rendered"); then
+              echo "WARNING: could not read the command for $out"
+              return 0
+            fi
+            [ -n "$script" ] || return 0
+            if {
+              echo "# $header"
+              printf '%s\n' "$script"
+            } > "$out"; then
+              echo "Wrote $out"
+            else
+              echo "WARNING: could not write $out"
+            fi
+          }
+          if [ -s "$rendered" ]; then
+            mkdir -p "$upload_dir/commands"
+            yq -r 'select(.kind == "DynamoGraphDeployment") | .spec.services | keys[]' "$rendered" |
+            while IFS= read -r svc; do
+              [ -n "$svc" ] || continue
+              base="$upload_dir/commands/$(printf '%s' "$svc" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '_')-command"
+              out="$base.yaml"
+              if {
+                echo "# Service $svc of ${TEST_NAME:-?}, from deploy-test-rendered.yaml"
+                yq -y --arg svc "$svc" 'select(.kind == "DynamoGraphDeployment") | .spec.services[$svc].extraPodSpec.mainContainer | {"image": .image, "command": .command, "args": .args, "env": .env} | with_entries(select(.value != null))' "$rendered"
+              } > "$out"; then
+                echo "Wrote $out"
+              else
+                echo "WARNING: could not write $out"
+              fi
+              write_sh "$base.sh" "Service $svc of ${TEST_NAME:-?}: the container's command, from deploy-test-rendered.yaml" \
+                --arg svc "$svc" "select(.kind == \"DynamoGraphDeployment\") | .spec.services[\$svc].extraPodSpec.mainContainer | $sh_filter"
+            done
+            out="$upload_dir/commands/bench-job-command.yaml"
+            if {
+              echo "# Benchmark Job of ${TEST_NAME:-?}, from deploy-test-rendered.yaml"
+              yq -y 'select(.kind == "Job") | .spec.template.spec.containers[0] | {"image": .image, "command": .command, "args": .args, "env": .env} | with_entries(select(.value != null))' "$rendered"
+            } > "$out"; then
+              echo "Wrote $out"
+            else
+              echo "WARNING: could not write $out"
+            fi
+            write_sh "$upload_dir/commands/bench-job-command.sh" "Benchmark Job of ${TEST_NAME:-?}: the container's command, from deploy-test-rendered.yaml" \
+              "select(.kind == \"Job\") | .spec.template.spec.containers[0] | $sh_filter"
+          else
+            echo "No rendered manifest at $rendered; commands/ not written"
+          fi
+
+          # bench/: cut the marked files out of the final bench pod log. The name
+          # must be a plain filename, so a stray marker cannot write outside
+          # bench/. A name that appears twice (save_artifacts runs mid-script and
+          # again at exit) keeps its last copy.
+          bench_log=$(find "$local_dir" -maxdepth 1 -type f -name '*-bench-*.log' ! -name '*-previous.log' | head -n1)
+          if [ -n "$bench_log" ]; then
+            mkdir -p "$upload_dir/bench"
+            awk -v dir="$upload_dir/bench" '
+              $1 ~ /^@@ci-artifact-begin(-b64)?$/ && $2 ~ /^[A-Za-z0-9._-]+$/ {
+                if (out != "") close(out)
+                out = dir "/" $2 ($1 == "@@ci-artifact-begin-b64" ? ".b64" : "")
+                printf "" > out
+                next
+              }
+              $1 == "@@ci-artifact-end" { if (out != "") close(out); out = ""; next }
+              out != "" { print > out }
+            ' "$bench_log"
+            for f in "$upload_dir"/bench/*.b64; do
+              [ -e "$f" ] || continue
+              if base64 -d "$f" > "${f%.b64}"; then
+                rm -f "$f"
+              else
+                echo "WARNING: could not decode $f; left as base64"
+              fi
+            done
+            echo "Extracted from $bench_log:"
+            ls -la "$upload_dir/bench"
+          else
+            echo "No bench pod log in $local_dir; bench/ not written"
+          fi
 
       - name: Upload logs
         if: always()

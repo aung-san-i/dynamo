@@ -7,8 +7,9 @@ name: XPU-Heterogeneous-Run
 # REUSABLE XPU heterogeneous P/D pipeline.
 # ============================================================================
 # guard -> changed-files -> build-xpu / build-nvidia -> resolve-images ->
-# heterog-test-px-dn -> heterog-test-pn-dx -> cleanup-images ->
-# xpu-status-check.
+# heterog-test-px-dn -> heterog-test-pn-dx -> heterog-test-e-pd-2nodes ->
+# heterog-test-px-dn-hnd-tp2 -> heterog-test-px-dx -> heterog-test-epd-3way-2node
+# -> heterog-test-omni-ar-dit-2nodes -> cleanup-images -> xpu-status-check.
 #
 # Called by exactly three thin trigger workflows, one per merge phase:
 #
@@ -84,17 +85,17 @@ on:
         type: string
         default: 'latest'
       runner:
-        description: 'Runner label for every job in this pipeline and both tests.'
+        description: 'Runner label for every job in this pipeline and every test.'
         required: false
         type: string
         default: 'xpu-heterogeneous-ubuntu-latest'
       model:
-        description: 'Model passed to both heterogeneous tests.'
+        description: 'Model passed to the Qwen3-0.6B P/D tests (px-dn, pn-dx, px-dx). The other tests run their manifest''s own model.'
         required: false
         type: string
         default: 'Qwen/Qwen3-0.6B'
       tensor_parallel:
-        description: 'Tensor parallel size passed to both heterogeneous tests.'
+        description: 'Tensor parallel size passed to the same tests as `model`. The other tests run their manifest''s own TP.'
         required: false
         type: string
         default: '1'
@@ -385,6 +386,22 @@ jobs:
           # Tag only -- GPU_PATH must keep matching GPU_REPO for the registry API
           # calls below, so do not fold a full image reference in here. An empty
           # value falls back to "latest" rather than requesting ":".
+          #
+          # /health NOTE: upstream ai-dynamo/dynamo#16454 (a789babbe3) made the
+          # frontend's /health status-only -- {"status":"healthy","stage":"ready"},
+          # no "endpoints" list -- unless the request asks for ?instances=true.
+          #   last nightly BEFORE the change: 20261023-75d0686
+          #       (sha256:65242c9b150f9938e02fb1a8a42b6897fb86d8cbb8e2819953d6b7b0241f39ce,
+          #        last passing run 40051657595)
+          #   first nightly seen WITH it:     20261025-1ecc870
+          #       (sha256:97e5567273c9ad562b2b080ecdd614131c5501cc644b91031b57026e3b3fed82,
+          #        every check saw 0 workers in run 40370917586)
+          # The worker-count checks (epd-test-template.yml "Check Service
+          # endpoints" and the bench pod in every test yaml) now request
+          # /health?instances=true. Older nightlies ignore the parameter and
+          # return the full list anyway, so pinning back to 20261023-75d0686 or
+          # earlier still works. Any new check that counts endpoints must use
+          # ?instances=true too, or it sees 0 workers on current nightlies.
           GPU_TAG="${GPU_TAG_INPUT:-latest}"
           # ---------------------------------------------------------------------
 
@@ -944,6 +961,186 @@ jobs:
       model: ${{ inputs.model }}
       tensor_parallel: ${{ inputs.tensor_parallel }}
 
+  # ----------------------------------------------------------------------------
+  # Tests ported from the internal heterog suite. Each one waits for the
+  # previous test, as pn-dx waits for px-dn: every P/D run takes the whole
+  # intel.com/rdma=2 Kueue quota (one NIC per worker node), so running them side
+  # by side would only queue them inside Kueue against the template's 1 hour
+  # readiness budget. `!= 'cancelled'` keeps a failed test from skipping the rest.
+  #
+  # Unlike px-dn/pn-dx, these pass no `model`/`tensor_parallel` unless they run
+  # the same Qwen3-0.6B TP=1 shape: each manifest carries its own
+  # `${MODEL:-<hub id>}` and `${TENSOR_PARALLEL:-N}` defaults, and the
+  # pipeline-wide Qwen3-0.6B / TP=1 would override them.
+  # ----------------------------------------------------------------------------
+
+  heterog-test-e-pd-2nodes:
+    name: "Heterog: XPU Encode + NVIDIA Prefill-Decode"
+    needs: [changed-files, build-xpu, resolve-images, heterog-test-pn-dx]
+    if: >-
+      always() &&
+      needs.build-xpu.result == 'success' &&
+      needs.resolve-images.result == 'success' &&
+      needs.heterog-test-pn-dx.result != 'cancelled' &&
+      (needs.changed-files.outputs.core == 'true' ||
+      needs.changed-files.outputs.vllm == 'true')
+    uses: ./.github/workflows/epd-test-template.yml
+    secrets: inherit
+    with:
+      test_name: "e-pd-2nodes"
+      test_yaml_path: ".ci/test/dynamo-heterog/k8s/tests/e-pd_2nodes.yaml"
+      runner: ${{ inputs.runner }}
+      CHECKOUT_COMMIT: ${{ needs.changed-files.outputs.checkout_ref }}
+      docker_image_xpu: ${{ needs.build-xpu.outputs.image }}
+      docker_image_gpu: "${{ needs.resolve-images.outputs.docker_image_gpu }}"
+      xpu_resource_template: "onexpu-rdma-kueue"
+      nvidia_resource_template: "onenvidia-rdma-kueue"
+      xpu_node: "xpu_node"
+      nvidia_node: "nvidia_node"
+      # No model / tensor_parallel: the manifest defaults to
+      # Qwen/Qwen3-VL-32B-Instruct-FP8, a multimodal model the encode split needs.
+
+  heterog-test-px-dn-hnd-tp2:
+    name: "Heterog: XPU Prefill TP2 + NVIDIA Decode (HND)"
+    needs: [changed-files, build-xpu, resolve-images, heterog-test-e-pd-2nodes]
+    if: >-
+      always() &&
+      needs.build-xpu.result == 'success' &&
+      needs.resolve-images.result == 'success' &&
+      needs.heterog-test-e-pd-2nodes.result != 'cancelled' &&
+      (needs.changed-files.outputs.core == 'true' ||
+      needs.changed-files.outputs.vllm == 'true')
+    uses: ./.github/workflows/epd-test-template.yml
+    secrets: inherit
+    with:
+      test_name: "px-dn-hnd-tp2"
+      test_yaml_path: ".ci/test/dynamo-heterog/k8s/tests/px-dn-hnd-tp2.yaml"
+      runner: ${{ inputs.runner }}
+      CHECKOUT_COMMIT: ${{ needs.changed-files.outputs.checkout_ref }}
+      docker_image_xpu: ${{ needs.build-xpu.outputs.image }}
+      docker_image_gpu: "${{ needs.resolve-images.outputs.docker_image_gpu }}"
+      # 2 XPU cards + 1 NIC in ONE claim, for the TP=2 prefill worker. Decode
+      # stays TP=1 on the usual 1-GPU template.
+      xpu_resource_template: "twoxpu-rdma-kueue"
+      nvidia_resource_template: "onenvidia-rdma-kueue"
+      xpu_node: "xpu_node"
+      nvidia_node: "nvidia_node"
+      # No model / tensor_parallel: the manifest defaults to openai/gpt-oss-20b
+      # with prefill TP=2 and decode TP=1; tensor_parallel: 1 would undo the
+      # very thing this test is for.
+
+  # ----------------------------------------------------------------------------
+  # SR-IOV VFs: each of the three tests below puts two NIXL workers on ONE node.
+  # Each worker node has one cabled port, and a port can go to one pod only
+  # (dranet moves the netdev into the pod's netns). The VFs of that port are
+  # separate RDMA devices, so on the crowded node both workers claim a VF
+  # template (*-rdma-vf-kueue, device class rdma-dranet-mlx5-vf-up):
+  #
+  #   px-dx               Prefill + Decode on the XPU node   -> onexpu-rdma-vf-kueue
+  #   epd-3way-2node      Prefill + Dec on the NVIDIA node   -> onenvidia-rdma-vf-kueue
+  #   omni-ar-dit-2nodes  Ar + Router on the NVIDIA node     -> onenvidia-rdma-vf-kueue
+  #
+  # The lone worker on the other node keeps the physical-port template.
+  # epd-3way-2node and omni claim 3 RDMA devices per run, so Kueue's
+  # intel.com/rdma quota must be at least 3, and rdma-dranet-mlx5-vf-up must be
+  # mapped to intel.com/rdma in kueue-manager-config's deviceClassMappings.
+  # ----------------------------------------------------------------------------
+
+  heterog-test-px-dx:
+    name: "Heterog: XPU Prefill + XPU Decode (one node)"
+    needs: [changed-files, build-xpu, resolve-images, heterog-test-px-dn-hnd-tp2]
+    if: >-
+      always() &&
+      needs.build-xpu.result == 'success' &&
+      needs.resolve-images.result == 'success' &&
+      needs.heterog-test-px-dn-hnd-tp2.result != 'cancelled' &&
+      (needs.changed-files.outputs.core == 'true' ||
+      needs.changed-files.outputs.vllm == 'true')
+    uses: ./.github/workflows/epd-test-template.yml
+    secrets: inherit
+    with:
+      test_name: "px-dx"
+      test_yaml_path: ".ci/test/dynamo-heterog/k8s/tests/px-dx.yaml"
+      runner: ${{ inputs.runner }}
+      CHECKOUT_COMMIT: ${{ needs.changed-files.outputs.checkout_ref }}
+      docker_image_xpu: ${{ needs.build-xpu.outputs.image }}
+      docker_image_gpu: "${{ needs.resolve-images.outputs.docker_image_gpu }}"
+      # Both workers claim this template: one card + one VF each.
+      xpu_resource_template: "onexpu-rdma-vf-kueue"
+      # Claimed by nothing in px-dx; the template step only checks it exists.
+      nvidia_resource_template: "onenvidia-rdma-kueue"
+      xpu_node: "xpu_node"
+      # The bench Job only, not a worker: it runs `vllm bench serve` from the GPU
+      # image and claims no device.
+      nvidia_node: "nvidia_node"
+      # Same Qwen3-0.6B TP=1 shape as px-dn, so it takes the pipeline inputs.
+      model: ${{ inputs.model }}
+      tensor_parallel: ${{ inputs.tensor_parallel }}
+
+  heterog-test-epd-3way-2node:
+    name: "Heterog: XPU Encode + NVIDIA Prefill + NVIDIA Decode"
+    needs: [changed-files, build-xpu, resolve-images, heterog-test-px-dx]
+    if: >-
+      always() &&
+      needs.build-xpu.result == 'success' &&
+      needs.resolve-images.result == 'success' &&
+      needs.heterog-test-px-dx.result != 'cancelled' &&
+      (needs.changed-files.outputs.core == 'true' ||
+      needs.changed-files.outputs.vllm == 'true')
+    uses: ./.github/workflows/epd-test-template.yml
+    secrets: inherit
+    with:
+      test_name: "epd-3way-2node"
+      test_yaml_path: ".ci/test/dynamo-heterog/k8s/tests/epd_3way_2node.yaml"
+      runner: ${{ inputs.runner }}
+      CHECKOUT_COMMIT: ${{ needs.changed-files.outputs.checkout_ref }}
+      docker_image_xpu: ${{ needs.build-xpu.outputs.image }}
+      docker_image_gpu: "${{ needs.resolve-images.outputs.docker_image_gpu }}"
+      xpu_resource_template: "onexpu-rdma-kueue"
+      # Claimed twice on the NVIDIA node, Prefill and Dec: one GPU + one VF each.
+      nvidia_resource_template: "onenvidia-rdma-vf-kueue"
+      xpu_node: "xpu_node"
+      nvidia_node: "nvidia_node"
+      # No model / tensor_parallel: Qwen/Qwen3-VL-8B-Instruct (bf16) from the
+      # manifest. Not the internal suite's Qwen3-VL-32B-Instruct-FP8: that ran
+      # on H200 (141 GB), and on this cluster's A100 (80 GB) the 32B left each
+      # NVIDIA worker 38.6 GiB of KV cache against 64 GiB needed for one
+      # max-length (262144-token) request, so both crashed at startup. The 8B
+      # needs ~36 GiB and has ~55 GiB free. e-pd-2nodes keeps the 32B on the
+      # same cards only because it sets --kv-cache-dtype fp8 (half the KV size).
+
+  # Functional, not a throughput benchmark: the bench Job drives
+  # /v1/images/generations, validates the PNG signature and exits non-zero on
+  # any failure, so it prints no "Successful requests:" for the template to
+  # parse. Hence expect_benchmark_result: false -- the Job's exit code is the
+  # verdict. No model / tensor_parallel: the manifest pins zai-org/GLM-Image
+  # through OMNI_MODEL, which is outside the template's envsubst list.
+  heterog-test-omni-ar-dit-2nodes:
+    name: "Omni: NVIDIA AR + XPU DiT (GLM-Image)"
+    needs: [changed-files, build-xpu, resolve-images, heterog-test-epd-3way-2node]
+    if: >-
+      always() &&
+      needs.build-xpu.result == 'success' &&
+      needs.resolve-images.result == 'success' &&
+      needs.heterog-test-epd-3way-2node.result != 'cancelled' &&
+      (needs.changed-files.outputs.core == 'true' ||
+      needs.changed-files.outputs.vllm == 'true')
+    uses: ./.github/workflows/epd-test-template.yml
+    secrets: inherit
+    with:
+      test_name: "omni-ar-dit-2nodes"
+      test_yaml_path: ".ci/test/dynamo-heterog/k8s/tests/omni_ar-dit_2nodes.yaml"
+      runner: ${{ inputs.runner }}
+      CHECKOUT_COMMIT: ${{ needs.changed-files.outputs.checkout_ref }}
+      docker_image_xpu: ${{ needs.build-xpu.outputs.image }}
+      docker_image_gpu: "${{ needs.resolve-images.outputs.docker_image_gpu }}"
+      xpu_resource_template: "onexpu-rdma-kueue"
+      # Claimed twice on the NVIDIA node, Ar and Router: one GPU + one VF each.
+      nvidia_resource_template: "onenvidia-rdma-vf-kueue"
+      xpu_node: "xpu_node"
+      nvidia_node: "nvidia_node"
+      expect_benchmark_result: false
+
   # ============================================================================
   # IMAGE CLEANUP – worker nodes and registry
   # ============================================================================
@@ -961,7 +1158,9 @@ jobs:
   # shared by every run that does not build its own; deleting it would only
   # force a multi-GB re-pull on the next run.
   #
-  # Runs after both tests whatever their result, so a failed run cleans up too.
+  # Runs after every test whatever its result, so a failed run cleans up too.
+  # Every heterog-test-* job must be in `needs` below: one left out could still
+  # be pulling the image when this deletes it.
   # The cost: "Re-run failed jobs" re-runs the tests against an image that no
   # longer exists and they fail to pull it. Use "Re-run all jobs" instead,
   # which rebuilds and re-pushes under the same tag.
@@ -972,7 +1171,16 @@ jobs:
 
   cleanup-images:
     name: Clean up test images
-    needs: [build-xpu, build-nvidia, heterog-test-px-dn, heterog-test-pn-dx]
+    needs:
+      - build-xpu
+      - build-nvidia
+      - heterog-test-px-dn
+      - heterog-test-pn-dx
+      - heterog-test-e-pd-2nodes
+      - heterog-test-px-dn-hnd-tp2
+      - heterog-test-px-dx
+      - heterog-test-epd-3way-2node
+      - heterog-test-omni-ar-dit-2nodes
     if: >-
       always() &&
       (needs.build-xpu.outputs.image != '' ||
@@ -983,8 +1191,8 @@ jobs:
       NS: dynamo-system
       XPU_IMAGE: ${{ needs.build-xpu.outputs.image }}
       NVIDIA_IMAGE: ${{ needs.build-nvidia.outputs.image }}
-      # Must match the xpu_node / nvidia_node values passed to both heterog
-      # tests above: the test manifests pin the XPU image to the first and the
+      # Must match the xpu_node / nvidia_node values passed to every heterog
+      # test above: the test manifests pin the XPU image to the first and the
       # GPU image to the second via dynamo.intel.com/node.
       XPU_NODE_LABEL: xpu_node
       NVIDIA_NODE_LABEL: nvidia_node
