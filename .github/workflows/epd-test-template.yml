@@ -943,13 +943,40 @@ jobs:
           # upload-artifact rejects a `"` in a path, failing the whole upload.
           # The filename is reduced to [a-z0-9._-] so whatever yq prints can
           # never again cost the artifact.
+          #
+          # Each <name>-command.yaml gets a plain-text twin, <name>-command.sh:
+          # -y folds a multi-line script into one quoted string full of \n, which
+          # is exact but unreadable and cannot be pasted. For `/bin/sh -c
+          # <script>` the .sh holds the script verbatim, one flag per line as in
+          # the test yaml; any other command is joined and shell-quoted. A
+          # service with no command (the Frontend) gets no .sh.
           rendered="$local_dir/deploy-test-rendered.yaml"
+          sh_filter='((.command // []) + (.args // [])) | if length == 0 then empty elif length >= 3 and .[1] == "-c" then .[2] else map(@sh) | join(" ") end'
+          # write_sh <out> <header> <yq args...>
+          write_sh() {
+            local out=$1 header=$2 script
+            shift 2
+            if ! script=$(yq -r "$@" "$rendered"); then
+              echo "WARNING: could not read the command for $out"
+              return 0
+            fi
+            [ -n "$script" ] || return 0
+            if {
+              echo "# $header"
+              printf '%s\n' "$script"
+            } > "$out"; then
+              echo "Wrote $out"
+            else
+              echo "WARNING: could not write $out"
+            fi
+          }
           if [ -s "$rendered" ]; then
             mkdir -p "$upload_dir/commands"
             yq -r 'select(.kind == "DynamoGraphDeployment") | .spec.services | keys[]' "$rendered" |
             while IFS= read -r svc; do
               [ -n "$svc" ] || continue
-              out="$upload_dir/commands/$(printf '%s' "$svc" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '_')-command.yaml"
+              base="$upload_dir/commands/$(printf '%s' "$svc" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '_')-command"
+              out="$base.yaml"
               if {
                 echo "# Service $svc of ${TEST_NAME:-?}, from deploy-test-rendered.yaml"
                 yq -y --arg svc "$svc" 'select(.kind == "DynamoGraphDeployment") | .spec.services[$svc].extraPodSpec.mainContainer | {"image": .image, "command": .command, "args": .args, "env": .env} | with_entries(select(.value != null))' "$rendered"
@@ -958,6 +985,8 @@ jobs:
               else
                 echo "WARNING: could not write $out"
               fi
+              write_sh "$base.sh" "Service $svc of ${TEST_NAME:-?}: the container's command, from deploy-test-rendered.yaml" \
+                --arg svc "$svc" "select(.kind == \"DynamoGraphDeployment\") | .spec.services[\$svc].extraPodSpec.mainContainer | $sh_filter"
             done
             out="$upload_dir/commands/bench-job-command.yaml"
             if {
@@ -968,6 +997,8 @@ jobs:
             else
               echo "WARNING: could not write $out"
             fi
+            write_sh "$upload_dir/commands/bench-job-command.sh" "Benchmark Job of ${TEST_NAME:-?}: the container's command, from deploy-test-rendered.yaml" \
+              "select(.kind == \"Job\") | .spec.template.spec.containers[0] | $sh_filter"
           else
             echo "No rendered manifest at $rendered; commands/ not written"
           fi
