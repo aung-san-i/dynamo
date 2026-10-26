@@ -80,12 +80,10 @@ on:
           NVIDIA image is built. 'latest' follows the newest nightly and is
           resolved to its immutable YYYYMMDD-sha tag for provenance. Pass a
           dated tag (e.g. 20260727-769ee07) to pin one caller without pinning
-          the others. Defaults to the last nightly known to pass; see the pin
-          note on the shared-images step.
+          the others.
         required: false
         type: string
-        # PINNED, not 'latest' -- see the note in "Set shared images".
-        default: '20261023-75d0686'
+        default: 'latest'
       runner:
         description: 'Runner label for every job in this pipeline and every test.'
         required: false
@@ -388,17 +386,6 @@ jobs:
           # Tag only -- GPU_PATH must keep matching GPU_REPO for the registry API
           # calls below, so do not fold a full image reference in here. An empty
           # value falls back to "latest" rather than requesting ":".
-          #
-          # PIN NOTE: the gpu_tag default is currently 20261023-75d0686, not
-          # "latest". The 20261025-1ecc870 nightly changed the frontend's /health
-          # to {"status":"healthy","stage":"ready"} with no "endpoints" list, and
-          # both the "Check Service endpoints" step in epd-test-template.yml and
-          # the bench pod in every test yaml count *.generate entries in that
-          # list -- so every test waited 30 min and failed with 0 workers (run
-          # 40370917586), although the workers had registered. 20261023-75d0686
-          # (sha256:65242c9b...) is the last nightly seen to pass (run
-          # 40051657595). Return the default to "latest" once those checks no
-          # longer depend on /health listing endpoints.
           GPU_TAG="${GPU_TAG_INPUT:-latest}"
           # ---------------------------------------------------------------------
 
