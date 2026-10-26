@@ -47,7 +47,8 @@ on:
         description: 'nvcr.io vllm-runtime-nightly tag to test (latest, or a dated tag like 20260727-769ee07)'
         required: false
         type: string
-        default: 'latest'
+        # Pinned with the xpu-heterogeneous-run.yml default; see its PIN NOTE.
+        default: '20261023-75d0686'
       build_nvidia_image:
         description: "Build a fresh cuda image instead of using the pinned nvcr.io one"
         required: false
@@ -104,12 +105,15 @@ jobs:
       # value the old cron got from the
       # `event_name == 'schedule' || event_name == 'issue_comment'` expression.
       force_all_tests: true
-      # Defaults reproduce the old cron exactly: pinned nvcr.io image, :latest.
+      # Defaults reproduce the old cron (pinned nvcr.io image), except that the
+      # tag is held on 20261023-75d0686 instead of :latest -- see the PIN NOTE
+      # in xpu-heterogeneous-run.yml. On a cron run inputs.gpu_tag is empty, so
+      # the `||` fallback is what pins it.
       # On a workflow_dispatch the boolean input is rendered to the 'true' /
       # 'false' strings the reusable workflow validates; on a cron run
       # inputs.build_nvidia_image is empty, so `|| 'false'` supplies the default.
       build_nvidia_image: ${{ inputs.build_nvidia_image && 'true' || 'false' }}
-      gpu_tag: ${{ inputs.gpu_tag || 'latest' }}
+      gpu_tag: ${{ inputs.gpu_tag || '20261023-75d0686' }}
 
   # Aggregate status, kept as a TOP-LEVEL job so its Checks API context is
   # `xpu-status-check` rather than `run / xpu-status-check`, identical to the
