@@ -386,6 +386,22 @@ jobs:
           # Tag only -- GPU_PATH must keep matching GPU_REPO for the registry API
           # calls below, so do not fold a full image reference in here. An empty
           # value falls back to "latest" rather than requesting ":".
+          #
+          # /health NOTE: upstream ai-dynamo/dynamo#16454 (a789babbe3) made the
+          # frontend's /health status-only -- {"status":"healthy","stage":"ready"},
+          # no "endpoints" list -- unless the request asks for ?instances=true.
+          #   last nightly BEFORE the change: 20261023-75d0686
+          #       (sha256:65242c9b150f9938e02fb1a8a42b6897fb86d8cbb8e2819953d6b7b0241f39ce,
+          #        last passing run 40051657595)
+          #   first nightly seen WITH it:     20261025-1ecc870
+          #       (sha256:97e5567273c9ad562b2b080ecdd614131c5501cc644b91031b57026e3b3fed82,
+          #        every check saw 0 workers in run 40370917586)
+          # The worker-count checks (epd-test-template.yml "Check Service
+          # endpoints" and the bench pod in every test yaml) now request
+          # /health?instances=true. Older nightlies ignore the parameter and
+          # return the full list anyway, so pinning back to 20261023-75d0686 or
+          # earlier still works. Any new check that counts endpoints must use
+          # ?instances=true too, or it sees 0 workers on current nightlies.
           GPU_TAG="${GPU_TAG_INPUT:-latest}"
           # ---------------------------------------------------------------------
 

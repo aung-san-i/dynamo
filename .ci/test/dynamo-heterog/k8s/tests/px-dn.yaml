@@ -330,7 +330,7 @@ spec:
               max_attempts=$((timeout_sec / poll_sec))
               workers_ready=false
               for attempt in $(seq 1 "$max_attempts"); do
-                health_response=$(curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health" 2>/dev/null || echo "")
+                health_response=$(curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health?instances=true" 2>/dev/null || echo "")
 
                 # Check for both required workers for px-dn deployment
                 # Note: decode worker with --disaggregation-mode decode still registers as backend.generate
@@ -354,7 +354,7 @@ spec:
                 echo "ERROR: timeout waiting for all worker endpoints"
                 echo "Final status: prefill=$has_prefill, decode=$has_decode, frontend_status=$frontend_status"
                 echo "Final health check response:"
-                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health" || true
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health?instances=true" || true
                 exit 1
               fi
 

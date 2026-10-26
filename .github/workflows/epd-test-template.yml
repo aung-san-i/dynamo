@@ -531,10 +531,13 @@ jobs:
 
           # Query the frontend's /health through the apiserver proxy: the runner
           # has no cluster DNS and no guarantee of in-cluster reachability, so
-          # `kubectl get --raw` is the portable way in. /health lists every
-          # instance the frontend has discovered -- the same assertion the bench
-          # pod makes later, made here where a failure is attributable to the
-          # deployment rather than to the benchmark.
+          # `kubectl get --raw` is the portable way in. /health?instances=true
+          # lists every instance the frontend has discovered -- the same
+          # assertion the bench pod makes later, made here where a failure is
+          # attributable to the deployment rather than to the benchmark.
+          # Plain /health is status-only since ai-dynamo/dynamo#16454 (see the
+          # /health NOTE in xpu-heterogeneous-run.yml), so the query parameter
+          # is required; older nightlies ignore it.
           echo ""
           echo "Waiting for Frontend to report status=healthy with worker endpoints..."
           # 30 min, matching timeout_sec for the same check inside the bench pod.
@@ -547,7 +550,7 @@ jobs:
           health_response=""
           while [ "$health_elapsed" -lt "$health_timeout" ]; do
             health_response=$(kubectl get --raw \
-              "/api/v1/namespaces/$NS/services/$FRONTEND_SVC:8000/proxy/health" 2>&1 || echo "")
+              "/api/v1/namespaces/$NS/services/$FRONTEND_SVC:8000/proxy/health?instances=true" 2>&1 || echo "")
 
             # Count this deployment's *.generate instances (prefill.generate,
             # backend.generate for decode, encode.generate when present).

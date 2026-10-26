@@ -791,7 +791,7 @@ spec:
               max_attempts=$((timeout_sec / poll_sec))
               workers_ready=false
               for attempt in $(seq 1 "$max_attempts"); do
-                health_response=$(curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health" 2>/dev/null || echo "")
+                health_response=$(curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health?instances=true" 2>/dev/null || echo "")
 
                 # count_ep <component>: endpoints in THIS run's namespace whose
                 # component matches exactly. Endpoint strings look like
@@ -827,7 +827,7 @@ spec:
               if [ "$workers_ready" != "true" ]; then
                 echo "ERROR: timeout waiting for omni endpoints"
                 echo "Final status: ar=$has_ar, dit=$has_dit, router=$has_router, frontend_status=$frontend_status"
-                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health" || true
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health?instances=true" || true
                 exit 1
               fi
 
