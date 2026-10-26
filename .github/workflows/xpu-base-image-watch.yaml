@@ -78,6 +78,14 @@ on:
         required: false
         type: boolean
         default: false
+      branch_suffix:
+        description: >-
+          Optional. Appended as deps/xpu-vllm-<version>-<suffix>, e.g. `2`, to
+          re-open the bump on a fresh branch when deps/xpu-vllm-<version> is
+          kept from an earlier, closed PR. Letters, digits, `.`, `_`, `-` only.
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -108,12 +116,16 @@ jobs:
   # DETECT -- is there a newer release than the one we baselined?
   # ==========================================================================
   # Cheap and credential-free, so the heavy runner is never occupied when there
-  # is nothing to do.
+  # is nothing to do. The read scopes below are for the open-PR health check in
+  # `plan`; none of them can write.
   detect:
     name: detect
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
     outputs:
       proceed:   ${{ steps.plan.outputs.proceed }}
       version:   ${{ steps.resolve.outputs.version }}
@@ -194,6 +206,8 @@ jobs:
           VERSION: ${{ steps.resolve.outputs.version }}
           DIGEST:  ${{ steps.resolve.outputs.digest }}
           FORCE:   ${{ inputs.force }}
+          SUFFIX:  ${{ inputs.branch_suffix }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -217,7 +231,14 @@ jobs:
           echo "Published : ${DIGEST} (${VERSION})"
           echo "Baselined : ${BASELINED_DIGEST} (${BASELINED_TAG})"
 
-          BRANCH="deps/xpu-vllm-${VERSION}"
+          # The suffix becomes part of a git ref and a PR head, so it is checked
+          # against a strict character set instead of trusted. Empty (every
+          # scheduled run) keeps the plain deps/xpu-vllm-<version> name.
+          if [ -n "${SUFFIX}" ] && ! [[ "${SUFFIX}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::branch_suffix '${SUFFIX}' may contain only letters, digits, '.', '_' and '-'"
+            exit 1
+          fi
+          BRANCH="deps/xpu-vllm-${VERSION}${SUFFIX:+-${SUFFIX}}"
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
 
           {
@@ -237,13 +258,62 @@ jobs:
           # Idempotency: a branch from an earlier run means the PR already
           # exists (or was closed deliberately). Re-pushing would either be a
           # no-op or reopen an argument someone already settled.
+          #
+          # Skipping must not read as healthy, though. A bump PR whose build-xpu
+          # failed, or that fell behind main into a conflict, used to leave every
+          # later run of this workflow green while the release sat unadopted
+          # (deps/xpu-vllm-v0.32.0: red since 2026-10-18, this watch green daily).
+          # So an OPEN PR whose xpu-status-check failed, or that no longer merges,
+          # fails this run. A closed PR was closed deliberately and still skips.
           if git ls-remote --heads \
                "https://github.com/${GITHUB_REPOSITORY}.git" "${BRANCH}" \
                | grep -q "${BRANCH}"; then
             echo "proceed=false" >> "$GITHUB_OUTPUT"
             echo "=> branch ${BRANCH} already exists on origin; skipping" \
               | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 0
+
+            PR="$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${BRANCH}" \
+                    --state open --json number,url,mergeable \
+                    --jq '.[0] // empty | "\(.number) \(.url) \(.mergeable)"')"
+            if [ -z "${PR}" ]; then
+              echo "=> no open PR for ${BRANCH}; it was closed or merged, nothing to do" \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            read -r PR_NUMBER PR_URL MERGEABLE <<< "${PR}"
+
+            # gh pr checks exits non-zero whenever any check is failing or still
+            # pending, --json included, so the verdict is read from its output
+            # and its exit code is ignored. An empty result means the lookup
+            # itself failed and is reported as `unknown`, not as a pass.
+            STATUS="$(gh pr checks "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" \
+                        --json name,bucket \
+                        --jq '[.[] | select(.name == "xpu-status-check") | .bucket] | first // "missing"' \
+                      || true)"
+            STATUS="${STATUS:-unknown}"
+
+            {
+              echo ""
+              echo "| Open PR | xpu-status-check | Mergeable |"
+              echo "|---|---|---|"
+              printf '| %s | `%s` | `%s` |\n' "${PR_URL}" "${STATUS}" "${MERGEABLE}"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            # MERGEABLE is UNKNOWN while GitHub is still computing it, so only an
+            # explicit CONFLICTING counts against the PR.
+            FAILED=0
+            if [ "${STATUS}" = "fail" ] || [ "${STATUS}" = "cancel" ]; then
+              echo "::error::${PR_URL} adopts ${VERSION} but its xpu-status-check is '${STATUS}'. The release is not adopted until that PR builds and passes."
+              FAILED=1
+            fi
+            if [ "${MERGEABLE}" = "CONFLICTING" ]; then
+              echo "::error::${PR_URL} conflicts with main. Close it, then dispatch this workflow from main with branch_suffix set (or delete ${BRANCH}) to re-open the bump from current main."
+              FAILED=1
+            fi
+            if [ "${STATUS}" = "missing" ] || [ "${STATUS}" = "unknown" ]; then
+              echo "::warning::${PR_URL}: xpu-status-check is '${STATUS}'; could not confirm the bump was tested."
+            fi
+            exit "${FAILED}"
           fi
 
           echo "proceed=true" >> "$GITHUB_OUTPUT"
