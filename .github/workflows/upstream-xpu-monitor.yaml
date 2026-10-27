@@ -174,13 +174,6 @@ jobs:
               return
             fi
 
-            if [ "${concl}" = "cancelled" ]; then
-              detail="$(jq -r '[.[] | select(.conclusion == "cancelled" and (.runner_name // "") == "") | .name] | join(", ")' <<<"${jobs}")"
-              add other "${wf}" "${ref}" "${branch}" \
-                "run cancelled${detail:+; never got a runner: ${detail}}"
-              return
-            fi
-
             failed="$(jq -c --arg re "${XPU_JOB}" \
               '.[] | select((.name | test($re)) and (.conclusion == "failure" or .conclusion == "timed_out"))' <<<"${jobs}")"
             if [ -n "${failed}" ]; then
@@ -197,6 +190,15 @@ jobs:
                 fi
               done <<<"${failed}"
               add tested-fail "${wf}" "${ref}" "${branch}" "${detail}"
+              return
+            fi
+
+            # Checked after the failed XPU jobs: a run is often cancelled
+            # (e.g. a newer commit landed) after an XPU test already failed.
+            if [ "${concl}" = "cancelled" ]; then
+              detail="$(jq -r '[.[] | select(.conclusion == "cancelled" and (.runner_name // "") == "") | .name] | join(", ")' <<<"${jobs}")"
+              add other "${wf}" "${ref}" "${branch}" \
+                "run cancelled${detail:+; never got a runner: ${detail}}"
               return
             fi
 
