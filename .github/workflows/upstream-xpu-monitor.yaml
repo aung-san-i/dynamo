@@ -210,7 +210,7 @@ jobs:
               "conclusion ${concl}; ${detail:-every job passed but the run is marked ${concl}}"
           }
 
-          for wf in pr-xpu.yaml xpu-ci.yaml; do
+          for wf in pr-xpu.yaml post-merge-ci.yml nightly-ci.yml xpu-ci.yaml; do
             gh api --paginate "repos/${R}/actions/workflows/${wf}/runs?created=${RANGE}&per_page=100" \
               --jq '.workflow_runs[] | [.id, .status, (.conclusion // "-"), .head_branch, .html_url] | @tsv' \
             | while IFS=$'\t' read -r id status concl branch url; do
