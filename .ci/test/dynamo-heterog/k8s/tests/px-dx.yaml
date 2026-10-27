@@ -127,7 +127,6 @@ spec:
                 --tensor-parallel-size ${TENSOR_PARALLEL:-1} \
                 --disaggregation-mode prefill \
                 --dtype bfloat16 \
-                --enforce-eager \
                 --block-size 64 \
                 --gpu-memory-utilization 0.7 \
                 --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}' \
@@ -234,7 +233,6 @@ spec:
                 --tensor-parallel-size ${TENSOR_PARALLEL:-1} \
                 --disaggregation-mode decode \
                 --dtype bfloat16 \
-                --enforce-eager \
                 --block-size 64 \
                 --gpu-memory-utilization 0.7 \
                 --kv-transfer-config '{"kv_connector":"NixlConnector", "kv_role":"kv_both", "kv_buffer_device":"xpu"}'

@@ -148,7 +148,6 @@ data:
         tensor_parallel_size: ${oc.decode:${oc.env:AR_TP,1}}
         max_num_seqs: 1
         gpu_memory_utilization: 0.85
-        enforce_eager: true
         max_num_batched_tokens: 32768
         output_connectors:
           to_stage_1: ar_to_dit_nixl
@@ -165,7 +164,6 @@ data:
       - stage_id: 1
         devices: ${oc.env:DIT_GPUS,0}
         max_num_seqs: 1
-        enforce_eager: true
         # parallel_config is not a StageDeployConfig field, so it lands in
         # engine_extras and is merged into the engine args verbatim
         # (engine_args.update(engine_extras)) -- the same place it reached under
