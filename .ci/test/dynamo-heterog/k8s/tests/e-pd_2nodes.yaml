@@ -111,7 +111,6 @@ spec:
                 --disaggregation-mode encode \
                 --enable-mm-embeds \
                 --dtype bfloat16 \
-                --enforce-eager \
                 --block-size 64 \
                 --gpu-memory-utilization 0.95 \
                 --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}' \

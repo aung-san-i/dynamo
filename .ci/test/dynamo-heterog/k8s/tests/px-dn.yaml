@@ -110,7 +110,6 @@ spec:
                 --tensor-parallel-size $TENSOR_PARALLEL \
                 --disaggregation-mode prefill \
                 --dtype bfloat16 \
-                --enforce-eager \
                 --block-size 64 \
                 --gpu-memory-utilization 0.7 \
                 --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}' \

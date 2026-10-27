@@ -130,7 +130,6 @@ spec:
                 --tensor-parallel-size ${TENSOR_PARALLEL:-2} \
                 --disaggregation-mode prefill \
                 --dtype bfloat16 \
-                --enforce-eager \
                 --block-size 64 \
                 --gpu-memory-utilization 0.7 \
                 --kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}' \
@@ -467,12 +466,14 @@ spec:
               # One variable on the wire and in the log, so they cannot drift.
               # Closed factual prefix, not an open instruction, so the answer
               # is checkable on content: the continuation has to say Paris.
+              # Greedy: a sampled curl is one frozen draw (engine seed 0) that a
+              # sampler change can flip; argmax depends only on the model.
               ENDPOINT="http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/completions"
               REQUEST_BODY="{
                 \"model\": \"${MODEL_PATH}\",
                 \"prompt\": \"The capital city of France is\",
                 \"max_tokens\": 256,
-                \"temperature\": 0.7
+                \"temperature\": 0
               }"
               echo "--- request sent to the frontend ---"
               {
