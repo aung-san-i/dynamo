@@ -143,8 +143,26 @@ jobs:
               return
             fi
 
-            jobs="$(gh api --paginate "repos/${R}/actions/runs/${id}/jobs?per_page=100" \
-              --jq '.jobs[] | {id, name, conclusion, runner_name}' | jq -s .)"
+            # A post-merge run has about 90 jobs. Listing them can take GitHub
+            # over 10 s, and then it may drop the request (HTTP 502). Small
+            # pages are quicker to build. Retry a few times, and if it still
+            # fails, report this run instead of stopping the whole report.
+            local try
+            jobs=""
+            for try in 1 2 3; do
+              if jobs="$(gh api --paginate "repos/${R}/actions/runs/${id}/jobs?per_page=30" \
+                  --jq '.jobs[] | {id, name, conclusion, runner_name}' | jq -s .)"; then
+                break
+              fi
+              jobs=""
+              if [ "${try}" -lt 3 ]; then
+                sleep 10
+              fi
+            done
+            if [ -z "${jobs}" ]; then
+              add other "${wf}" "${ref}" "${branch}" "job list not available (GitHub API error)"
+              return
+            fi
             n="$(jq length <<<"${jobs}")"
 
             if [ "${n}" -eq 0 ]; then
@@ -153,13 +171,6 @@ jobs:
               else
                 add other "${wf}" "${ref}" "${branch}" "0 jobs, conclusion ${concl}"
               fi
-              return
-            fi
-
-            if [ "${concl}" = "cancelled" ]; then
-              detail="$(jq -r '[.[] | select(.conclusion == "cancelled" and (.runner_name // "") == "") | .name] | join(", ")' <<<"${jobs}")"
-              add other "${wf}" "${ref}" "${branch}" \
-                "run cancelled${detail:+; never got a runner: ${detail}}"
               return
             fi
 
@@ -179,6 +190,15 @@ jobs:
                 fi
               done <<<"${failed}"
               add tested-fail "${wf}" "${ref}" "${branch}" "${detail}"
+              return
+            fi
+
+            # Checked after the failed XPU jobs: a run is often cancelled
+            # (e.g. a newer commit landed) after an XPU test already failed.
+            if [ "${concl}" = "cancelled" ]; then
+              detail="$(jq -r '[.[] | select(.conclusion == "cancelled" and (.runner_name // "") == "") | .name] | join(", ")' <<<"${jobs}")"
+              add other "${wf}" "${ref}" "${branch}" \
+                "run cancelled${detail:+; never got a runner: ${detail}}"
               return
             fi
 
@@ -249,3 +269,12 @@ jobs:
               echo "</details>"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # Fail this run when an upstream XPU build or test job failed, so
+          # GitHub sends its usual failure email. The summary above is
+          # already written.
+          fails="$(count tested-fail)"
+          if [ "${fails}" -gt 0 ]; then
+            echo "::error::${fails} upstream run(s) with a failed XPU build or test job in ${RANGE} UTC. See the job summary."
+            exit 1
+          fi
