@@ -217,6 +217,10 @@ core:
   - '!**/*.md'
   - '!**/*.rst'
   - '!**/*.txt'
+  # Fork-only monitors: they read GitHub and test nothing, so a change to
+  # them alone must not start the XPU pipeline.
+  - '!.github/workflows/upstream-xpu-monitor.yaml'
+  - '!.github/workflows/xpu-base-image-watch.yaml'
 
 # dev/local-dev image templates. These are NOT in `core`: dev.Dockerfile is `FROM
 # runtime` and local_dev.Dockerfile is `FROM dev`, so neither can change a runtime
