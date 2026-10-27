@@ -124,6 +124,10 @@ ignore:
   - 'deploy/utils/tests/**'
   # The path-triggered protocol tooling workflow owns these CPU tooling tests.
   - 'scripts/protocol_compatibility/**'
+  # Heterog DeviceClass / ResourceClaimTemplate manifests. Applied to the
+  # cluster by hand with kubectl; no CI job reads these files, so editing one
+  # changes nothing a run tests. The test manifests that name them are in `vllm`.
+  - '.ci/test/dynamo-heterog/k8s/templates/**'
   - 'dev/*'
   - '.github/scripts/**'
   - '.github/ISSUE_TEMPLATE/**'
@@ -396,6 +400,8 @@ vllm:
   - 'components/src/dynamo/vllm/**'
   - 'components/src/dynamo/artifacts/vllm/**'
   - 'container/templates/vllm_*'
+  # Heterogeneous EPD/P-D test manifests are consumed by PR-XPU and manual EPD workflows.
+  - '.ci/test/dynamo-heterog/k8s/tests/**'
   - '!**/*.md'
   - '!**/*.rst'
 
