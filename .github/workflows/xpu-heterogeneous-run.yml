@@ -140,6 +140,9 @@ jobs:
       # and the PR carries the label. Otherwise the pinned nvcr.io gpu_tag is
       # used, exactly as before.
       build_nvidia_image: ${{ steps.pr-info.outputs.build_nvidia_image }}
+      # PR this run tests, empty for post-merge and nightly. Only consumed by
+      # the build jobs' image record, so a reader can trace an image to its PR.
+      pr_number: ${{ steps.pr-info.outputs.pr_number }}
     steps:
       - name: Get PR info and check labels
         id: pr-info
@@ -254,6 +257,7 @@ jobs:
             if [[ "${GITHUB_REF_NAME}" =~ ^pull-request/([0-9]+)$ ]]; then
               PR_FROM_BRANCH="${BASH_REMATCH[1]}"
             fi
+            echo "pr_number=${PR_FROM_BRANCH}" >> "$GITHUB_OUTPUT"
             BUILD_NVIDIA="$(resolve_nvidia "${PR_FROM_BRANCH}")"
             echo "build_nvidia_image=${BUILD_NVIDIA}" >> "$GITHUB_OUTPUT"
             echo "Push to ${GITHUB_REF_NAME}; running XPU CI at ${GITHUB_SHA}"
@@ -280,6 +284,7 @@ jobs:
             # branch" step), so the head commit here IS the commit that merges --
             # which is the whole point of testing it.
             echo "checkout_ref=${PR_HEAD_SHA}" >> "$GITHUB_OUTPUT"
+            echo "pr_number=${PR_NUMBER_EVENT}" >> "$GITHUB_OUTPUT"
             BUILD_NVIDIA="$(resolve_nvidia "${PR_NUMBER_EVENT}")"
             echo "build_nvidia_image=${BUILD_NVIDIA}" >> "$GITHUB_OUTPUT"
             echo "PR #${PR_NUMBER_EVENT}; running XPU CI at ${PR_HEAD_SHA}"
@@ -305,6 +310,7 @@ jobs:
           fi
 
           PR_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
 
           # Check for xpu label
           HAS_XPU=$(jq -r '[.labels[].name] | any(. == "xpu")' <<< "${PR_JSON}")
@@ -488,7 +494,8 @@ jobs:
   # ============================================================================
 
   build-xpu:
-    needs: [changed-files]
+    # guard only for its pr_number output, read by the image record.
+    needs: [guard, changed-files]
     if: >-
       needs.changed-files.outputs.core == 'true' ||
       needs.changed-files.outputs.vllm == 'true'
@@ -600,6 +607,57 @@ jobs:
           echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Registry Image | \`${REGISTRY_IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      # The registry copy is NOT deleted at the end of the run, so "Re-run
+      # failed jobs" can still pull it. xpu-image-retention.yaml deletes it once
+      # it is older than 14 days, and this record is the list that workflow
+      # reads: one JSON file per pushed image, uploaded as an artifact anyone
+      # with repo access can open from the run page.
+      #
+      # Before "Clean up local images": the digest is read from the local tag.
+      # The artifact name carries run_attempt because "Re-run all jobs" pushes
+      # the same tag again and an artifact name is usable once per run.
+      # retention-days (30) must stay above the retention workflow's 14-day
+      # cutoff: a record that expires first can no longer be read, and its
+      # image is never deleted.
+      #
+      # A failed upload fails this job on purpose: an image without a record
+      # stays in the registry forever.
+      - name: Record pushed image
+        id: record
+        shell: bash
+        env:
+          IMAGE: ${{ steps.push.outputs.registry_image_tag }}
+          PR_NUMBER: ${{ needs.guard.outputs.pr_number }}
+          PHASE: ${{ inputs.phase }}
+        run: |
+          set -euo pipefail
+
+          digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE}" \
+            | grep -m1 "^${IMAGE%:*}@" | cut -d@ -f2 || true)
+          name="image-record-${DEVICE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          jq -n \
+            --arg image "${IMAGE}" --arg digest "${digest}" --arg device "${DEVICE}" \
+            --arg pushed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg pr_number "${PR_NUMBER}" --arg phase "${PHASE}" \
+            --arg repository "${GITHUB_REPOSITORY}" --arg sha "$(git rev-parse HEAD)" \
+            --arg run_id "${GITHUB_RUN_ID}" --arg run_number "${GITHUB_RUN_NUMBER}" \
+            --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '$ARGS.named' > image-record.json
+          cat image-record.json
+
+          echo "artifact_name=${name}" >> "$GITHUB_OUTPUT"
+          echo "| Image Record | artifact \`${name}\` (registry copy deleted after 14 days) |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.record.outputs.artifact_name }}
+          path: image-record.json
+          if-no-files-found: error
+          retention-days: 30
 
       # Remove THIS run's image tags from the self-hosted runner's daemon. The
       # tags embed github.run_id, so every run creates new names and nothing is
@@ -774,6 +832,43 @@ jobs:
           echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Registry Image | \`${REGISTRY_IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      # Same record as build-xpu; see the comment there.
+      - name: Record pushed image
+        id: record
+        shell: bash
+        env:
+          IMAGE: ${{ steps.push.outputs.registry_image_tag }}
+          PR_NUMBER: ${{ needs.guard.outputs.pr_number }}
+          PHASE: ${{ inputs.phase }}
+        run: |
+          set -euo pipefail
+
+          digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE}" \
+            | grep -m1 "^${IMAGE%:*}@" | cut -d@ -f2 || true)
+          name="image-record-${DEVICE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          jq -n \
+            --arg image "${IMAGE}" --arg digest "${digest}" --arg device "${DEVICE}" \
+            --arg pushed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg pr_number "${PR_NUMBER}" --arg phase "${PHASE}" \
+            --arg repository "${GITHUB_REPOSITORY}" --arg sha "$(git rev-parse HEAD)" \
+            --arg run_id "${GITHUB_RUN_ID}" --arg run_number "${GITHUB_RUN_NUMBER}" \
+            --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '$ARGS.named' > image-record.json
+          cat image-record.json
+
+          echo "artifact_name=${name}" >> "$GITHUB_OUTPUT"
+          echo "| Image Record | artifact \`${name}\` (registry copy deleted after 14 days) |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.record.outputs.artifact_name }}
+          path: image-record.json
+          if-no-files-found: error
+          retention-days: 30
 
       # See the matching step in build-xpu for why this is scoped to this run's
       # own tags rather than a broad prune. No -test ref here: this job builds
@@ -1142,7 +1237,7 @@ jobs:
       expect_benchmark_result: false
 
   # ============================================================================
-  # IMAGE CLEANUP – worker nodes and registry
+  # IMAGE CLEANUP – worker nodes
   # ============================================================================
   # The build jobs already drop their tags from the runner's own docker daemon
   # right after the push. Two more copies outlive the run, and every run adds a
@@ -1150,9 +1245,13 @@ jobs:
   #
   #   1. The worker nodes. Each test pod pulls its image into the node's
   #      container runtime, and deleting the pod (the template's Cleanup step)
-  #      leaves the image there. Removed by one short privileged pod per node
-  #      that runs the node's own crictl through a hostPath mount of /.
-  #   2. The registry. Removed through the Harbor API.
+  #      leaves the image there. Removed here by one short privileged pod per
+  #      node that runs the node's own crictl through a hostPath mount of /.
+  #   2. The registry. NOT removed here. xpu-image-retention.yaml deletes it
+  #      once it is older than 14 days, reading the image-record-* artifact the
+  #      build job uploaded. Until then "Re-run failed jobs" still works: the
+  #      re-run reuses this run's image tag, and a node that no longer holds
+  #      the image simply pulls it from the registry again.
   #
   # Only images THIS run built are touched. The pinned nvcr.io GPU image is
   # shared by every run that does not build its own; deleting it would only
@@ -1160,10 +1259,7 @@ jobs:
   #
   # Runs after every test whatever its result, so a failed run cleans up too.
   # Every heterog-test-* job must be in `needs` below: one left out could still
-  # be pulling the image when this deletes it.
-  # The cost: "Re-run failed jobs" re-runs the tests against an image that no
-  # longer exists and they fail to pull it. Use "Re-run all jobs" instead,
-  # which rebuilds and re-pushes under the same tag.
+  # be running on the node when this deletes the image there.
   #
   # Every failure here is a ::warning::, never a red job: a leaked image costs
   # disk, a red cleanup would fail xpu-status-check on a run whose tests passed.
@@ -1358,130 +1454,6 @@ jobs:
             echo "### 🧹 Worker-node image cleanup"
             echo "| Node label | Node | Image | Result |"
             echo "|------------|------|-------|--------|"
-            for row in ${ROWS+"${ROWS[@]}"}; do
-              echo "${row}"
-            done
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # Harbor keeps the blobs until its own garbage collection runs, so this
-      # frees the space at the next GC, not immediately.
-      #
-      # Credential: HARBOR_USERNAME / HARBOR_PASSWORD secrets if both are set,
-      # otherwise the login the runner's docker client already pushes with. The
-      # account needs delete permission on the project; a push-only robot
-      # account gets a 403, reported as a warning.
-      #
-      # A tag is deleted, not blindly the artifact behind it: two runs on the
-      # same commit with a warm build cache can produce the same digest under
-      # two tags. The artifact itself goes only when this run's tag is its last.
-      - name: Remove images from the registry
-        if: always()
-        shell: bash
-        env:
-          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
-          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
-        run: |
-          set -uo pipefail
-
-          basic_auth() {
-            local host="$1" config="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
-            if [[ -n "${HARBOR_USERNAME}" && -n "${HARBOR_PASSWORD}" ]]; then
-              printf '%s:%s' "${HARBOR_USERNAME}" "${HARBOR_PASSWORD}" | base64 -w0
-            elif [[ -f "${config}" ]]; then
-              jq -r --arg h "${host}" '(.auths[$h].auth // .auths["https://" + $h].auth) // empty' "${config}"
-            fi
-          }
-
-          # api METHOD URL OUTFILE -> prints the HTTP status, 000 if unreachable.
-          # The Authorization header goes in through a file descriptor so the
-          # credential never appears in the runner's process list.
-          #
-          # -r, not -f: the docker daemon reads certs.d as root, so the file can
-          # exist yet be unreadable by the runner user, and curl then fails with
-          # error 77 before sending anything. Fall back to the system store.
-          api() {
-            local cacert=() ca="/etc/docker/certs.d/${host}/ca.crt"
-            [[ -r "${ca}" ]] && cacert=(--cacert "${ca}")
-            curl -sS --max-time 60 -o "$3" -w '%{http_code}' -X "$1" \
-              ${cacert+"${cacert[@]}"} \
-              -H @<(printf 'Authorization: Basic %s\n' "${auth}") \
-              "$2" || true
-          }
-
-          REFS=()
-          [[ -n "${XPU_IMAGE}" ]]    && REFS+=("${XPU_IMAGE}")
-          [[ -n "${NVIDIA_IMAGE}" ]] && REFS+=("${NVIDIA_IMAGE}")
-
-          ROWS=()
-          body=$(mktemp)
-          for ref in ${REFS+"${REFS[@]}"}; do
-            # sc09super01-srv.intel.com/dynamo/dynamo-vllm-runtime-xpu:<run_id>-<sha>
-            host="${ref%%/*}"
-            rest="${ref#*/}"
-            project="${rest%%/*}"
-            repo_tag="${rest#*/}"
-            repo="${repo_tag%:*}"
-            tag="${repo_tag##*:}"
-
-            auth="$(basic_auth "${host}" || true)"
-            if [[ -z "${auth}" ]]; then
-              echo "::warning::No registry credential for ${host} (no HARBOR_USERNAME/HARBOR_PASSWORD secrets, no docker login entry); ${ref} left in the registry"
-              ROWS+=("| \`${ref}\` | ⚠️ no credential |")
-              continue
-            fi
-            echo "::add-mask::${auth}"
-
-            # Harbor wants a nested repository name with its slashes encoded
-            # twice; a flat one like dynamo-vllm-runtime-xpu is unchanged.
-            base="https://${host}/api/v2.0/projects/${project}/repositories/${repo//\//%252F}/artifacts"
-
-            code=$(api GET "${base}/${tag}?with_tag=true" "${body}")
-            case "${code}" in
-              200) ;;
-              404)
-                echo "Already gone from the registry: ${ref}"
-                ROWS+=("| \`${ref}\` | ✅ already absent |")
-                continue
-                ;;
-              *)
-                echo "::warning::Could not look up ${ref} in the registry (HTTP ${code:-000}): $(head -c 500 "${body}" 2>/dev/null)"
-                ROWS+=("| \`${ref}\` | ⚠️ lookup HTTP ${code:-000} |")
-                continue
-                ;;
-            esac
-
-            digest=$(jq -r '.digest // empty' "${body}" || true)
-            others=$(jq -r --arg t "${tag}" '[.tags[]?.name | select(. != $t)] | length' "${body}" || true)
-            if [[ -z "${digest}" ]]; then
-              echo "::warning::Registry returned no digest for ${ref}; left in place"
-              ROWS+=("| \`${ref}\` | ⚠️ no digest in response |")
-              continue
-            fi
-
-            if [[ "${others}" == "0" ]]; then
-              url="${base}/${digest}"
-              what="artifact ${digest}"
-            else
-              url="${base}/${digest}/tags/${tag}"
-              what="tag only; ${others} other tag(s) still reference ${digest}"
-            fi
-
-            code=$(api DELETE "${url}" "${body}")
-            if [[ "${code}" == "200" ]]; then
-              echo "Deleted ${ref} (${what})"
-              ROWS+=("| \`${ref}\` | ✅ deleted (${what}) |")
-            else
-              echo "::warning::Could not delete ${ref} (HTTP ${code:-000}): $(head -c 500 "${body}" 2>/dev/null)"
-              ROWS+=("| \`${ref}\` | ⚠️ delete HTTP ${code:-000} |")
-            fi
-          done
-          rm -f "${body}"
-
-          {
-            echo "### 🧹 Registry image cleanup"
-            echo "| Image | Result |"
-            echo "|-------|--------|"
             for row in ${ROWS+"${ROWS[@]}"}; do
               echo "${row}"
             done

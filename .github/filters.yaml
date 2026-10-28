@@ -128,6 +128,9 @@ ignore:
   # cluster by hand with kubectl; no CI job reads these files, so editing one
   # changes nothing a run tests. The test manifests that name them are in `vllm`.
   - '.ci/test/dynamo-heterog/k8s/templates/**'
+  # Fork-only registry retention workflow. Excluded from `ci` (and so from
+  # every filter that reuses it); listed here so the coverage check passes.
+  - '.github/workflows/xpu-image-retention.yaml'
   - 'dev/*'
   - '.github/scripts/**'
   - '.github/ISSUE_TEMPLATE/**'
@@ -167,6 +170,10 @@ ci: &ci
   - '.github/scripts/pytest-local.sh'
   - '.github/scripts/route_buildkit.sh'
   - 'container/Dockerfile.test'
+  # Fork-only registry retention: deletes old XPU CI images from Harbor and
+  # builds or tests nothing, so a change to it alone must not start the XPU
+  # pipeline.
+  - '!.github/workflows/xpu-image-retention.yaml'
 
 core:
   - *ci
