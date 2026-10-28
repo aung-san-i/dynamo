@@ -40,8 +40,22 @@
 # No state is stored. The branch name encodes the release tag and nothing else,
 # so the branch existing on origin is the record that this release was already
 # proposed. A later run that finds it does not rebuild it. It checks the open
-# PR instead, and fails if that PR's xpu-status-check failed or it conflicts
-# with main. A closed PR was closed deliberately and is skipped.
+# PR instead, and fails if that PR's xpu-status-check failed. A closed PR was
+# closed deliberately and is skipped.
+#
+# ---------------------------------------------------------------------------
+# A PR THAT CONFLICTS WITH MAIN IS TESTED BY DISPATCH
+# ---------------------------------------------------------------------------
+# The release branch's own commits often conflict with main (v1.6.1 did), and
+# GitHub starts no pull_request workflow on a PR that conflicts with its base.
+# The head commit itself is fine, so for such a PR this workflow starts
+# xpu-heterogeneous-dispatch.yaml on it, the same pipeline, and comments the
+# run link on the PR. A dispatch run that already exists for the PR's head
+# commit is reused rather than started again, so the daily run occupies the
+# single xpu-heterog-hardware slot at most once per head commit. That run's
+# verdict then stands in for xpu-status-check: a failure fails this workflow.
+# A cancelled run gave no verdict and is replaced by a fresh dispatch; to stop
+# testing a release, close its PR.
 #
 # The branch prefix is sync/upstream- on purpose: pr-xpu-heterogeneous.yaml
 # forces every test on for a head ref with that prefix (its line 189), so no
@@ -64,10 +78,14 @@ on:
         required: false
         default: ""
 
-# Read scopes for the open-PR health check. Every write uses SYNC_UPSTREAM_PAT.
+# Read scopes for the open-PR health check. Pushing the branch and opening the
+# PR use SYNC_UPSTREAM_PAT. The default token writes only in "Test a
+# conflicting PR by dispatch": actions to start the dispatch, pull-requests to
+# comment its run link.
 permissions:
   contents: read
-  pull-requests: read
+  actions: write
+  pull-requests: write
   checks: read
   statuses: read
 
@@ -137,8 +155,9 @@ jobs:
 
       - name: Check whether this release was already proposed
         # Same idempotency and health check as xpu-base-image-watch.yaml: the
-        # branch is the record, and an open PR that failed or conflicts must
-        # not leave this run green while the release sits untested.
+        # branch is the record, and an open PR that failed must not leave this
+        # run green while the release sits untested. A conflicting PR is
+        # handed to "Test a conflicting PR by dispatch" below.
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
@@ -167,6 +186,8 @@ jobs:
             exit 0
           fi
           read -r PR_NUMBER PR_URL MERGEABLE HEAD_SHA <<< "${PR}"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
 
           # gh pr checks exits non-zero whenever any check is failing or still
           # pending, --json included, so the verdict is read from its output
@@ -185,21 +206,15 @@ jobs:
             printf '| %s | `%s` | `%s` |\n' "${PR_URL}" "${STATUS}" "${MERGEABLE}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # MERGEABLE is UNKNOWN while GitHub is still computing it, so only an
-          # explicit CONFLICTING counts against the PR.
           FAILED=0
           if [ "${STATUS}" = "fail" ] || [ "${STATUS}" = "cancel" ]; then
             echo "::error::${PR_URL}: upstream ${TAG} failed xpu-status-check ('${STATUS}')."
             FAILED=1
           fi
-          if [ "${MERGEABLE}" = "CONFLICTING" ]; then
-            # GitHub starts no pull_request workflow for a PR that conflicts
-            # with its base, so the suite never ran. The head commit itself is
-            # fine; run the same pipeline on it by dispatch instead.
-            echo "::error::${PR_URL} conflicts with ${TARGET_BRANCH}, so the XPU suite cannot start on it. Run it by dispatch: gh workflow run xpu-heterogeneous-dispatch.yaml --repo ${GITHUB_REPOSITORY} --ref ${BRANCH} -f CHECKOUT_COMMIT=${HEAD_SHA} -f xpu_build_checkout_commit=${HEAD_SHA} -f docker_image_xpu=BUILD"
-            FAILED=1
-          fi
-          if [ "${STATUS}" = "missing" ] || [ "${STATUS}" = "unknown" ]; then
+          # A conflicting PR never gets xpu-status-check; the dispatch step
+          # reports on it instead, so a missing check is expected there.
+          if [ "${MERGEABLE}" != "CONFLICTING" ] && \
+             { [ "${STATUS}" = "missing" ] || [ "${STATUS}" = "unknown" ]; }; then
             echo "::warning::${PR_URL}: xpu-status-check is '${STATUS}'; could not confirm ${TAG} was tested."
           fi
           exit "${FAILED}"
@@ -321,6 +336,7 @@ jobs:
 
       - name: Open the draft PR
         if: steps.plan.outputs.proceed == 'true'
+        id: open
         env:
           GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_PAT }}
           TAG: ${{ steps.release.outputs.tag }}
@@ -355,7 +371,7 @@ jobs:
             fi
             echo "The XPU suite tests that head commit, not its merge with ${TARGET_BRANCH}. The \"Files changed\" tab compares against ${TARGET_BRANCH}, so it is large and is not what was tested."
             echo ""
-            echo "If GitHub reports a conflict with ${TARGET_BRANCH}, no pull_request workflow starts. Run the same pipeline by dispatch:"
+            echo "If GitHub reports a conflict with ${TARGET_BRANCH}, no pull_request workflow starts. upstream-release-watch.yaml then runs the same pipeline by dispatch and comments its link here. By hand, that is:"
             echo '```bash'
             echo "gh workflow run xpu-heterogeneous-dispatch.yaml --repo ${GITHUB_REPOSITORY} --ref ${BRANCH} -f CHECKOUT_COMMIT=${HEAD_SHA} -f xpu_build_checkout_commit=${HEAD_SHA} -f docker_image_xpu=BUILD"
             echo '```'
@@ -369,3 +385,108 @@ jobs:
             --title "[test only] XPU on upstream release ${TAG}" \
             --body-file "${RUNNER_TEMP}/pr-body.md")"
           echo "Opened ${pr_url}" | tee -a "$GITHUB_STEP_SUMMARY"
+          # gh prints the PR URL; the number is its last path segment.
+          echo "pr_number=${pr_url##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Test a conflicting PR by dispatch
+        # Runs for the PR just opened and for an open PR found by `plan`.
+        # GitHub starts no pull_request workflow on a PR that conflicts with
+        # its base, so nothing else would ever test it.
+        if: steps.open.outputs.pr_number != '' || steps.plan.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+          PR_NUMBER: ${{ steps.open.outputs.pr_number || steps.plan.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.build.outputs.head_sha || steps.plan.outputs.head_sha }}
+          DISPATCH_WORKFLOW: xpu-heterogeneous-dispatch.yaml
+        run: |
+          set -euo pipefail
+          # GitHub computes mergeability in the background after a PR opens
+          # or its base moves, and reports UNKNOWN until it is done.
+          MERGEABLE=UNKNOWN
+          for _ in $(seq 1 12); do
+            MERGEABLE="$(gh pr view "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" \
+                           --json mergeable --jq .mergeable)"
+            [ "${MERGEABLE}" != "UNKNOWN" ] && break
+            sleep 10
+          done
+          if [ "${MERGEABLE}" = "UNKNOWN" ]; then
+            echo "::warning::PR #${PR_NUMBER}: GitHub has not decided whether it conflicts with ${TARGET_BRANCH}; the next run checks again."
+            exit 0
+          fi
+          if [ "${MERGEABLE}" != "CONFLICTING" ]; then
+            echo "=> PR #${PR_NUMBER} merges cleanly; its pull_request checks test it" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # The run list has no input filter, so a run is matched on branch
+          # and head commit. A hand-started dispatch on the same commit counts.
+          run_for_head() {
+            gh run list --repo "${GITHUB_REPOSITORY}" --workflow "${DISPATCH_WORKFLOW}" \
+              --branch "${BRANCH}" --event workflow_dispatch --commit "${HEAD_SHA}" \
+              --limit 1 --json databaseId,status,conclusion,url \
+              --jq '.[0] // empty | "\(.databaseId) \(.status) \(if .conclusion == "" then "none" else .conclusion end) \(.url)"'
+          }
+
+          RUN="$(run_for_head)"
+          # A cancelled run gave no verdict, so it is replaced by a fresh one.
+          # A release that should not be tested at all is skipped by closing
+          # its PR, not by cancelling its run.
+          STALE_ID=""
+          if [ -n "${RUN}" ]; then
+            read -r RUN_ID RUN_STATUS RUN_CONCLUSION RUN_URL <<< "${RUN}"
+            if [ "${RUN_STATUS}" = "completed" ] && [ "${RUN_CONCLUSION}" = "cancelled" ]; then
+              echo "=> dispatch run ${RUN_URL} was cancelled; starting a fresh one" \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+              STALE_ID="${RUN_ID}"
+              RUN=""
+            fi
+          fi
+
+          if [ -z "${RUN}" ]; then
+            gh workflow run "${DISPATCH_WORKFLOW}" --repo "${GITHUB_REPOSITORY}" \
+              --ref "${BRANCH}" \
+              -f test_selection=both \
+              -f CHECKOUT_COMMIT="${HEAD_SHA}" \
+              -f xpu_build_checkout_commit="${HEAD_SHA}" \
+              -f docker_image_xpu=BUILD
+            # A dispatch returns before its run exists, so look it up. Until
+            # the new run is listed, the newest run is still the cancelled one.
+            for _ in $(seq 1 12); do
+              sleep 5
+              RUN="$(run_for_head)"
+              [ -n "${RUN}" ] && [ "${RUN%% *}" != "${STALE_ID}" ] && break
+              RUN=""
+            done
+            if [ -z "${RUN}" ]; then
+              echo "::error::dispatched ${DISPATCH_WORKFLOW} on ${BRANCH} but could not find its run; check the Actions tab."
+              exit 1
+            fi
+            read -r _ _ _ RUN_URL <<< "${RUN}"
+            gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --body \
+              "This PR conflicts with \`${TARGET_BRANCH}\`, so GitHub starts no pull_request workflow on it. The XPU suite was started by dispatch on head \`${HEAD_SHA}\` instead: ${RUN_URL}"
+            echo "=> PR #${PR_NUMBER} conflicts with ${TARGET_BRANCH}; started ${RUN_URL}" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          read -r RUN_ID RUN_STATUS RUN_CONCLUSION RUN_URL <<< "${RUN}"
+          {
+            echo ""
+            echo "| Conflicting PR | Dispatch run | Status | Conclusion |"
+            echo "|---|---|---|---|"
+            printf '| #%s | %s | `%s` | `%s` |\n' "${PR_NUMBER}" "${RUN_URL}" "${RUN_STATUS}" "${RUN_CONCLUSION}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${RUN_STATUS}" != "completed" ]; then
+            echo "=> dispatch run for ${HEAD_SHA:0:12} is still ${RUN_STATUS}" | tee -a "$GITHUB_STEP_SUMMARY"
+          elif [ "${RUN_CONCLUSION}" = "success" ]; then
+            echo "=> upstream ${TAG} passed the XPU suite by dispatch; close PR #${PR_NUMBER}" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            # A failure is the verdict and is not re-dispatched. A rerun is a
+            # new attempt of the same run, which run_for_head then reports on.
+            echo "::error::upstream ${TAG} did not pass the XPU suite by dispatch ('${RUN_CONCLUSION}'): ${RUN_URL}. To test again: gh run rerun ${RUN_ID} --repo ${GITHUB_REPOSITORY}"
+            exit 1
+          fi
