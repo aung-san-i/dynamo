@@ -1,0 +1,371 @@
+# Watches ai-dynamo/dynamo for a new release and opens a PR that tests it on XPU.
+#
+# Nothing is ever pushed to upstream, and main is never written to directly.
+# The job builds one branch per release and opens a DRAFT PR against main, and
+# pr-xpu-heterogeneous.yaml takes it from there.
+#
+# Requires the SYNC_UPSTREAM_PAT repository secret, the same one
+# sync-upstream.yaml uses. The branch carries upstream's and this fork's files
+# under .github/workflows/, and the default GITHUB_TOKEN is forbidden from
+# pushing commits that touch them.
+#
+# ---------------------------------------------------------------------------
+# WHAT THE PR'S HEAD IS, AND WHY IT IS NOT A MERGE OF THE TAG
+# ---------------------------------------------------------------------------
+# A release tag sits on a release branch that was cut from upstream main weeks
+# earlier. This fork's main already holds newer upstream code than the release.
+# Merging the tag with main, the way sync-upstream.yaml merges upstream main,
+# would therefore test main again and not the release.
+#
+# So the head is built as:
+#   the release tag
+#   + this fork's own changes, and nothing else.
+# "This fork's own changes" is the diff from the last upstream commit main
+# contains (the merge-base of main and upstream main) to main's tip: the XPU
+# workflows, the heterogeneous test manifests and the licence baseline.
+#
+# The pipeline tests that head commit, not the PR's merge with main: the guard
+# job checks out pull_request.head.sha (xpu-heterogeneous-run.yml:286).
+#
+# ---------------------------------------------------------------------------
+# WHY THE PR IS A DRAFT AND MUST NOT BE MERGED
+# ---------------------------------------------------------------------------
+# The PR exists to put an xpu-status-check verdict on the release. Merging it
+# would bring the release branch's own commits (version bumps, cherry-picks)
+# into main, which upstream itself never does. Close it once the verdict is in.
+#
+# ---------------------------------------------------------------------------
+# WHAT "ALREADY HANDLED" MEANS
+# ---------------------------------------------------------------------------
+# No state is stored. The branch name encodes the release tag and nothing else,
+# so the branch existing on origin is the record that this release was already
+# proposed. A later run that finds it does not rebuild it. It checks the open
+# PR instead, and fails if that PR's xpu-status-check failed or it conflicts
+# with main. A closed PR was closed deliberately and is skipped.
+#
+# The branch prefix is sync/upstream- on purpose: pr-xpu-heterogeneous.yaml
+# forces every test on for a head ref with that prefix (its line 189), so no
+# paths filter can decide that a release needs no testing. The `release-` part
+# keeps these branches apart from sync-upstream.yaml's sync/upstream-<sha>.
+name: Upstream-Release-Watch
+
+on:
+  schedule:
+    # 08:13 UTC daily. Clear of the other scheduled jobs: sync-upstream.yaml at
+    # 06:17, xpu-base-image-watch.yaml at 07:41, auto-dep-upgrade-trigger.yml at
+    # 10:00, nightly-xpu-heterogeneous.yaml at 23:00. Off-round minute on
+    # purpose: GitHub delays cron that fires exactly on the hour, when everyone
+    # else's jobs are queued.
+    - cron: "13 8 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release tag to test, e.g. v1.6.1. Leave empty to follow upstream's latest release."
+        required: false
+        default: ""
+
+# Read scopes for the open-PR health check. Every write uses SYNC_UPSTREAM_PAT.
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: upstream-release-watch
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ai-dynamo/dynamo
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: main
+  BRANCH_PREFIX: sync/upstream-release-
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Resolve the release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # Checked before it goes into a URL or a branch name.
+          tag_re='^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
+          if [ -n "${REQUESTED}" ]; then
+            if ! [[ "${REQUESTED}" =~ ${tag_re} ]]; then
+              echo "::error::requested tag '${REQUESTED}' does not look like a release tag (e.g. v1.6.1)"
+              exit 1
+            fi
+            endpoint="repos/${UPSTREAM_REPO}/releases/tags/${REQUESTED}"
+          else
+            # `latest` is upstream's newest release that is neither a draft nor
+            # a prerelease, so the -dev.1 model previews are never picked up.
+            endpoint="repos/${UPSTREAM_REPO}/releases/latest"
+          fi
+
+          gh api "${endpoint}" > "${RUNNER_TEMP}/release.json"
+          tag="$(jq -r '.tag_name' "${RUNNER_TEMP}/release.json")"
+          if ! [[ "${tag}" =~ ${tag_re} ]]; then
+            echo "::error::upstream returned tag '${tag}', which does not look like a release tag"
+            exit 1
+          fi
+
+          {
+            echo "tag=${tag}"
+            echo "url=$(jq -r '.html_url' "${RUNNER_TEMP}/release.json")"
+            echo "published=$(jq -r '.published_at' "${RUNNER_TEMP}/release.json")"
+            echo "branch=${BRANCH_PREFIX}${tag}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 🔎 Upstream release check"
+            echo "| Release | Published | Branch |"
+            echo "|---|---|---|"
+            printf '| [%s](%s) | %s | `%s` |\n' "${tag}" \
+              "$(jq -r '.html_url' "${RUNNER_TEMP}/release.json")" \
+              "$(jq -r '.published_at' "${RUNNER_TEMP}/release.json")" \
+              "${BRANCH_PREFIX}${tag}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check whether this release was already proposed
+        # Same idempotency and health check as xpu-base-image-watch.yaml: the
+        # branch is the record, and an open PR that failed or conflicts must
+        # not leave this run green while the release sits untested.
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+        run: |
+          set -euo pipefail
+          if ! git ls-remote --heads \
+                 "https://github.com/${GITHUB_REPOSITORY}.git" "${BRANCH}" \
+                 | grep -q "refs/heads/${BRANCH}$"; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "=> ${TAG} is new; will build ${BRANCH}" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "proceed=false" >> "$GITHUB_OUTPUT"
+          echo "=> branch ${BRANCH} already exists on origin; not rebuilding it" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+          PR="$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${BRANCH}" \
+                  --state open --json number,url,mergeable,headRefOid \
+                  --jq '.[0] // empty | "\(.number) \(.url) \(.mergeable) \(.headRefOid)"')"
+          if [ -z "${PR}" ]; then
+            echo "=> no open PR for ${BRANCH}; it was closed, nothing to do" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          read -r PR_NUMBER PR_URL MERGEABLE HEAD_SHA <<< "${PR}"
+
+          # gh pr checks exits non-zero whenever any check is failing or still
+          # pending, --json included, so the verdict is read from its output
+          # and its exit code is ignored. An empty result means the lookup
+          # itself failed and is reported as `unknown`, not as a pass.
+          STATUS="$(gh pr checks "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" \
+                      --json name,bucket \
+                      --jq '[.[] | select(.name == "xpu-status-check") | .bucket] | first // "missing"' \
+                    || true)"
+          STATUS="${STATUS:-unknown}"
+
+          {
+            echo ""
+            echo "| Open PR | xpu-status-check | Mergeable |"
+            echo "|---|---|---|"
+            printf '| %s | `%s` | `%s` |\n' "${PR_URL}" "${STATUS}" "${MERGEABLE}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # MERGEABLE is UNKNOWN while GitHub is still computing it, so only an
+          # explicit CONFLICTING counts against the PR.
+          FAILED=0
+          if [ "${STATUS}" = "fail" ] || [ "${STATUS}" = "cancel" ]; then
+            echo "::error::${PR_URL}: upstream ${TAG} failed xpu-status-check ('${STATUS}')."
+            FAILED=1
+          fi
+          if [ "${MERGEABLE}" = "CONFLICTING" ]; then
+            # GitHub starts no pull_request workflow for a PR that conflicts
+            # with its base, so the suite never ran. The head commit itself is
+            # fine; run the same pipeline on it by dispatch instead.
+            echo "::error::${PR_URL} conflicts with ${TARGET_BRANCH}, so the XPU suite cannot start on it. Run it by dispatch: gh workflow run xpu-heterogeneous-dispatch.yaml --repo ${GITHUB_REPOSITORY} --ref ${BRANCH} -f CHECKOUT_COMMIT=${HEAD_SHA} -f xpu_build_checkout_commit=${HEAD_SHA} -f docker_image_xpu=BUILD"
+            FAILED=1
+          fi
+          if [ "${STATUS}" = "missing" ] || [ "${STATUS}" = "unknown" ]; then
+            echo "::warning::${PR_URL}: xpu-status-check is '${STATUS}'; could not confirm ${TAG} was tested."
+          fi
+          exit "${FAILED}"
+
+      - name: Checkout fork
+        if: steps.plan.outputs.proceed == 'true'
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
+        with:
+          # Full history: merge-base below needs it.
+          fetch-depth: 0
+          ref: ${{ env.TARGET_BRANCH }}
+          token: ${{ secrets.SYNC_UPSTREAM_PAT }}
+
+      - name: Fetch upstream main and the release tag
+        if: steps.plan.outputs.proceed == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          # Fully-qualified refspec on both sides: an abbreviated one can
+          # resolve to the wrong ref, or delete the destination.
+          git fetch --no-tags upstream \
+            "refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}" \
+            "refs/tags/${TAG}:refs/tags/${TAG}"
+          git rev-parse --verify "refs/tags/${TAG}^{commit}"
+
+      - name: Build the branch - release tag plus this fork's own changes
+        if: steps.plan.outputs.proceed == 'true'
+        id: build
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+          # Keep LFS files as pointers. Switching to the tag would otherwise try
+          # to download upstream's LFS objects from this fork's LFS store, which
+          # need not hold them. Nothing here reads LFS content, and a pointer
+          # commits back unchanged.
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: |
+          set -euo pipefail
+          # A commit needs an author, and the runner has no git identity.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          main_sha="$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")"
+          base_sha="$(git merge-base "${main_sha}" "refs/remotes/upstream/${UPSTREAM_BRANCH}")"
+          tag_sha="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          {
+            echo "main_sha=${main_sha}"
+            echo "base_sha=${base_sha}"
+            echo "tag_sha=${tag_sha}"
+          } >> "$GITHUB_OUTPUT"
+
+          git diff --name-status "${base_sha}" "${main_sha}" > "${RUNNER_TEMP}/fork-files.txt"
+          {
+            echo ""
+            echo "This fork's own changes: \`${base_sha:0:12}..${main_sha:0:12}\`, $(wc -l < "${RUNNER_TEMP}/fork-files.txt") file(s), applied onto \`${TAG}\` (\`${tag_sha:0:12}\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          git switch --no-track -c "${BRANCH}" "${tag_sha}"
+
+          git diff --binary "${base_sha}" "${main_sha}" > "${RUNNER_TEMP}/fork.patch"
+          : > "${RUNNER_TEMP}/fork-copy.txt"
+          if [ -s "${RUNNER_TEMP}/fork.patch" ]; then
+            # --3way: where the release changed a file this fork also changed,
+            # merge the two instead of rejecting the hunk outright.
+            if ! git apply --3way --index "${RUNNER_TEMP}/fork.patch"; then
+              mapfile -t conflicted < <(git diff --name-only --diff-filter=U)
+              outside=()
+              for f in "${conflicted[@]}"; do
+                [[ "${f}" == .github/* ]] || outside+=("${f}")
+              done
+
+              # A release branch is cut weeks before the upstream main this
+              # fork tracks, so the two routinely differ in .github/ files this
+              # fork also edits (v1.6.1: filters.yaml, pr-xpu.yaml). Under
+              # .github/ this fork's copy is the CI config it actually runs, so
+              # it wins. Anything else is product code, and a human decides.
+              if [ "${#conflicted[@]}" -eq 0 ] || [ "${#outside[@]}" -gt 0 ]; then
+                {
+                  echo ""
+                  echo "**This fork's changes do not apply cleanly onto ${TAG}.** Nothing was pushed. Conflicting files:"
+                  echo '```'
+                  if [ "${#conflicted[@]}" -eq 0 ]; then
+                    echo "(none listed: git apply rejected the patch outright, see the log)"
+                  else
+                    printf '%s\n' "${conflicted[@]}"
+                  fi
+                  echo '```'
+                } | tee -a "$GITHUB_STEP_SUMMARY"
+                echo "::error::this fork's changes do not apply onto ${TAG} (rejected outright, or a conflict outside .github/); see the job summary and the log above. Build ${BRANCH} by hand from ${tag_sha}, push it and open its draft PR against ${TARGET_BRANCH}; later runs then report on that PR."
+                exit 1
+              fi
+
+              for f in "${conflicted[@]}"; do
+                if git cat-file -e "${main_sha}:${f}" 2>/dev/null; then
+                  git checkout "${main_sha}" -- "${f}"
+                else
+                  git rm --quiet -- "${f}"
+                fi
+                echo "${f}" >> "${RUNNER_TEMP}/fork-copy.txt"
+              done
+              {
+                echo ""
+                echo "Conflicted under .github/, so ${TARGET_BRANCH}'s copy was taken whole:"
+                echo '```'
+                cat "${RUNNER_TEMP}/fork-copy.txt"
+                echo '```'
+              } | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+            git commit --quiet -m "Apply ${GITHUB_REPOSITORY}@${main_sha:0:12} onto ${UPSTREAM_REPO} ${TAG}" \
+              -m "This fork's own changes, ${base_sha}..${main_sha}, applied onto upstream release ${TAG} (${tag_sha}) by .github/workflows/upstream-release-watch.yaml."
+          else
+            echo "::warning::${TARGET_BRANCH} has no changes of its own over upstream; the branch is ${TAG} unchanged."
+          fi
+
+          git push origin "refs/heads/${BRANCH}"
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Open the draft PR
+        if: steps.plan.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_PAT }}
+          TAG: ${{ steps.release.outputs.tag }}
+          URL: ${{ steps.release.outputs.url }}
+          PUBLISHED: ${{ steps.release.outputs.published }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+          MAIN_SHA: ${{ steps.build.outputs.main_sha }}
+          BASE_SHA: ${{ steps.build.outputs.base_sha }}
+          TAG_SHA: ${{ steps.build.outputs.tag_sha }}
+          HEAD_SHA: ${{ steps.build.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "XPU test of upstream release [${TAG}](${URL}), published ${PUBLISHED}."
+            echo ""
+            echo "**Draft, test only. Do not merge.** Merging would bring the release branch's own commits into ${TARGET_BRANCH}. The result is this PR's \`xpu-status-check\`; close the PR once it is in."
+            echo ""
+            echo "The head commit is:"
+            echo "- upstream \`${TAG}\` (\`${TAG_SHA}\`)"
+            echo "- plus this fork's own changes, \`${BASE_SHA:0:12}..${MAIN_SHA:0:12}\` (the last upstream commit ${TARGET_BRANCH} contains, to ${TARGET_BRANCH}'s tip):"
+            echo ""
+            echo '```'
+            cat "${RUNNER_TEMP}/fork-files.txt"
+            echo '```'
+            echo ""
+            if [ -s "${RUNNER_TEMP}/fork-copy.txt" ]; then
+              echo "These files conflicted with ${TAG}, so ${TARGET_BRANCH}'s copy was taken whole and the release's own edits to them are not in the head:"
+              echo '```'
+              cat "${RUNNER_TEMP}/fork-copy.txt"
+              echo '```'
+              echo ""
+            fi
+            echo "The XPU suite tests that head commit, not its merge with ${TARGET_BRANCH}. The \"Files changed\" tab compares against ${TARGET_BRANCH}, so it is large and is not what was tested."
+            echo ""
+            echo "If GitHub reports a conflict with ${TARGET_BRANCH}, no pull_request workflow starts. Run the same pipeline by dispatch:"
+            echo '```bash'
+            echo "gh workflow run xpu-heterogeneous-dispatch.yaml --repo ${GITHUB_REPOSITORY} --ref ${BRANCH} -f CHECKOUT_COMMIT=${HEAD_SHA} -f xpu_build_checkout_commit=${HEAD_SHA} -f docker_image_xpu=BUILD"
+            echo '```'
+            echo ""
+            echo "Opened by .github/workflows/upstream-release-watch.yaml"
+          } > "${RUNNER_TEMP}/pr-body.md"
+
+          pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --draft \
+            --base "$TARGET_BRANCH" \
+            --head "$BRANCH" \
+            --title "[test only] XPU on upstream release ${TAG}" \
+            --body-file "${RUNNER_TEMP}/pr-body.md")"
+          echo "Opened ${pr_url}" | tee -a "$GITHUB_STEP_SUMMARY"
