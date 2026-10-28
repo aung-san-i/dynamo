@@ -122,6 +122,15 @@ ignore:
   # pipeline (it is excluded from the `deploy` filter below).
   - 'deploy/utils/convert_api_version.py'
   - 'deploy/utils/tests/**'
+  # The path-triggered protocol tooling workflow owns these CPU tooling tests.
+  - 'scripts/protocol_compatibility/**'
+  # Heterog DeviceClass / ResourceClaimTemplate manifests. Applied to the
+  # cluster by hand with kubectl; no CI job reads these files, so editing one
+  # changes nothing a run tests. The test manifests that name them are in `vllm`.
+  - '.ci/test/dynamo-heterog/k8s/templates/**'
+  # Fork-only registry retention workflow. Excluded from `ci` (and so from
+  # every filter that reuses it); listed here so the coverage check passes.
+  - '.github/workflows/xpu-image-retention.yaml'
   - 'dev/*'
   - '.github/scripts/**'
   - '.github/ISSUE_TEMPLATE/**'
@@ -158,8 +167,13 @@ ci: &ci
   - '.github/filters.yaml'
   - '.github/actions/**'
   - '.github/scripts/parse_buildkit_output.py'
+  - '.github/scripts/pytest-local.sh'
   - '.github/scripts/route_buildkit.sh'
   - 'container/Dockerfile.test'
+  # Fork-only registry retention: deletes old XPU CI images from Harbor and
+  # builds or tests nothing, so a change to it alone must not start the XPU
+  # pipeline.
+  - '!.github/workflows/xpu-image-retention.yaml'
 
 core:
   - *ci
@@ -185,6 +199,7 @@ core:
   - 'components/src/dynamo/replay/**'
   - 'components/src/dynamo/frontend/**'
   - 'components/src/dynamo/common/**'
+  - 'components/src/dynamo/artifacts/**'
   - 'components/src/dynamo/experimental/**'
   - 'components/src/dynamo/gpu_memory_service/**'
   # TODO(will): Move TokenSpeed to a dedicated framework filter once CI has
@@ -203,11 +218,16 @@ core:
   # Rust sidecars have their own classification and do not use the framework
   # container or E2E pipelines triggered by `core`.
   - '!lib/sidecar/**'
+  - '!components/src/dynamo/artifacts/vllm/**'
   - '!tests/test_generate_kustomize_openapi.py'
   - '!tests/test_kustomize_matrix.py'
   - '!**/*.md'
   - '!**/*.rst'
   - '!**/*.txt'
+  # Fork-only monitors: they read GitHub and test nothing, so a change to
+  # them alone must not start the XPU pipeline.
+  - '!.github/workflows/upstream-xpu-monitor.yaml'
+  - '!.github/workflows/xpu-base-image-watch.yaml'
 
 # dev/local-dev image templates. These are NOT in `core`: dev.Dockerfile is `FROM
 # runtime` and local_dev.Dockerfile is `FROM dev`, so neither can change a runtime
@@ -276,6 +296,10 @@ snapshot:
   - 'tests/deploy/test_dynamocheckpoint.py'
   - '.github/actions/setup-dynamo-operator/action.yml'
   - '.github/actions/setup-snapshot-agent/action.yml'
+  # Exercise the full checkpoint lifecycle when its scheduling or cleanup changes.
+  - '.github/actions/teardown-dynamo-operator/action.yml'
+  - '.github/workflows/pr.yaml'
+  - '.github/workflows/post-merge-ci.yml'
   # Where the pinned github.com/ai-dynamo/snapshot chart version/values live --
   # a version bump or install-config change must trigger the deploy-snapshot-
   # agent-checkpoint-*/deploy-test-checkpoint-* jobs, not just 'operator'.
@@ -347,6 +371,7 @@ planner:
   - 'components/src/dynamo/planner/**'
   - 'components/src/dynamo/global_planner/**'
   - 'components/src/dynamo/profiler/**'
+  - 'components/src/dynamo/aisimulate/**'
   - 'components/src/dynamo/global_router/**'
   # Keep this tombstone until the vendored-tree deletion has merged so the
   # deleted paths in that PR remain covered by the Planner CI filter.
@@ -384,7 +409,10 @@ vllm:
   - 'container/deps/vllm/**'
   - 'examples/backends/vllm/**'
   - 'components/src/dynamo/vllm/**'
+  - 'components/src/dynamo/artifacts/vllm/**'
   - 'container/templates/vllm_*'
+  # Heterogeneous EPD/P-D test manifests are consumed by PR-XPU and manual EPD workflows.
+  - '.ci/test/dynamo-heterog/k8s/tests/**'
   - '!**/*.md'
   - '!**/*.rst'
 
@@ -437,6 +465,7 @@ frontend:
   - 'components/src/dynamo/replay/**'
   - 'components/src/dynamo/frontend/**'
   - 'components/src/dynamo/common/**'
+  - 'components/src/dynamo/artifacts/**'
   - 'tests/frontend/router_ais_image_smoke.py'
   - 'deploy/inference-gateway/**'
   - 'container/templates/frontend.Dockerfile'
@@ -451,6 +480,7 @@ frontend:
   # Sidecars are standalone Rust binaries and are not part of the frontend
   # image or its E2E test pipeline.
   - '!lib/sidecar/**'
+  - '!components/src/dynamo/artifacts/vllm/**'
   - '!**/*.md'
   - '!**/*.rst'
 
@@ -460,6 +490,8 @@ rust:
   - '**/Cargo.toml'
   - '**/Cargo.lock'
   - 'deny.toml'
+  # Compiled into the native OpenAPI serializer/deserializer tests.
+  - 'lib/llm/tests/fixtures/openapi/*.json'
   # Sidecar protobuf contracts are compiled by crate build scripts and need the
   # same workspace checks as sidecar Rust sources.
   - 'lib/sidecar/**/*.proto'
