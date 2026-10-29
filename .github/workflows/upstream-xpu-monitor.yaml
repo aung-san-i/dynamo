@@ -3,8 +3,15 @@
 #
 # Read-only. It reads upstream's public run history, job logs and JUnit test
 # reports, and writes this run's job summary plus one artifact holding the
-# upstream logs it read. Nothing is pushed anywhere, and no secret is needed:
-# the default GITHUB_TOKEN can read a public repo.
+# upstream logs it read. Nothing is pushed anywhere.
+#
+# Uses the UPSTREAM_READ_TOKEN repository secret: a fine-grained PAT with
+# "Public repositories (read-only)" access and no other permission. The
+# default GITHUB_TOKEN can list upstream's runs and jobs, but GitHub refuses
+# it upstream's job logs (HTTP 403) and artifacts (HTTP 401): those need a
+# signed-in user, even on a public repo. Without the secret the monitor falls
+# back to GITHUB_TOKEN, still sorts every run, and says "log not available"
+# with GitHub's reason for each failed job.
 #
 # For every failed XPU job the summary shows a link to the job's log page,
 # the causes found in the log, and the tests that failed. The test list comes
@@ -90,7 +97,7 @@ jobs:
 
       - name: Sort upstream XPU runs into groups
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_READ_TOKEN || github.token }}
           RANGE: ${{ steps.window.outputs.range }}
         run: |
           set -euo pipefail
@@ -116,7 +123,13 @@ jobs:
           # XPU-CI-FAILURE-REPORT.md. One log can hold several.
           cause() {
             local log="$1" m found=()
-            if m="$(grep -m1 -oE "No module named '[^']+'" "${log}")"; then
+            # "Failed to import from vllm._C: ... No module named 'vllm._C'"
+            # is a harmless warning printed while the image builds; skip it.
+            # No grep -m1 after a pipe: it would close the pipe early, and
+            # pipefail would then count the match as a failure.
+            m="$(grep -v 'Failed to import from' "${log}" | grep -oE "No module named '[^']+'" || true)"
+            m="${m%%$'\n'*}"
+            if [ -n "${m}" ]; then
               found+=("module missing from the XPU image: ${m}")
             fi
             if grep -q 'auditwheel: command not found' "${log}"; then
@@ -131,8 +144,19 @@ jobs:
             if m="$(grep -m1 -oE "unexpected keyword argument '[^']+'" "${log}")"; then
               found+=("API change: ${m}")
             fi
-            if grep -qE 'Temporary failure in name resolution|TLS handshake timeout|i/o timeout|net/http: request canceled' "${log}"; then
-              found+=("network trouble on the XPU runner")
+            # The registry lines are Docker failing to reach a registry, e.g.
+            # "failed to resolve source metadata for docker.io/...: unexpected
+            # status from HEAD request to https://registry-1.docker.io/...:
+            # 502 Bad Gateway". The host and 5xx status are named when found.
+            if m="$(grep -m1 -E 'Temporary failure in name resolution|TLS handshake timeout|i/o timeout|net/http: request canceled|unexpected status from (HEAD|GET) request|failed to resolve source metadata|50[234] (Bad Gateway|Service Unavailable|Gateway Timeout)' "${log}")"; then
+              local where="" re_host='https?://([^/:[:space:]]+)' re_status='(50[234] [A-Za-z]+( [A-Za-z]+)?)'
+              if [[ "${m}" =~ ${re_host} ]]; then
+                where="${BASH_REMATCH[1]}"
+              fi
+              if [[ "${m}" =~ ${re_status} ]]; then
+                where+="${where:+: }${BASH_REMATCH[1]}"
+              fi
+              found+=("network trouble on the XPU runner${where:+ (${where})}")
             fi
             if [ "${#found[@]}" -eq 0 ]; then
               # Job log lines start with a timestamp; drop it.
@@ -245,6 +269,16 @@ jobs:
             echo "${1//|/"${bar}"}"
           }
 
+          # Why a gh api call failed, from its stderr file $1, e.g.
+          # "Must have admin rights to Repository. (HTTP 403)". Kept out of
+          # ${logs}, so the artifact holds only upstream's own files.
+          api_error() {
+            local m
+            m="$(sed -n '1{s/^gh: //;p;q}' "$1" | cut -c1-150)"
+            html_escape "${m:-no error message from gh}"
+          }
+          gh_err="${RUNNER_TEMP}/gh-api.err"
+
           # A job or test name made safe for a file name inside an artifact.
           safe_name() {
             echo "${1//[^A-Za-z0-9._-]/-}"
@@ -302,13 +336,16 @@ jobs:
             failed="$(jq -c --arg re "${XPU_JOB}" \
               '.[] | select((.name | test($re)) and (.conclusion == "failure" or .conclusion == "timed_out"))' <<<"${jobs}")"
             if [ -n "${failed}" ]; then
-              local jid jname jconcl jurl base log list src arts aid aname
+              local jid jname jconcl jurl base log list src arts arts_err="" aid aname junit_err
               local kind test reason n total tally
               # This run's JUnit report artifacts, "id<TAB>name". Read once
               # per run, and only for a run with a failed XPU job.
-              arts="$(gh api --paginate "repos/${R}/actions/runs/${id}/artifacts?per_page=100" \
-                --jq '.artifacts[] | select((.expired | not) and (.name | startswith("test-results-"))) | [.id, .name] | @tsv' \
-                2>/dev/null || true)"
+              if ! arts="$(gh api --paginate "repos/${R}/actions/runs/${id}/artifacts?per_page=100" \
+                  --jq '.artifacts[] | select((.expired | not) and (.name | startswith("test-results-"))) | [.id, .name] | @tsv' \
+                  2> "${gh_err}")"; then
+                arts=""
+                arts_err="$(api_error "${gh_err}")"
+              fi
               while read -r j; do
                 jid="$(jq -r .id <<<"${j}")"
                 jname="$(jq -r .name <<<"${j}")"
@@ -319,11 +356,11 @@ jobs:
                 base="${logs}/${id}-${jid}-$(safe_name "${jname}")"
                 log="${base}.log"
                 detail+="**${jname}** (${jconcl})${jurl:+ [log](${jurl})}: "
-                if gh api "repos/${R}/actions/jobs/${jid}/logs" > "${log}" 2>/dev/null; then
+                if gh api "repos/${R}/actions/jobs/${jid}/logs" > "${log}" 2> "${gh_err}"; then
                   detail+="$(cause "${log}")<br>"
                 else
                   rm -f "${log}"
-                  detail+="log not available<br>"
+                  detail+="log not available: $(api_error "${gh_err}")<br>"
                 fi
 
                 # Upstream's pytest action names its artifact
@@ -332,15 +369,24 @@ jobs:
                 list="${base}.tests.tsv"
                 : > "${list}"
                 src=""
+                junit_err="${arts_err}"
                 while IFS=$'\t' read -r aid aname; do
                   [ -n "${aid}" ] && [[ "${aname}" == *"-${jid}" ]] || continue
                   mkdir -p "${base}-junit/${aid}"
-                  if gh api "repos/${R}/actions/artifacts/${aid}/zip" > "${base}-junit/${aid}.zip" 2>/dev/null \
-                      && unzip -o -q "${base}-junit/${aid}.zip" -d "${base}-junit/${aid}"; then
+                  if ! gh api "repos/${R}/actions/artifacts/${aid}/zip" > "${base}-junit/${aid}.zip" 2> "${gh_err}"; then
+                    junit_err="$(api_error "${gh_err}")"
+                  elif unzip -o -q "${base}-junit/${aid}.zip" -d "${base}-junit/${aid}"; then
                     src=junit
+                  else
+                    junit_err="artifact ${aid} is not a readable zip"
                   fi
                   rm -f "${base}-junit/${aid}.zip"
                 done <<<"${arts}"
+                # Only said when no report was read; the log may still list
+                # the tests below.
+                if [ -n "${junit_err}" ] && [ -z "${src}" ]; then
+                  detail+="JUnit report not available: ${junit_err}<br>"
+                fi
                 if [ "${src}" = junit ]; then
                   if ! junit_tests "${base}-junit" > "${list}" || [ ! -s "${list}" ]; then
                     src=""
