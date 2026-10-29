@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: PR-XPU-Heterogeneous-Matrix-Trial
+
+# ============================================================================
+# TRIAL caller: the heterogeneous tests as ONE matrix job.
+# ============================================================================
+# Runs xpu-heterogeneous-run-matrix.yml on the same pull requests as
+# pr-xpu-heterogeneous.yaml, so both layouts test the same commits:
+#
+#   PR-XPU-Heterogeneous               seven tests chained with `needs:`
+#   PR-XPU-Heterogeneous-Matrix-Trial  seven legs of one matrix, max-parallel 1
+#
+# What to compare: after a test fails, "Re-run failed jobs" on a trial run
+# should re-run only the failed legs, cleanup-images and the status job --
+# never a leg that passed. On PR-XPU-Heterogeneous it also re-runs every test
+# after the failed one.
+#
+# Pre-merge only, with the same two automatic triggers and the same
+# fork-PR clause as pr-xpu-heterogeneous.yaml. Not the /run_xpu_heterogeneous
+# slash command: that path needs issues: write and is not what the trial
+# measures.
+#
+# NOT a merge gate. The status job is deliberately NOT named
+# `xpu-status-check`: two workflows reporting one context name on the same
+# commit would let either run's verdict stand in for the other's. Its name,
+# `xpu-matrix-trial-status-check`, is not in any branch protection rule, so a
+# red trial shows on the PR but blocks nothing.
+#
+# Delete this file and xpu-heterogeneous-run-matrix.yml when the trial is done.
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# Its OWN group, not xpu-heterog-hardware. Sharing that group would queue this
+# run behind the PR-XPU-Heterogeneous run of the same push -- the two would run
+# one after the other, never side by side.
+#
+# Side by side is safe only while xpu-heterogeneous-ubuntu-latest has ONE
+# runner: every job of both workflows needs that runner, it runs one job at a
+# time, and each test job deletes its own pods (the template's Cleanup step,
+# `if: always()`) before it frees the runner. So no two tests ever hold the
+# Kueue quota or the dynamo-system names at once. Stop the trial before adding
+# a second runner to that label. See the header of
+# xpu-heterogeneous-run-matrix.yml.
+#
+# This group still serializes trial runs against EACH OTHER, FIFO, never
+# cancelled -- the same cancel-in-progress: false + queue: max pairing the
+# hardware group uses. actionlint <=1.7.12 wrongly flags "queue" as an unknown
+# key.
+concurrency:
+  group: xpu-heterog-matrix-trial
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+
+  # Same gate as `run` in pr-xpu-heterogeneous.yaml, minus the issue_comment
+  # clause: a fork PR's head branch is never aimed at this hardware; it is
+  # tested through the copy-pr-bot push to pull-request/N instead.
+  run:
+    name: XPU Heterogeneous
+    if: >-
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository) ||
+      github.event_name == 'push'
+    uses: ./.github/workflows/xpu-heterogeneous-run-matrix.yml
+    secrets: inherit
+    with:
+      phase: pre-merge
+      # Same expression as pr-xpu-heterogeneous.yaml without its issue_comment
+      # half: a sync PR forces every test on, any other PR is diff-gated.
+      force_all_tests: ${{ startsWith(github.head_ref, 'sync/upstream-') }}
+      build_nvidia_image: 'pr-label'
+
+  # Same verdict as `xpu-status-check` in pr-xpu-heterogeneous.yaml for the two
+  # events this file has, under a name no branch protection rule requires.
+  xpu-matrix-trial-status-check:
+    runs-on: xpu-heterogeneous-ubuntu-latest
+    needs: [run]
+    if: always()
+    steps:
+      - name: Check the XPU heterogeneous matrix pipeline result
+        env:
+          RESULT: ${{ needs.run.result }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          echo "event: ${EVENT}"
+          echo "xpu-heterogeneous-run-matrix result: ${RESULT}"
+          case "${RESULT}" in
+            success)
+              echo "OK: XPU heterogeneous matrix pipeline succeeded"
+              ;;
+            skipped)
+              echo "::error::The XPU heterogeneous matrix pipeline did not run for this PR. Head branch is in ${HEAD_REPO:-an unknown repository}, not ${GITHUB_REPOSITORY}; the push run on pull-request/N reports against this same commit."
+              exit 1
+              ;;
+            *)
+              echo "::error::XPU heterogeneous matrix pipeline ${RESULT}"
+              exit 1
+              ;;
+          esac
