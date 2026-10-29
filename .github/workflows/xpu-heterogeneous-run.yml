@@ -1062,48 +1062,49 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          - test_name: px-dn
-            title: "Heterog: XPU Prefill + NVIDIA Decode"
-            test_yaml: px-dn.yaml
-            xpu_resource_template: onexpu-rdma-kueue
-            nvidia_resource_template: onenvidia-rdma-kueue
-            pipeline_model: true
-            expect_benchmark_result: true
-          - test_name: pn-dx
-            title: "Heterog: NVIDIA Prefill + XPU Decode"
-            test_yaml: pn-dx.yaml
-            xpu_resource_template: onexpu-rdma-kueue
-            nvidia_resource_template: onenvidia-rdma-kueue
-            pipeline_model: true
-            expect_benchmark_result: true
-          - test_name: e-pd-2nodes
-            title: "Heterog: XPU Encode + NVIDIA Prefill-Decode"
-            test_yaml: e-pd_2nodes.yaml
-            xpu_resource_template: onexpu-rdma-kueue
-            nvidia_resource_template: onenvidia-rdma-kueue
-            pipeline_model: false
-            expect_benchmark_result: true
-          - test_name: px-dn-hnd-tp2
-            title: "Heterog: XPU Prefill TP2 + NVIDIA Decode (HND)"
-            test_yaml: px-dn-hnd-tp2.yaml
-            xpu_resource_template: twoxpu-rdma-kueue
-            nvidia_resource_template: onenvidia-rdma-kueue
-            pipeline_model: false
-            expect_benchmark_result: true
-          - test_name: px-dx
-            title: "Heterog: XPU Prefill + XPU Decode (one node)"
-            test_yaml: px-dx.yaml
-            xpu_resource_template: onexpu-rdma-vf-kueue
-            nvidia_resource_template: onenvidia-rdma-kueue
-            pipeline_model: true
-            expect_benchmark_result: true
-          - test_name: epd-3way-2node
-            title: "Heterog: XPU Encode + NVIDIA Prefill + NVIDIA Decode"
-            test_yaml: epd_3way_2node.yaml
-            xpu_resource_template: onexpu-rdma-kueue
-            nvidia_resource_template: onenvidia-rdma-vf-kueue
-            pipeline_model: false
-            expect_benchmark_result: true
+          # DO-NOT-MERGE: omni-only test PR; the other legs are commented out.
+          # - test_name: px-dn
+          #   title: "Heterog: XPU Prefill + NVIDIA Decode"
+          #   test_yaml: px-dn.yaml
+          #   xpu_resource_template: onexpu-rdma-kueue
+          #   nvidia_resource_template: onenvidia-rdma-kueue
+          #   pipeline_model: true
+          #   expect_benchmark_result: true
+          # - test_name: pn-dx
+          #   title: "Heterog: NVIDIA Prefill + XPU Decode"
+          #   test_yaml: pn-dx.yaml
+          #   xpu_resource_template: onexpu-rdma-kueue
+          #   nvidia_resource_template: onenvidia-rdma-kueue
+          #   pipeline_model: true
+          #   expect_benchmark_result: true
+          # - test_name: e-pd-2nodes
+          #   title: "Heterog: XPU Encode + NVIDIA Prefill-Decode"
+          #   test_yaml: e-pd_2nodes.yaml
+          #   xpu_resource_template: onexpu-rdma-kueue
+          #   nvidia_resource_template: onenvidia-rdma-kueue
+          #   pipeline_model: false
+          #   expect_benchmark_result: true
+          # - test_name: px-dn-hnd-tp2
+          #   title: "Heterog: XPU Prefill TP2 + NVIDIA Decode (HND)"
+          #   test_yaml: px-dn-hnd-tp2.yaml
+          #   xpu_resource_template: twoxpu-rdma-kueue
+          #   nvidia_resource_template: onenvidia-rdma-kueue
+          #   pipeline_model: false
+          #   expect_benchmark_result: true
+          # - test_name: px-dx
+          #   title: "Heterog: XPU Prefill + XPU Decode (one node)"
+          #   test_yaml: px-dx.yaml
+          #   xpu_resource_template: onexpu-rdma-vf-kueue
+          #   nvidia_resource_template: onenvidia-rdma-kueue
+          #   pipeline_model: true
+          #   expect_benchmark_result: true
+          # - test_name: epd-3way-2node
+          #   title: "Heterog: XPU Encode + NVIDIA Prefill + NVIDIA Decode"
+          #   test_yaml: epd_3way_2node.yaml
+          #   xpu_resource_template: onexpu-rdma-kueue
+          #   nvidia_resource_template: onenvidia-rdma-vf-kueue
+          #   pipeline_model: false
+          #   expect_benchmark_result: true
           - test_name: omni-ar-dit-2nodes
             title: "Omni: NVIDIA AR + XPU DiT (GLM-Image)"
             test_yaml: omni_ar-dit_2nodes.yaml
