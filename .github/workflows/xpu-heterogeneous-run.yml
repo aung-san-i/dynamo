@@ -7,7 +7,7 @@ name: XPU-Heterogeneous-Run
 # REUSABLE XPU heterogeneous P/D pipeline.
 # ============================================================================
 # guard -> changed-files -> build-xpu / build-nvidia -> resolve-images ->
-# heterog-test (matrix, 13 legs, max-parallel 1) -> cleanup-images ->
+# heterog-test (matrix, 12 legs, max-parallel 1) -> cleanup-images ->
 # xpu-status-check (in the caller).
 #
 # Called by exactly three thin trigger workflows, one per merge phase:
@@ -1053,11 +1053,13 @@ jobs:
   #                       manifest's own default, so pipeline_model: false.
   #   ex-pdx              EXT-15. XPU encode + XPU prefill-decode on one host,
   #                       Qwen/Qwen3-VL-2B-Instruct; both on the VF template.
-  #   omni-ar-dit-1node-xpu
-  #                       EXT-19. omni-ar-dit-2nodes with AR on the second B60;
-  #                       Ar and Dit on the VF template, Router alone on
-  #                       onenvidia-rdma-kueue. expect_benchmark_result: false
-  #                       for the same reason as omni-ar-dit-2nodes.
+  #
+  # EXT-19 (omni_ar-dit_1node_xpu.yaml, GLM-Image AR + DiT both on XPU) is NOT a
+  # leg: in run 41087132745 the AR stage's weights took 18.88 GiB of the B60's
+  # budget and left -2.68 GiB for KV cache ("No available memory for the cache
+  # blocks"). The AR stage does not fit one 24 GB B60 at bf16, and AR at TP=2
+  # would need a third card on the XPU node. The manifest is kept for a node
+  # with more cards.
   # SR-IOV VFs: px-dx, epd-3way-2node and omni put two NIXL workers on ONE node,
   # and one cabled port can go to one pod only, so the crowded node's workers
   # claim VF templates. epd-3way-2node and omni claim 3 RDMA devices, so Kueue's
@@ -1164,13 +1166,6 @@ jobs:
             nvidia_resource_template: onenvidia-rdma-kueue
             pipeline_model: false
             expect_benchmark_result: true
-          - test_name: omni-ar-dit-1node-xpu
-            title: "Omni: XPU AR + XPU DiT (GLM-Image, one node)"
-            test_yaml: omni_ar-dit_1node_xpu.yaml
-            xpu_resource_template: onexpu-rdma-vf-kueue
-            nvidia_resource_template: onenvidia-rdma-kueue
-            pipeline_model: false
-            expect_benchmark_result: false
     uses: ./.github/workflows/epd-test-template.yml
     secrets: inherit
     with:

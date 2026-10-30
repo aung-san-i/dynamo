@@ -18,13 +18,12 @@
 # A run claims 3 RDMA devices (2 VFs + the NVIDIA port), so Kueue's
 # intel.com/rdma quota must be at least 3.
 #
-# MEMORY RISK: GLM-Image's AR stage is a ~9B model, about 18 GB in bf16. It ran on
-# an A100 in omni_ar-dit_2nodes; here it gets one 24 GB B60, and the stage config
-# gives it gpu_memory_utilization 0.85 (20.4 GB) with max_num_seqs 1. That leaves
-# little room for KV cache and activations. If the AR pod fails with an
-# out-of-memory or "No available memory for the cache blocks" error, this
-# topology does not fit one B60 at bf16 and needs a second card (AR_TP=2) or a
-# smaller AR -- it is not a flake.
+# DOES NOT FIT intel01-b60, so xpu-heterogeneous-run.yml does not run it.
+# GLM-Image's AR stage is a ~9B model. In run 41087132745 its weights took
+# 18.88 GiB on one 24 GB B60 and vLLM reported "Available KV cache memory:
+# -2.68 GiB", then "No available memory for the cache blocks". It needs AR at
+# TP=2 (AR_TP/AR_GPUS and a 2-card claim for Ar), which with Dit's card makes 3
+# B60s -- more than intel01-b60 has. Kept for a node with at least 3 cards.
 #
 # Inter-stage transfer is NixlConnector over UCX/IB:
 #   Ar --(ar_to_dit_nixl)--> Dit --(dit_to_router)--> Router
