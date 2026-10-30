@@ -361,6 +361,12 @@ spec:
         - name: benchmark-runner
           image: ${DOCKER_IMAGE_GPU}
           workingDir: /workspace
+          # Root, like the workers. They run as root and create this model's
+          # folder in the shared HF cache root-owned; huggingface_hub writes a
+          # lock file there even on a cache hit, so a non-root bench pod got
+          # "Permission denied" loading the tokenizer (run 41127269054).
+          securityContext:
+            runAsUser: 0
           command:
             - /bin/sh
             - -c
