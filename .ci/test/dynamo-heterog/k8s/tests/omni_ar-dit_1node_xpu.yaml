@@ -1,0 +1,1027 @@
+# omni_ar-dit_1node_xpu Test: XPU AR (stage 0) + XPU DiT (stage 1) on ONE XPU node
+#
+# Test plan EXT-19: the omni_ar-dit_2nodes test with the AR stage moved off
+# NVIDIA onto the second B60 of the XPU host, so both GLM-Image stages and the
+# AR -> DiT hand-off run XPU to XPU. Everything else -- stage config, router,
+# bench Job and its image check -- is omni_ar-dit_2nodes unchanged.
+#
+# Topology (4 pods, 3 accelerators):
+#   Frontend  -> NVIDIA node, no device      (HTTP only, no NIXL)
+#   Ar        -> XPU node,    1 B60 + VF     (stage 0, AR token generation)
+#   Dit       -> XPU node,    1 B60 + VF     (stage 1, diffusion / image out)
+#   Router    -> NVIDIA node, 1 GPU + RDMA   (registers the user-visible model)
+#
+# Ar and Dit both claim ${XPU_RESOURCE_TEMPLATE}: one ResourceClaim per pod, so
+# each gets one card of the pair. Two pods on one node cannot share the cabled
+# RDMA port, so xpu-heterogeneous-run.yml passes onexpu-rdma-vf-kueue (1 XPU +
+# 1 VF). The Router is alone on the NVIDIA node and keeps onenvidia-rdma-kueue.
+# A run claims 3 RDMA devices (2 VFs + the NVIDIA port), so Kueue's
+# intel.com/rdma quota must be at least 3.
+#
+# MEMORY RISK: GLM-Image's AR stage is a ~9B model, about 18 GB in bf16. It ran on
+# an A100 in omni_ar-dit_2nodes; here it gets one 24 GB B60, and the stage config
+# gives it gpu_memory_utilization 0.85 (20.4 GB) with max_num_seqs 1. That leaves
+# little room for KV cache and activations. If the AR pod fails with an
+# out-of-memory or "No available memory for the cache blocks" error, this
+# topology does not fit one B60 at bf16 and needs a second card (AR_TP=2) or a
+# smaller AR -- it is not a flake.
+#
+# Inter-stage transfer is NixlConnector over UCX/IB:
+#   Ar --(ar_to_dit_nixl)--> Dit --(dit_to_router)--> Router
+#
+# The router runs in its own pod because dynamo's kube discovery is pod-scoped:
+# one instance_id per pod, so two dynamo processes in one pod cannot both hold a
+# registration. (Per-container identity exists upstream but needs a `pods` verb
+# the discovery Role lacks here; see omni_test_discovery_issue.md.)
+#
+# It runs on the NVIDIA node with the GPU image because it needs a visible
+# accelerator even though it computes nothing: the launch path builds vLLM engine
+# args before it branches on --omni-router, and vLLM picks its platform by probing
+# hardware. Here both XPU cards are taken by Ar and Dit, so the NVIDIA node is the
+# only place left for it. The dit_to_router hop is cross-node as a result, but
+# receive_device: cpu pins that receive buffer to host memory, so only the wire
+# is longer.
+#
+# Endpoint registration (see dynamo omni/stage_worker.py, omni/stage_router.py):
+#   stage workers -> {DYN_NAMESPACE}.stage0.generate / {DYN_NAMESPACE}.stage1.generate
+#   router        -> {DYN_NAMESPACE}.backend.generate   <- the user-visible model
+# Not ar/dit: both sides read model_stage with getattr() off engine_args, which the
+# 0.30 compat property returns as a plain dict, so both take the same f"stage{id}".
+#
+# MODEL NOTE: GLM-Image (34G) lives in the HF cache under /models/huggingface
+# (HF_HOME), on the /software/data/pytorch host path each worker pod mounts
+# read-write. This cluster does not pre-stage it, so HF_HUB_OFFLINE=0: the first
+# run downloads it into that cache (34G, inside the template's readiness wait)
+# and later runs reuse it. OMNI_MODEL stays the plain hub id, and dynamo rewrites
+# it to whichever snapshot refs/main points at (omni/args.py -> vllm
+# get_model_path, which calls snapshot_download). Nothing here pins a revision,
+# so a newer upstream snapshot is picked up with no edit. That rewrite also sets
+# served_model_name to the hub id, so /v1/models still advertises
+# "zai-org/GLM-Image" rather than a snapshot path -- which is what the bench Job
+# sends as SERVED_MODEL_NAME in its request payloads. The two must stay in sync.
+#
+# The variable is OMNI_MODEL, not MODEL, on purpose: MODEL is in the
+# epd-test-template envsubst allow-list (the other tests write `--model
+# ${MODEL:-<their own default>}`, which envsubst copies through verbatim for the
+# pod's shell to expand, while a bare `$MODEL` is filled in from inputs.model at
+# render time), so a `$MODEL` here would be substituted away before the pod ever
+# ran and this test would silently load the workflow's default text model.
+# OMNI_MODEL is outside that allow-list, so it survives rendering and is
+# expanded by the pod's shell.
+#
+# Consequence of HF_HUB_OFFLINE=0: a run that finds no cached copy downloads 34G
+# before its pods go Ready, so the first run (and any run after the cache is
+# wiped) is slow. With HF_HUB_OFFLINE=1 the same cache miss failed every stage
+# at startup with LocalEntryNotFoundError, which is what the first CI run hit.
+#
+# Do NOT point HF_HOME at /mnt/weka: that mount is readOnly: true in every test
+# manifest here, and huggingface_hub writes lock files under the cache root even
+# on a pure cache hit.
+#
+# Usage:
+#   export DOCKER_IMAGE_XPU="..." DOCKER_IMAGE_GPU="..." XPU_RESOURCE_TEMPLATE="..." NVIDIA_RESOURCE_TEMPLATE="..."
+#   kubectl apply -f <(envsubst < omni_ar-dit_1node_xpu.yaml) -n dynamo-system
+#   kubectl wait --for=condition=Ready pod -l dynamo.nvidia.com/graph=${TEST_NAME} -n dynamo-system --timeout=30m
+#
+# Cleanup:
+#   kubectl delete dynamographdeployment ${TEST_NAME} -n dynamo-system
+#   kubectl delete job ${TEST_NAME}-bench -n dynamo-system
+#   kubectl delete configmap ${TEST_NAME}-omni-stage-config -n dynamo-system
+#
+# NODE CAPACITY: Ar and Dit both claim ${XPU_RESOURCE_TEMPLATE} on ${XPU_NODE},
+# so that node must satisfy the template TWICE -- two B60s and two RDMA devices.
+# See the topology note above for the VF template and the RDMA quota.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${TEST_NAME}-omni-stage-config
+  namespace: dynamo-system
+data:
+  # Mirrors dynamo examples/backends/vllm/launch/stage_configs/glm_image_nixl.yaml.
+  # Inlined so the test is self-contained and does not depend on the image's
+  # /opt/dynamo checkout layout.
+  #
+  # SCHEMA: keep `stages:` and never write `stage_args:`. vLLM-Omni's loader
+  # (config/stage_config.py) raises "uses the removed `stage_args` schema" on a
+  # file that carries the latter.
+  #
+  # TOPOLOGY IS NOT HERE, and restating it is rejected: stage types, model
+  # architectures, model/tokenizer subdirs, input sources, the AR->DiT input
+  # processor and the AR scheduler class are frozen in vLLM-Omni's
+  # GLM_IMAGE_PIPELINE (model_executor/models/glm_image/pipeline.py), reached via
+  # `pipeline: glm_image`. This file carries deployment knobs and connector
+  # wiring only.
+  #
+  # Both stages use devices "0": each pod sees exactly one card (DRA-allocated),
+  # so logical device 0 is the right one on both sides.
+  #
+  # AR_GPUS/AR_TP/DIT_GPUS/DIT_TP are read via oc.env. OmegaConf resolves the
+  # WHOLE file on load, so every pod that reads this config must define all four
+  # even if it only runs one stage.
+  glm_image_nixl.yaml: |
+    pipeline: glm_image
+
+    # GLM-Image declares no async-chunk next-stage processor, and DeployConfig
+    # defaults this to true. Matches vLLM-Omni's own deploy/glm_image.yaml.
+    async_chunk: false
+
+    # Pipeline-wide engine settings, propagated to every stage.
+    trust_remote_code: true
+    enable_prefix_caching: false
+    distributed_executor_backend: "mp"
+
+    connectors:
+      # AR (xpu) -> DiT (xpu), two cards of one host. Device-to-device over the
+      # two VFs; both sides contribute ze_copy from UCX_TLS.
+      ar_to_dit_nixl:
+        name: NixlConnector
+        extra:
+          enforce_handshake_compat: false
+      # DiT (xpu) -> Router (own pod on the NVIDIA node).
+      # receive_device: cpu puts the router's receive buffer in host memory.
+      # Set explicitly: the connector's default first candidate is the SOURCE
+      # device (xpu:0), which no CUDA node can allocate.
+      dit_to_router:
+        name: NixlConnector
+        extra:
+          enforce_handshake_compat: false
+          receive_device: cpu
+
+    # Edges only declare the graph; an edge with no connector above would fall
+    # back to SharedMemoryConnector. The legacy window_size/max_inflight knobs
+    # are gone -- no vLLM-Omni code reads them.
+    edges:
+      - from: 0
+        to: 1
+
+    stages:
+      # Stage 0: AR model (token generation) -- XPU in this test
+      - stage_id: 0
+        devices: ${oc.env:AR_GPUS,0}
+        tensor_parallel_size: ${oc.decode:${oc.env:AR_TP,1}}
+        max_num_seqs: 1
+        gpu_memory_utilization: 0.85
+        enforce_eager: true
+        max_num_batched_tokens: 32768
+        output_connectors:
+          to_stage_1: ar_to_dit_nixl
+        default_sampling_params:
+          temperature: 0.9
+          top_p: 0.75
+          top_k: 16512
+          max_tokens: 1281
+          stop_token_ids: [16385]
+          seed: 42
+          detokenize: false
+
+      # Stage 1: DiT diffusion model (image generation) -- XPU in this test
+      - stage_id: 1
+        devices: ${oc.env:DIT_GPUS,0}
+        max_num_seqs: 1
+        enforce_eager: true
+        # parallel_config is not a StageDeployConfig field, so it lands in
+        # engine_extras and is merged into the engine args verbatim
+        # (engine_args.update(engine_extras)) -- the same place it reached under
+        # the old schema's engine_args block. vLLM-Omni's own deploy/glm_image.yaml
+        # wires its diffusion stage this way too.
+        parallel_config:
+          tensor_parallel_size: ${oc.decode:${oc.env:DIT_TP,1}}
+          cfg_parallel_size: ${oc.decode:${oc.env:DYN_OMNI_CFG_PARALLEL_SIZE,1}}
+        input_connectors:
+          from_stage_0: ar_to_dit_nixl
+        output_connectors:
+          to_stage_router: dit_to_router
+        default_sampling_params:
+          seed: 42
+          num_inference_steps: 50
+          guidance_scale: 1.5
+          height: 1024
+          width: 1024
+
+---
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: ${TEST_NAME}
+  namespace: dynamo-system
+spec:
+  backendFramework: vllm
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "4"
+      extraPodSpec:
+        nodeSelector:
+          dynamo.intel.com/node: ${NVIDIA_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+        mainContainer:
+          image: ${DOCKER_IMAGE_GPU}
+          env:
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+            - name: PYTHONHASHSEED
+              value: "0"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+
+    Ar:
+      componentType: worker
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "4"
+      # /dev/shm for the mp executor. Declared through the operator's own field,
+      # NOT as a volume+volumeMount in extraPodSpec: the operator unconditionally
+      # appends its own "shared-memory" emptyDir at /dev/shm, and a hand-rolled
+      # mount at the same path makes the generated Deployment invalid
+      # ("spec.template.spec.containers[0].volumeMounts[4].mountPath: Invalid
+      # value: \"/dev/shm\": must be unique"), so the worker pods are never
+      # created. Default would be 8Gi; raised here for the 34G model.
+      sharedMemory:
+        size: 16Gi
+      extraPodSpec:
+        nodeSelector:
+          dynamo.intel.com/node: ${XPU_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+          - name: omni-stage-config
+            configMap:
+              name: ${TEST_NAME}-omni-stage-config
+        resourceClaims:
+          # Same template as Dit, separate claim: a device already allocated to
+          # Dit's claim is no candidate for this one, so Ar necessarily lands on
+          # the other card of the pair.
+          - name: intel-gpu-rdma-resource
+            resourceClaimTemplateName: ${XPU_RESOURCE_TEMPLATE}
+        mainContainer:
+          image: ${DOCKER_IMAGE_XPU}
+          workingDir: /workspace
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -x
+              xpu-smi discovery || true
+
+              # Stage 0 (AR) on the pod's single B60. Sole process in the
+              # pod, in the foreground: it owns stdout for `kubectl logs`, its
+              # exit status is the container's, and it keeps the
+              # operator-injected DYN_SYSTEM_PORT=9090 so the pod's
+              # liveness/readiness probes track the AR stage.
+              exec python -m dynamo.vllm.omni \
+                --model "$OMNI_MODEL" \
+                --stage-id 0 \
+                --stage-configs-path "$STAGE_CONFIG" \
+                --output-modalities image \
+                --media-output-fs-url file:///tmp/dynamo_media
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - "IPC_LOCK"
+                - "SYS_PTRACE"
+                - "SYS_ADMIN"
+                - "SYS_RAWIO"
+          env:
+            # Hub id, downloaded into the HF cache under HF_HOME on first use
+            # (HF_HUB_OFFLINE=0) and reused after. dynamo rewrites it to the
+            # snapshot that refs/main points at (omni/args.py get_model_path), so
+            # a newer snapshot is picked up with no edit here. The rewrite also
+            # sets served_model_name to this id, so /v1/models keeps advertising
+            # "zai-org/GLM-Image" instead of the snapshot path.
+            - name: OMNI_MODEL
+              value: "zai-org/GLM-Image"
+            - name: STAGE_CONFIG
+              value: "/etc/dynamo/omni/glm_image_nixl.yaml"
+            # No RUN_TAG / POD_LOG_DIR: this pod's only process writes to stdout,
+            # so `kubectl logs` collects everything. The shared-NFS drop box is
+            # only for the bench Job's generated PNG, and that Job sets these
+            # itself.
+            # AR on XPU, like DiT. VLLM_TARGET_DEVICE is what
+            # disagg_omni_glm_image_xpu_cuda.sh exports from AR_DEVICE_TYPE.
+            - name: VLLM_TARGET_DEVICE
+              value: "xpu"
+            # No VLLM_USE_V2_MODEL_RUNNER: omni owns that choice and forces Model
+            # Runner V1 on both halves itself (OmniSchedulerMixin, gpu_ar_worker).
+            # A scheduler/worker disagreement is an omni bug, not a knob for here.
+            - name: AR_TP
+              value: "1"
+            - name: AR_GPUS
+              value: "0"
+            # DIT_* are unused by stage 0 but must be present: OmegaConf resolves
+            # every oc.env in the stage config, including stage 1's.
+            - name: DIT_TP
+              value: "1"
+            - name: DIT_GPUS
+              value: "0"
+            - name: DYN_OMNI_CFG_PARALLEL_SIZE
+              value: "1"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: UCX_TLS
+              value: "ib,rc,ud,rc_verbs,ud_verbs,ze_copy"
+            - name: UCX_IB_ROCE_REACHABILITY_MODE
+              value: "all"
+            # RoCE GID 1 = the RoCE v2 GID of the link-local IPv6 (fe80) address,
+            # which every up interface has. Ar and Dit run on VFs, and a VF
+            # loses its IPv4 address after a test uses it (dranet moves it out
+            # and back, and nothing re-applies a hand-set address), leaving only
+            # GIDs 0/1. Same index on every NIXL worker here so both ends of
+            # each connection (Ar -> Dit, Dit -> Router) use fe80 GIDs.
+            - name: UCX_IB_GID_INDEX
+              value: "1"
+            - name: UCX_MEMTYPE_CACHE
+              value: "0"
+            # vLLM 0.30 reads telemetry on every completed transfer, so it must be on
+            # (the operator injects ENABLE=n) -- but with an empty EXPORTER: its
+            # prometheus is a plugin neither image builds, and loading it throws.
+            - name: NIXL_TELEMETRY_ENABLE
+              value: "y"
+            - name: NIXL_TELEMETRY_EXPORTER
+              value: ""
+            - name: PYTHONHASHSEED
+              value: "0"
+            # Downloads on: GLM-Image is not pre-staged on this cluster, so with
+            # "1" every stage failed with LocalEntryNotFoundError. "0" lets HF
+            # fetch it into HF_HOME on first use and reuse the cache afterwards.
+            # dynamo's repo-id -> snapshot rewrite (omni/args.py get_model_path)
+            # still runs: it calls snapshot_download either way.
+            - name: HF_HUB_OFFLINE
+              value: "0"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+          resources:
+            claims:
+              - name: intel-gpu-rdma-resource
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+            - name: omni-stage-config
+              mountPath: /etc/dynamo/omni
+              readOnly: true
+
+    Dit:
+      componentType: worker
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "4"
+      # See the Ar service above: /dev/shm comes from the operator's sharedMemory
+      # field, never from a hand-rolled volumeMount.
+      sharedMemory:
+        size: 16Gi
+      extraPodSpec:
+        nodeSelector:
+          dynamo.intel.com/node: ${XPU_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+          - name: omni-stage-config
+            configMap:
+              name: ${TEST_NAME}-omni-stage-config
+        resourceClaims:
+          - name: intel-gpu-rdma-resource
+            resourceClaimTemplateName: ${XPU_RESOURCE_TEMPLATE}
+        mainContainer:
+          image: ${DOCKER_IMAGE_XPU}
+          workingDir: /workspace
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -x
+              xpu-smi discovery || true
+
+              # Stage 1 (DiT) on the pod's single B60. 1 card is enough to serve
+              # the DiT half of GLM-Image.
+              exec python -m dynamo.vllm.omni \
+                --model "$OMNI_MODEL" \
+                --stage-id 1 \
+                --stage-configs-path "$STAGE_CONFIG" \
+                --output-modalities image \
+                --media-output-fs-url file:///tmp/dynamo_media
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - "IPC_LOCK"
+                - "SYS_PTRACE"
+                - "SYS_ADMIN"
+                - "SYS_RAWIO"
+          env:
+            # Resolved from the local HF cache, same as the Ar pod -- see there.
+            # /software/data/pytorch is the same NFS export on the XPU and NVIDIA
+            # nodes (verified), so both stages resolve the same snapshot.
+            - name: OMNI_MODEL
+              value: "zai-org/GLM-Image"
+            - name: STAGE_CONFIG
+              value: "/etc/dynamo/omni/glm_image_nixl.yaml"
+            - name: VLLM_TARGET_DEVICE
+              value: "xpu"
+            # No DIFFUSION_ATTENTION_BACKEND override: the DiT runs omni's default
+            # FLASH_ATTN, and vllm_xpu_kernels 0.1.14.1 compiles the kernel it needs
+            # (head_dim 128, non-paged, non-causal). Without it, ~2.6x per image.
+            - name: DIT_TP
+              value: "1"
+            - name: DIT_GPUS
+              value: "0"
+            - name: DYN_OMNI_CFG_PARALLEL_SIZE
+              value: "1"
+            # AR_* are unused by stage 1 but must be present for OmegaConf.
+            - name: AR_TP
+              value: "1"
+            - name: AR_GPUS
+              value: "0"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: UCX_TLS
+              value: "ib,rc,ud,rc_verbs,ud_verbs,ze_copy"
+            - name: UCX_IB_ROCE_REACHABILITY_MODE
+              value: "all"
+            # RoCE GID 1 = the RoCE v2 GID of the link-local IPv6 (fe80) address,
+            # which every up interface has. Ar and Dit run on VFs, and a VF
+            # loses its IPv4 address after a test uses it (dranet moves it out
+            # and back, and nothing re-applies a hand-set address), leaving only
+            # GIDs 0/1. Same index on every NIXL worker here so both ends of
+            # each connection (Ar -> Dit, Dit -> Router) use fe80 GIDs.
+            - name: UCX_IB_GID_INDEX
+              value: "1"
+            - name: UCX_MEMTYPE_CACHE
+              value: "0"
+            # vLLM 0.30 reads telemetry on every completed transfer, so it must be on
+            # (the operator injects ENABLE=n) -- but with an empty EXPORTER: its
+            # prometheus is a plugin neither image builds, and loading it throws.
+            - name: NIXL_TELEMETRY_ENABLE
+              value: "y"
+            - name: NIXL_TELEMETRY_EXPORTER
+              value: ""
+            - name: PYTHONHASHSEED
+              value: "0"
+            # Downloads on: GLM-Image is not pre-staged on this cluster, so with
+            # "1" every stage failed with LocalEntryNotFoundError. "0" lets HF
+            # fetch it into HF_HOME on first use and reuse the cache afterwards.
+            # dynamo's repo-id -> snapshot rewrite (omni/args.py get_model_path)
+            # still runs: it calls snapshot_download either way.
+            - name: HF_HUB_OFFLINE
+              value: "0"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+          resources:
+            claims:
+              - name: intel-gpu-rdma-resource
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+            - name: omni-stage-config
+              mountPath: /etc/dynamo/omni
+              readOnly: true
+
+    # Omni router: discovers ar.generate + dit.generate, then registers the
+    # user-visible model at {ns}.backend.generate. Its own pod, per the header
+    # note on pod-scoped discovery. It blocks in wait_for_instances() until both
+    # stages are up, so the operator's StartupProbe budget bounds startup here.
+    #
+    # On ${NVIDIA_NODE} with the GPU image and the only claim on that node: it
+    # computes nothing, but vLLM's platform probe needs a visible accelerator,
+    # and both XPU cards are taken by Ar and Dit.
+    #
+    # No sharedMemory override and no /dev/shm: the router runs no mp executor.
+    Router:
+      componentType: worker
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "4"
+      extraPodSpec:
+        nodeSelector:
+          dynamo.intel.com/node: ${NVIDIA_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+          - name: omni-stage-config
+            configMap:
+              name: ${TEST_NAME}-omni-stage-config
+        resourceClaims:
+          - name: gpu-rdma-resource
+            resourceClaimTemplateName: ${NVIDIA_RESOURCE_TEMPLATE}
+        mainContainer:
+          image: ${DOCKER_IMAGE_GPU}
+          workingDir: /workspace
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -x
+              # Sole process in the pod, in the foreground: its log is plain
+              # `kubectl logs`, and its exit status is the container's, so a crash
+              # restarts the pod rather than leaving a stale registration.
+              exec python -m dynamo.vllm.omni \
+                --model "$OMNI_MODEL" \
+                --omni-router \
+                --stage-configs-path "$STAGE_CONFIG" \
+                --output-modalities image \
+                --media-output-fs-url file:///tmp/dynamo_media
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - "IPC_LOCK"
+                - "SYS_PTRACE"
+                - "SYS_ADMIN"
+                - "SYS_RAWIO"
+          env:
+            # Same cache-resolved hub id as the stages: the router builds the
+            # model card it registers, so served_model_name must match what the
+            # stages resolved or /v1/models would advertise a different id than
+            # the bench Job sends.
+            - name: OMNI_MODEL
+              value: "zai-org/GLM-Image"
+            - name: STAGE_CONFIG
+              value: "/etc/dynamo/omni/glm_image_nixl.yaml"
+            # Logical device 0 of this pod's own GPU claim. Needed for
+            # vLLM's platform probe, not for compute -- the probe reads the device
+            # itself, so no VLLM_TARGET_DEVICE is set here.
+            # OmegaConf resolves every oc.env in the stage config, including both
+            # stages', so all four of these must be present even though the
+            # router runs neither stage.
+            - name: AR_TP
+              value: "1"
+            - name: AR_GPUS
+              value: "0"
+            - name: DIT_TP
+              value: "1"
+            - name: DIT_GPUS
+              value: "0"
+            - name: DYN_OMNI_CFG_PARALLEL_SIZE
+              value: "1"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            # cuda_copy since the pod has a CUDA device, but
+            # dit_to_router pins receive_device: cpu, so the receive buffer stays
+            # in host memory and no device memory is registered with UCX.
+            - name: UCX_TLS
+              value: "ib,rc,ud,rc_verbs,ud_verbs,cuda_copy"
+            - name: UCX_IB_ROCE_REACHABILITY_MODE
+              value: "all"
+            # RoCE GID 1 = the RoCE v2 GID of the link-local IPv6 (fe80) address,
+            # which every up interface has. Ar and Dit run on VFs, and a VF
+            # loses its IPv4 address after a test uses it (dranet moves it out
+            # and back, and nothing re-applies a hand-set address), leaving only
+            # GIDs 0/1. Same index on every NIXL worker here so both ends of
+            # each connection (Ar -> Dit, Dit -> Router) use fe80 GIDs.
+            - name: UCX_IB_GID_INDEX
+              value: "1"
+            - name: UCX_MEMTYPE_CACHE
+              value: "0"
+            # vLLM 0.30 reads telemetry on every completed transfer, so it must be on
+            # (the operator injects ENABLE=n) -- but with an empty EXPORTER: its
+            # prometheus is a plugin neither image builds, and loading it throws.
+            - name: NIXL_TELEMETRY_ENABLE
+              value: "y"
+            - name: NIXL_TELEMETRY_EXPORTER
+              value: ""
+            - name: PYTHONHASHSEED
+              value: "0"
+            # Downloads on, as in Ar and Dit (see their HF_HUB_OFFLINE comment).
+            - name: HF_HUB_OFFLINE
+              value: "0"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
+            - name: VLLM_LOGGING_LEVEL
+              value: "INFO"
+          resources:
+            claims:
+              - name: gpu-rdma-resource
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+            - name: omni-stage-config
+              mountPath: /etc/dynamo/omni
+              readOnly: true
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${TEST_NAME}-bench
+  namespace: dynamo-system
+  labels:
+    kueue.x-k8s.io/queue-name: dynamo-queue
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ${TEST_NAME}-bench
+        app.kubernetes.io/part-of: omni-ar-dit-1node-xpu
+        kueue.x-k8s.io/queue-name: dynamo-queue
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${TEST_NAME}-k8s-service-discovery
+      nodeSelector:
+        dynamo.intel.com/node: ${NVIDIA_NODE}
+      imagePullSecrets:
+        - name: amr-caas-registry
+      volumes:
+        - name: pytorch-models
+          hostPath:
+            path: /software/data/pytorch
+            type: Directory
+        - name: weka-models
+          hostPath:
+            path: /mnt/weka
+            type: Directory
+      containers:
+        - name: benchmark-runner
+          image: ${DOCKER_IMAGE_GPU}
+          workingDir: /workspace
+          command:
+            - /bin/sh
+            - -c
+            - |
+              FRONTEND_HOST="${TEST_NAME}-frontend.dynamo-system.svc.cluster.local"
+
+              # Anything this Job wants in the run artifact goes in $ARTIFACT_DIR.
+              # save_artifacts prints each file into this pod's log between
+              # "@@ci-artifact-begin <name>" and "@@ci-artifact-end <name>" lines;
+              # the workflow's "Stage all logs for upload" step cuts them back out
+              # into bench/<name> in the artifact. The log is the only way out: the
+              # pod has exited before the workflow collects, and POD_LOG_DIR, the
+              # drop box this used to copy into, was never set or mounted.
+              # Called on every exit path via the trap below, and again right after
+              # the curl test so the transcript is already in the log if what
+              # follows is killed outright (a SIGKILL runs no trap); the workflow
+              # keeps the last copy.
+              ARTIFACT_DIR=/tmp/ci-artifacts
+              mkdir -p "$ARTIFACT_DIR"
+              save_artifacts() {
+                for f in "$ARTIFACT_DIR"/*; do
+                  [ -f "$f" ] || continue
+                  name=$(basename "$f")
+                  case "$name" in
+                    *.png)
+                      # Binary: base64 here, decoded by the workflow.
+                      echo "@@ci-artifact-begin-b64 $name"
+                      base64 "$f"
+                      ;;
+                    *)
+                      echo "@@ci-artifact-begin $name"
+                      cat "$f"
+                      # An end marker glued onto an unterminated last line is lost.
+                      if [ -n "$(tail -c1 "$f")" ]; then echo; fi
+                      ;;
+                  esac
+                  echo "@@ci-artifact-end $name"
+                done
+              }
+              trap save_artifacts EXIT
+
+              echo "========================================="
+              echo "Endpoint and FrontEnd Health Check"
+              echo "========================================="
+
+              # Three endpoints must appear: the two omni stage workers register at
+              # {ns}.ar.generate / {ns}.dit.generate, and the router registers the
+              # user-visible model at {ns}.backend.generate. Each needs its own
+              # pod to hold a registration (header note on pod-scoped discovery),
+              # so ar=0 with router=1 means the two share a pod.
+              # DYN_NAMESPACE is dynamo-system-${TEST_NAME}, so TEST_NAME matches.
+              #
+              # Matched with jq over .endpoints[] rather than grep: /health returns
+              # the whole payload on ONE line, so `grep -c` counts that single line
+              # and can only ever return 0 or 1, and a `${TEST_NAME}.*ar.generate`
+              # regex lets `.*` run across the entire document -- it can pair this
+              # run's namespace with some other tenant's endpoint. The namespace
+              # here also literally contains "ar-dit", so substring matching on
+              # "ar" is asking for a false positive. jq compares the component
+              # suffix exactly, per endpoint.
+              echo "Waiting for all omni endpoints (ar, dit, router) to be registered..."
+              timeout_sec=1800
+              poll_sec=30
+              max_attempts=$((timeout_sec / poll_sec))
+              workers_ready=false
+              for attempt in $(seq 1 "$max_attempts"); do
+                health_response=$(curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health?instances=true" 2>/dev/null || echo "")
+
+                # count_ep <component>: endpoints in THIS run's namespace whose
+                # component matches exactly. Endpoint strings look like
+                #   dyn://dynamo-system-<TEST_NAME>-<workerhash>.<component>.generate
+                # The operator appends a worker hash to the namespace (e.g.
+                # "...-2nodes-4d5a57b1"), which is not knowable here, so this
+                # matches on prefix + suffix rather than full equality: the prefix
+                # confines the match to this run, the suffix pins the component
+                # exactly (".ar.generate" cannot match ".dit.generate").
+                count_ep() {
+                  printf '%s' "$health_response" | jq -r --arg ns "dynamo-system-${TEST_NAME}" --arg c "$1" '
+                    [ .endpoints[]?
+                      | select(startswith("dyn://\($ns)") and endswith(".\($c).generate")) ] | length
+                  ' 2>/dev/null || echo 0
+                }
+
+                has_ar=$(count_ep ar)
+                has_dit=$(count_ep dit)
+                has_router=$(count_ep backend)
+                frontend_status=$(echo "$health_response" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+
+                if [ "$has_ar" -gt 0 ] && [ "$has_dit" -gt 0 ] && [ "$has_router" -gt 0 ] && [ "$frontend_status" = "healthy" ]; then
+                  echo "All omni endpoints registered (attempt ${attempt}/${max_attempts})"
+                  echo "$health_response" | jq -r --arg ns "dynamo-system-${TEST_NAME}" \
+                    '.endpoints[]? | select(startswith("dyn://\($ns)."))' 2>/dev/null || true
+                  workers_ready=true
+                  break
+                fi
+                echo "Attempt ${attempt}/${max_attempts}: ar=$has_ar dit=$has_dit router=$has_router frontend=$frontend_status"
+                sleep "$poll_sec"
+              done
+
+              if [ "$workers_ready" != "true" ]; then
+                echo "ERROR: timeout waiting for omni endpoints"
+                echo "Final status: ar=$has_ar, dit=$has_dit, router=$has_router, frontend_status=$frontend_status"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health?instances=true" || true
+                exit 1
+              fi
+
+              echo "========================================="
+              echo "Model Registration Check"
+              echo "========================================="
+
+              model_ready=false
+              timeout_sec=300
+              poll_sec=15
+              max_attempts=$((timeout_sec / poll_sec))
+              for attempt in $(seq 1 "$max_attempts"); do
+                if curl --noproxy '*' -sf "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models" 2>/dev/null | grep -Fq '"id":"'; then
+                  echo "Model registration check passed (attempt ${attempt}/${max_attempts})"
+                  model_ready=true
+                  break
+                fi
+                echo "Attempt ${attempt}/${max_attempts}: model not registered yet"
+                sleep "$poll_sec"
+              done
+
+              if [ "$model_ready" != "true" ]; then
+                echo "ERROR: timeout waiting for model registration"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models" || true
+                exit 1
+              fi
+
+              {
+                echo "========================================="
+                echo "Image Generation Smoke Test - $(date)"
+                echo "========================================="
+                echo ""
+                echo "--- /v1/models ---"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models"
+                echo ""
+              } 2>&1 | tee "$ARTIFACT_DIR/curl_test.log"
+
+              # response_format=b64_json returns the PNG inline. The default ("url")
+              # would hand back a file:// URL into the router pod's
+              # /tmp/dynamo_media, which this Job cannot read.
+              #
+              # Both the smoke test and the latency benchmark below send this one
+              # variable, so the logged prompt cannot drift from what was sent.
+              ENDPOINT="http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/images/generations"
+              REQUEST_BODY="{
+                \"model\": \"${SERVED_MODEL_NAME}\",
+                \"prompt\": \"${PROMPT}\",
+                \"size\": \"${IMAGE_SIZE}\",
+                \"response_format\": \"b64_json\"
+              }"
+              {
+                echo "endpoint: POST $ENDPOINT"
+                echo "request body:"
+                printf '%s\n' "$REQUEST_BODY"
+              } | tee "$ARTIFACT_DIR/input-prompt-curl-req.log"
+
+              gen_success=false
+              gen_max_attempts=6
+              gen_interval=20
+              for attempt in $(seq 1 "$gen_max_attempts"); do
+                echo "Image generation attempt ${attempt}/${gen_max_attempts}..."
+                response=$(curl --noproxy '*' -sS -X POST "$ENDPOINT" \
+                  -H 'Content-Type: application/json' \
+                  -d "$REQUEST_BODY" 2>&1)
+
+                if echo "$response" | jq -e '.data[0].b64_json' >/dev/null 2>&1; then
+                  echo "$response" | jq -r '.data[0].b64_json' | base64 -d > /tmp/omni_output.png
+                  # Validate it is a real PNG rather than an error body that happens
+                  # to decode: check the 8-byte PNG signature and a sane file size.
+                  magic=$(head -c 8 /tmp/omni_output.png | od -An -tx1 | tr -d ' \n')
+                  size=$(wc -c < /tmp/omni_output.png)
+                  echo "Decoded /tmp/omni_output.png: ${size} bytes, magic=${magic}"
+                  if [ "$magic" = "89504e470d0a1a0a" ] && [ "$size" -gt 1024 ]; then
+                    echo "PNG signature and size OK"
+                    gen_success=true
+                    break
+                  fi
+                  echo "Decoded payload is not a valid PNG; retrying in ${gen_interval}s..."
+                else
+                  echo "No b64_json in response:"
+                  echo "$response" | head -c 2000
+                  echo ""
+                  echo "Retrying in ${gen_interval}s..."
+                fi
+                sleep "$gen_interval"
+              done
+
+              if [ "$gen_success" != "true" ]; then
+                echo "ERROR: image generation failed after ${gen_max_attempts} attempts"
+                exit 1
+              fi
+
+              # The PNG joins the curl transcript in $ARTIFACT_DIR, and both go to
+              # the shared-NFS drop box now rather than at exit: the latency
+              # benchmark below runs for a while and can be killed outright.
+              if cp /tmp/omni_output.png "$ARTIFACT_DIR/generated_image.png"; then
+                echo "Staged generated_image.png for collection"
+              else
+                echo "WARNING: could not stage the PNG; it will not reach the artifact"
+              fi
+              save_artifacts
+
+              echo "========================================="
+              echo "Running AR/DiT Latency Benchmark"
+              echo "========================================="
+              echo "Configuration:"
+              echo "  FRONTEND_HOST: $FRONTEND_HOST"
+              echo "  MODEL:         ${SERVED_MODEL_NAME}"
+              echo "  IMAGE_SIZE:    ${IMAGE_SIZE}"
+              echo "  NUM_REQUESTS:  ${NUM_REQUESTS}"
+              echo ""
+
+              # vllm bench serve has no image-generation backend, so time
+              # sequential end-to-end requests instead. max_inflight is 1 in the
+              # stage config, so concurrency would only queue.
+              # The marker lines put this section in its own file in the run
+              # artifact, bench/bench_latency.log (see save_artifacts above).
+              echo "@@ci-artifact-begin bench_latency.log"
+              total_ms=0
+              ok=0
+              for i in $(seq 1 "$NUM_REQUESTS"); do
+                start_ns=$(date +%s%N)
+                body=$(curl --noproxy '*' -sS -X POST "$ENDPOINT" \
+                  -H 'Content-Type: application/json' \
+                  -d "$REQUEST_BODY" 2>&1)
+                end_ns=$(date +%s%N)
+                elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+                if echo "$body" | jq -e '.data[0].b64_json' >/dev/null 2>&1; then
+                  bytes=$(echo "$body" | jq -r '.data[0].b64_json' | base64 -d | wc -c)
+                  echo "request ${i}/${NUM_REQUESTS}: ${elapsed_ms} ms, ${bytes} bytes"
+                  total_ms=$((total_ms + elapsed_ms))
+                  ok=$((ok + 1))
+                else
+                  echo "request ${i}/${NUM_REQUESTS}: FAILED after ${elapsed_ms} ms"
+                  echo "$body" | head -c 500
+                fi
+              done
+
+              echo ""
+              echo "--- Results ---"
+              echo "successful: ${ok}/${NUM_REQUESTS}"
+              if [ "$ok" -gt 0 ]; then
+                echo "mean e2e latency: $((total_ms / ok)) ms"
+              fi
+              echo "@@ci-artifact-end bench_latency.log"
+
+              if [ "$ok" -ne "$NUM_REQUESTS" ]; then
+                echo "ERROR: ${NUM_REQUESTS} requested, only ${ok} succeeded"
+                exit 1
+              fi
+
+              echo ""
+              echo "========================================="
+              echo "Benchmark Complete"
+              echo "========================================="
+          env:
+            - name: FRONTEND_PORT
+              value: "8000"
+            # The API-facing model name, i.e. the worker pods' SERVED_MODEL_NAME
+            # -- NOT their OMNI_MODEL, which is what the workers load weights from and
+            # is not what /v1/... requests are keyed on. These must match or
+            # every request 404s on an unknown model.
+            - name: SERVED_MODEL_NAME
+              value: "zai-org/GLM-Image"
+            - name: PROMPT
+              value: "a red apple, a green apple and a yellow alphonso mango on a white table"
+            - name: IMAGE_SIZE
+              value: "1024x1024"
+            - name: NUM_REQUESTS
+              value: "5"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
