@@ -7,7 +7,7 @@ name: XPU-Heterogeneous-Run
 # REUSABLE XPU heterogeneous P/D pipeline.
 # ============================================================================
 # guard -> changed-files -> build-xpu / build-nvidia -> resolve-images ->
-# heterog-test (matrix, 7 legs, max-parallel 1) -> cleanup-images ->
+# heterog-test (matrix, 12 legs, max-parallel 1) -> cleanup-images ->
 # xpu-status-check (in the caller).
 #
 # Called by exactly three thin trigger workflows, one per merge phase:
@@ -1003,7 +1003,7 @@ jobs:
   # dependents: one failure in px-dn-hnd-tp2 re-ran px-dx and epd-3way-2node
   # although both had passed (run 40767899198).
   #
-  # Here the seven tests are the legs of ONE matrix job:
+  # Here the tests are the legs of ONE matrix job:
   #   max-parallel: 1   still one test at a time, so the reason for the chain
   #                     still holds: every P/D run takes the whole
   #                     intel.com/rdma Kueue quota, and two at once would only
@@ -1040,6 +1040,26 @@ jobs:
   #                       functional check, no "Successful requests:" line, so
   #                       expect_benchmark_result: false. GLM-Image comes from
   #                       OMNI_MODEL in the manifest.
+  #
+  # Legs from the XPU CI test plan (.ci/test/dynamo-heterog/XPU_CI_Test_Plan.md):
+  #   agg-x               INT-1. One aggregated XPU worker, the baseline. Claims
+  #                       onexpu-rdma-kueue; the NVIDIA template is claimed by
+  #                       nothing.
+  #   agg-router-2x       INT-11. Two aggregated replicas behind the KV router,
+  #                       one per B60, each on onexpu-rdma-vf-kueue.
+  #   px2-dn-router       INT-12. px-dn with 2 XPU prefill replicas (VF template)
+  #                       and the KV router; decode keeps onenvidia-rdma-kueue.
+  #   px-dn-8b            INT-6. px-dn on Qwen/Qwen3-8B; the model is the
+  #                       manifest's own default, so pipeline_model: false.
+  #   ex-pdx              EXT-15. XPU encode + XPU prefill-decode on one host,
+  #                       Qwen/Qwen3-VL-2B-Instruct; both on the VF template.
+  #
+  # EXT-19 (omni_ar-dit_1node_xpu.yaml, GLM-Image AR + DiT both on XPU) is NOT a
+  # leg: in run 41087132745 the AR stage's weights took 18.88 GiB of the B60's
+  # budget and left -2.68 GiB for KV cache ("No available memory for the cache
+  # blocks"). The AR stage does not fit one 24 GB B60 at bf16, and AR at TP=2
+  # would need a third card on the XPU node. The manifest is kept for a node
+  # with more cards.
   # SR-IOV VFs: px-dx, epd-3way-2node and omni put two NIXL workers on ONE node,
   # and one cabled port can go to one pod only, so the crowded node's workers
   # claim VF templates. epd-3way-2node and omni claim 3 RDMA devices, so Kueue's
@@ -1111,6 +1131,41 @@ jobs:
             nvidia_resource_template: onenvidia-rdma-vf-kueue
             pipeline_model: false
             expect_benchmark_result: false
+          - test_name: agg-x
+            title: "XPU: Aggregated baseline (one card)"
+            test_yaml: agg-x.yaml
+            xpu_resource_template: onexpu-rdma-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: true
+            expect_benchmark_result: true
+          - test_name: agg-router-2x
+            title: "XPU: Aggregated x2 + KV Router (one node)"
+            test_yaml: agg-router-2x.yaml
+            xpu_resource_template: onexpu-rdma-vf-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: true
+            expect_benchmark_result: true
+          - test_name: px2-dn-router
+            title: "Heterog: 2x XPU Prefill + NVIDIA Decode + KV Router"
+            test_yaml: px2-dn-router.yaml
+            xpu_resource_template: onexpu-rdma-vf-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: true
+            expect_benchmark_result: true
+          - test_name: px-dn-8b
+            title: "Heterog: XPU Prefill + NVIDIA Decode (Qwen3-8B)"
+            test_yaml: px-dn-8b.yaml
+            xpu_resource_template: onexpu-rdma-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: false
+            expect_benchmark_result: true
+          - test_name: ex-pdx
+            title: "XPU: Encode + Prefill-Decode (one node)"
+            test_yaml: ex-pdx.yaml
+            xpu_resource_template: onexpu-rdma-vf-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: false
+            expect_benchmark_result: true
     uses: ./.github/workflows/epd-test-template.yml
     secrets: inherit
     with:

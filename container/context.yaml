@@ -97,8 +97,12 @@ vllm:
     base_image: nvcr.io/nvidia/cuda-dl-base
     runtime_image: vllm/vllm-openai
     base_image_tag: 25.11-cuda13.0-devel-ubuntu24.04
-    runtime_image_tag: v0.32.0-ubuntu2404
-    vllm_omni_ref: "v0.32.0rc1"
+    runtime_image_tag: v0.33.0
+    # Unreleased vllm-omni#9648 head for vLLM 0.33; replace with the Omni release.
+    vllm_omni_ref: "0.33.0.dev0+gfe886bbb379396a2947c99ae041f7c35006c1900"
+    # Omni caps Transformers below 5.20; the vLLM 0.33 image ships 5.20.2.
+    transformers_version: "5.19.0"
+    tokenizers_version: "0.23.3"
     # Baseline is vllm-openai's TRUE base, nvidia/cuda:13.0.2-base-ubuntu24.04
     # (Docker Hub), NOT a self-baseline of the third-party vllm/vllm-openai image.
     # vllm-openai is built FROM nvidia/cuda, so this attributes everything vLLM
@@ -110,11 +114,15 @@ vllm:
   xpu:
     base_image: vllm/vllm-openai-xpu
     runtime_image: vllm/vllm-openai-xpu
-    base_image_tag: v0.32.0
-    runtime_image_tag: v0.32.0
-    baseline_sbom: vllm-openai-xpu@20509fab
+    base_image_tag: v0.33.0
+    runtime_image_tag: v0.33.0
+    baseline_sbom: vllm-openai-xpu@be3a9aea
+    # vLLM 0.33's NIXL connector requires NIXL >= 1.5.0 (check_nixl_version).
     nixl_ref: v1.5.0
     nixl_ucx_ref: v1.23.0-rc1
+    # Unreleased vllm-omni#9648 head for vLLM 0.33, as upstream's CUDA image
+    # uses (PR #17862); replace with the Omni release.
+    vllm_omni_ref: "0.33.0.dev0+gfe886bbb379396a2947c99ae041f7c35006c1900"
   cpu:
     base_image: ubuntu
     runtime_image: vllm/vllm-openai-cpu
