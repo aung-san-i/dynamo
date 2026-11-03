@@ -124,8 +124,9 @@ vllm:
     # vLLM 0.33's NIXL connector requires NIXL >= 1.5.0 (check_nixl_version).
     nixl_ref: v1.5.0
     nixl_ucx_ref: v1.23.0-rc1
-    # No Omni release targets vLLM 0.33 yet (vllm-omni#9648 is a draft).
-    vllm_omni_ref: "v0.32.0"
+    # Unreleased vllm-omni#9648 head for vLLM 0.33, as upstream's CUDA image
+    # uses (PR #17862); replace with the Omni release.
+    vllm_omni_ref: "0.33.0.dev0+gfe886bbb379396a2947c99ae041f7c35006c1900"
   cpu:
     base_image: ubuntu
     runtime_image: vllm/vllm-openai-cpu
