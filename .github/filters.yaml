@@ -125,6 +125,13 @@ ignore:
   - 'deploy/utils/tests/**'
   # The path-triggered protocol tooling workflow owns these CPU tooling tests.
   - 'scripts/protocol_compatibility/**'
+  # Heterog DeviceClass / ResourceClaimTemplate manifests. Applied to the
+  # cluster by hand with kubectl; no CI job reads these files, so editing one
+  # changes nothing a run tests. The test manifests that name them are in `vllm`.
+  - '.ci/test/dynamo-heterog/k8s/templates/**'
+  # Fork-only registry retention workflow. Excluded from `ci` (and so from
+  # every filter that reuses it); listed here so the coverage check passes.
+  - '.github/workflows/xpu-image-retention.yaml'
   - 'dev/*'
   - '.github/scripts/**'
   - '.github/ISSUE_TEMPLATE/**'
@@ -172,6 +179,10 @@ ci: &ci
   - '.github/scripts/pytest-local.sh'
   - '.github/scripts/route_buildkit.sh'
   - 'container/Dockerfile.test'
+  # Fork-only registry retention: deletes old XPU CI images from Harbor and
+  # builds or tests nothing, so a change to it alone must not start the XPU
+  # pipeline.
+  - '!.github/workflows/xpu-image-retention.yaml'
 
 core:
   - *ci
@@ -222,6 +233,10 @@ core:
   - '!**/*.md'
   - '!**/*.rst'
   - '!**/*.txt'
+  # Fork-only monitors: they read GitHub and test nothing, so a change to
+  # them alone must not start the XPU pipeline.
+  - '!.github/workflows/upstream-xpu-monitor.yaml'
+  - '!.github/workflows/xpu-base-image-watch.yaml'
 
 # dev/local-dev image templates. These are NOT in `core`: dev.Dockerfile is `FROM
 # runtime` and local_dev.Dockerfile is `FROM dev`, so neither can change a runtime
@@ -423,6 +438,8 @@ vllm:
   - 'components/src/dynamo/artifacts/vllm/**'
   - 'container/templates/vllm_*'
   - 'container/templates/ffmpeg_encoder_guard.Dockerfile'
+  # Heterogeneous EPD/P-D test manifests are consumed by PR-XPU and manual EPD workflows.
+  - '.ci/test/dynamo-heterog/k8s/tests/**'
   - '!**/*.md'
   - '!**/*.rst'
 
