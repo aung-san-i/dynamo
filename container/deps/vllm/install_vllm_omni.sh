@@ -66,3 +66,27 @@ else
     "${OVERRIDE_ARGS[@]}" \
     "vllm-omni==${VLLM_OMNI_VERSION}"
 fi
+
+# vLLM-Omni 0.33 registers its experimental Physis pipelines (vllm-omni#9154) eagerly,
+# so every Omni process imports PyAV, which the CUDA image removes under the codec
+# policy, and Qwen3-TTS fails requests when stage 0 uses FlashInfer. Remove those
+# registrations; remove this once vLLM-Omni loads them lazily.
+if [ "${VLLM_OMNI_TARGET_DEVICE}" = "cuda" ]; then
+  python3 - <<'PY'
+import importlib.util
+import py_compile
+from pathlib import Path
+
+pkg = Path(importlib.util.find_spec("vllm_omni").submodule_search_locations[0])
+path = pkg / "config" / "pipeline_registry.py"
+lines = path.read_text().splitlines(keepends=True)
+physis = [line for line in lines if "physis" in line.lower()]
+if len(physis) != 6:
+    raise SystemExit(f"{path}: expected 6 Physis lines, found {len(physis)}; update or remove this patch")
+kept = "".join(line for line in lines if "physis" not in line.lower())
+path.write_text("# Modified by NVIDIA Dynamo: experimental Physis pipelines removed.\n" + kept)
+py_compile.compile(str(path), doraise=True)
+PY
+  # The image purges PyAV in a later step; check Omni's pipeline registry loads without it.
+  python3 -c "import sys; sys.modules['av'] = None; import vllm_omni.config.pipeline_registry"
+fi
