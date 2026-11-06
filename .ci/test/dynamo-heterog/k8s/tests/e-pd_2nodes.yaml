@@ -44,6 +44,10 @@ spec:
         mainContainer:
           image: ${DOCKER_IMAGE_GPU}
           env:
+            # The frontend fetches remote images itself (MM-aware routing) via the
+            # proxy, whose 10.x address its SSRF filter rejects unless this is set.
+            - name: DYN_MM_ALLOW_INTERNAL
+              value: "1"
             - name: DYN_STORE_KV
               value: "mem"
             - name: DYN_REQUEST_PLANE
