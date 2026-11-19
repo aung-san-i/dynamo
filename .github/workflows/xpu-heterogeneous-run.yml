@@ -7,8 +7,14 @@ name: XPU-Heterogeneous-Run
 # REUSABLE XPU heterogeneous P/D pipeline.
 # ============================================================================
 # guard -> changed-files -> build-xpu / build-nvidia -> resolve-images ->
-# heterog-test (matrix, 7 legs, max-parallel 1) -> cleanup-images ->
-# xpu-status-check (in the caller).
+# heterog-test (vLLM matrix, 7 legs, max-parallel 1) -> sglang-smoke (matrix:
+# xpu, nvidia) -> sglang-heterog-test (SGLang matrix, 10 legs, max-parallel 1)
+# -> cleanup-images -> xpu-status-check (in the caller).
+#
+# The SGLang half has its own images, built by build-xpu-sglang and
+# build-nvidia-sglang in parallel with the vLLM builds, and is gated on
+# core || sglang. Its two matrices wait for the vLLM matrix (and the second
+# for the first) only so that no two of them hold the hardware at once.
 #
 # Called by exactly three thin trigger workflows, one per merge phase:
 #
@@ -344,7 +350,10 @@ jobs:
       # condition is visible at the call site instead of buried here.
       core: ${{ inputs.force_all_tests && 'true' || steps.changes.outputs.core }}
       vllm: ${{ inputs.force_all_tests && 'true' || steps.changes.outputs.vllm }}
-      sglang: ${{ steps.changes.outputs.sglang }}
+      # Forced on with the others: the "Check for changes" step is skipped
+      # under force_all_tests, so without the override this read as empty and
+      # the SGLang jobs never ran on a slash command, post-merge or nightly.
+      sglang: ${{ inputs.force_all_tests && 'true' || steps.changes.outputs.sglang }}
       docker_image_gpu: ${{ steps.shared-images.outputs.docker_image_gpu }}
       # Immutable form of docker_image_gpu (repo:YYYYMMDD-sha) plus its digest,
       # recorded for provenance. Empty if :latest could not be resolved.
@@ -909,6 +918,300 @@ jobs:
           retention-days: 7
 
   # ============================================================================
+  # BUILD SGLANG IMAGES (XPU + NVIDIA)
+  # ============================================================================
+  # The SGLang smoke and heterog tests need an SGLang image on both sides of the
+  # P/D split, so both are always built when SGLang is in scope -- there is no
+  # pinned nvcr.io SGLang nightly to fall back to, unlike the vLLM GPU side.
+  # Each job is build-xpu / build-nvidia with FRAMEWORK=sglang; see those jobs
+  # for the reasoning behind every step. Differences:
+  #   * no Dockerfile.test image (nothing here consumes it);
+  #   * the image record is named image-record-sglang-<device>-..., so it cannot
+  #     collide with the vLLM record of the same device in the same run (an
+  #     artifact name is usable once per run). xpu-image-retention.yaml lists
+  #     every image-record-* artifact, so it still finds and expires these.
+  # The rendered Dockerfile comes from container/templates/sglang_* via
+  # container/context.yaml's sglang.xpu / sglang.cuda13.0 entries.
+
+  build-xpu-sglang:
+    needs: [guard, changed-files]
+    if: >-
+      needs.changed-files.outputs.core == 'true' ||
+      needs.changed-files.outputs.sglang == 'true'
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      image: ${{ steps.push.outputs.registry_image_tag }}
+    env:
+      FRAMEWORK: sglang
+      TARGET: runtime
+      DEVICE: xpu
+      PLATFORM: linux/amd64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
+        with:
+          ref: ${{ needs.changed-files.outputs.checkout_ref }}
+
+      - name: Generate Dockerfile
+        id: render
+        shell: bash
+        run: |
+          echo "::group::Generating SGLang XPU Dockerfile"
+          python3 ./container/render.py \
+              --target=${{ env.TARGET }} \
+              --framework=${{ env.FRAMEWORK }} \
+              --device=${{ env.DEVICE }} \
+              --platform=${{ env.PLATFORM }} \
+              --show-result
+          echo "::endgroup::"
+
+          ARCH="${PLATFORM##*/}"
+          RENDERED="container/${FRAMEWORK}-${TARGET}-${DEVICE}-${ARCH}-rendered.Dockerfile"
+          if [[ ! -f "${RENDERED}" ]]; then
+            echo "::error::Expected rendered Dockerfile not found at ${RENDERED}"
+            ls -la container/*rendered.Dockerfile || true
+            exit 1
+          fi
+          echo "rendered=${RENDERED}" >> "$GITHUB_OUTPUT"
+          echo "Rendered: ${RENDERED}"
+
+      - name: Build SGLang XPU image
+        id: build
+        shell: bash
+        run: |
+          set -x
+          IMAGE_NAME="dynamo-${{ env.FRAMEWORK }}-${{ env.TARGET }}-${{ env.DEVICE }}"
+          SHORT_SHA="$(git rev-parse HEAD | cut -c1-7)"
+          IMAGE_TAG="${IMAGE_NAME}:${{ github.run_id }}-${SHORT_SHA}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+          # Explicit although `shell: bash` already runs with -eo pipefail: a
+          # failed build must fail here, not later on the push of a missing tag.
+          set -o pipefail
+          docker build \
+            --progress=plain \
+            --tag "${IMAGE_TAG}" \
+            -f "${{ steps.render.outputs.rendered }}" \
+            . 2>&1 | tee build-xpu-sglang.log
+
+          echo "### 🐳 SGLang XPU Image Built" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image Tag | \`${IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Framework | ${{ env.FRAMEWORK }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Device | ${{ env.DEVICE }} |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push SGLang XPU image to registry
+        id: push
+        shell: bash
+        run: |
+          set -x
+          REGISTRY="sc09super01-srv.intel.com/dynamo"
+          IMAGE_TAG="${{ steps.build.outputs.image_tag }}"
+          REGISTRY_IMAGE_TAG="${REGISTRY}/${IMAGE_TAG}"
+          docker tag "${IMAGE_TAG}" "${REGISTRY_IMAGE_TAG}"
+          docker push "${REGISTRY_IMAGE_TAG}"
+          echo "registry_image_tag=${REGISTRY_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "| Registry Image | \`${REGISTRY_IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record pushed image
+        id: record
+        shell: bash
+        env:
+          IMAGE: ${{ steps.push.outputs.registry_image_tag }}
+          PR_NUMBER: ${{ needs.guard.outputs.pr_number }}
+          PHASE: ${{ inputs.phase }}
+        run: |
+          set -euo pipefail
+          digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE}" \
+            | grep -m1 "^${IMAGE%:*}@" | cut -d@ -f2 || true)
+          name="image-record-${FRAMEWORK}-${DEVICE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          jq -n \
+            --arg image "${IMAGE}" --arg digest "${digest}" --arg device "${DEVICE}" \
+            --arg pushed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg pr_number "${PR_NUMBER}" --arg phase "${PHASE}" \
+            --arg repository "${GITHUB_REPOSITORY}" --arg sha "$(git rev-parse HEAD)" \
+            --arg run_id "${GITHUB_RUN_ID}" --arg run_number "${GITHUB_RUN_NUMBER}" \
+            --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '$ARGS.named' > image-record.json
+          cat image-record.json
+          echo "artifact_name=${name}" >> "$GITHUB_OUTPUT"
+          echo "| Image Record | artifact \`${name}\` (registry copy deleted after 14 days) |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.record.outputs.artifact_name }}
+          path: image-record.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Clean up local images
+        if: always()
+        shell: bash
+        run: |
+          IMAGE_TAG="${{ steps.build.outputs.image_tag }}"
+          REGISTRY_IMAGE_TAG="${{ steps.push.outputs.registry_image_tag }}"
+          REFS=()
+          [[ -n "${IMAGE_TAG}" ]]          && REFS+=("${IMAGE_TAG}")
+          [[ -n "${REGISTRY_IMAGE_TAG}" ]] && REFS+=("${REGISTRY_IMAGE_TAG}")
+          for ref in ${REFS+"${REFS[@]}"}; do
+            echo "Removing ${ref}"
+            docker rmi "${ref}" || true
+          done
+          docker image prune --force || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpu-sglang-build-log
+          path: |
+            build-xpu-sglang.log
+            container/*rendered.Dockerfile
+          retention-days: 7
+
+  build-nvidia-sglang:
+    needs: [guard, changed-files]
+    if: >-
+      needs.changed-files.outputs.core == 'true' ||
+      needs.changed-files.outputs.sglang == 'true'
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      image: ${{ steps.push.outputs.registry_image_tag }}
+    env:
+      FRAMEWORK: sglang
+      TARGET: runtime
+      DEVICE: cuda
+      CUDA_VERSION: "13.0"
+      PLATFORM: linux/amd64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
+        with:
+          ref: ${{ needs.changed-files.outputs.checkout_ref }}
+
+      - name: Generate Dockerfile
+        id: render
+        shell: bash
+        run: |
+          echo "::group::Generating SGLang NVIDIA (cuda) Dockerfile"
+          python3 ./container/render.py \
+              --target=${{ env.TARGET }} \
+              --framework=${{ env.FRAMEWORK }} \
+              --device=${{ env.DEVICE }} \
+              --cuda-version=${{ env.CUDA_VERSION }} \
+              --platform=${{ env.PLATFORM }} \
+              --show-result
+          echo "::endgroup::"
+
+          ARCH="${PLATFORM##*/}"
+          RENDERED="container/${FRAMEWORK}-${TARGET}-${DEVICE}${CUDA_VERSION}-${ARCH}-rendered.Dockerfile"
+          if [[ ! -f "${RENDERED}" ]]; then
+            echo "::error::Expected rendered Dockerfile not found at ${RENDERED}"
+            ls -la container/*rendered.Dockerfile || true
+            exit 1
+          fi
+          echo "rendered=${RENDERED}" >> "$GITHUB_OUTPUT"
+          echo "Rendered: ${RENDERED}"
+
+      - name: Build SGLang NVIDIA image
+        id: build
+        shell: bash
+        run: |
+          set -x
+          IMAGE_NAME="dynamo-${{ env.FRAMEWORK }}-${{ env.TARGET }}-${{ env.DEVICE }}"
+          SHORT_SHA="$(git rev-parse HEAD | cut -c1-7)"
+          IMAGE_TAG="${IMAGE_NAME}:${{ github.run_id }}-${SHORT_SHA}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+          set -o pipefail
+          docker build \
+            --progress=plain \
+            --tag "${IMAGE_TAG}" \
+            -f "${{ steps.render.outputs.rendered }}" \
+            . 2>&1 | tee build-nvidia-sglang.log
+
+          echo "### 🐳 SGLang NVIDIA Image Built" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image Tag | \`${IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Framework | ${{ env.FRAMEWORK }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Device | ${{ env.DEVICE }} ${{ env.CUDA_VERSION }} |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push SGLang NVIDIA image to registry
+        id: push
+        shell: bash
+        run: |
+          set -x
+          REGISTRY="sc09super01-srv.intel.com/dynamo"
+          IMAGE_TAG="${{ steps.build.outputs.image_tag }}"
+          REGISTRY_IMAGE_TAG="${REGISTRY}/${IMAGE_TAG}"
+          docker tag "${IMAGE_TAG}" "${REGISTRY_IMAGE_TAG}"
+          docker push "${REGISTRY_IMAGE_TAG}"
+          echo "registry_image_tag=${REGISTRY_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "| Registry Image | \`${REGISTRY_IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record pushed image
+        id: record
+        shell: bash
+        env:
+          IMAGE: ${{ steps.push.outputs.registry_image_tag }}
+          PR_NUMBER: ${{ needs.guard.outputs.pr_number }}
+          PHASE: ${{ inputs.phase }}
+        run: |
+          set -euo pipefail
+          digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE}" \
+            | grep -m1 "^${IMAGE%:*}@" | cut -d@ -f2 || true)
+          name="image-record-${FRAMEWORK}-${DEVICE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          jq -n \
+            --arg image "${IMAGE}" --arg digest "${digest}" --arg device "${DEVICE}" \
+            --arg pushed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg pr_number "${PR_NUMBER}" --arg phase "${PHASE}" \
+            --arg repository "${GITHUB_REPOSITORY}" --arg sha "$(git rev-parse HEAD)" \
+            --arg run_id "${GITHUB_RUN_ID}" --arg run_number "${GITHUB_RUN_NUMBER}" \
+            --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '$ARGS.named' > image-record.json
+          cat image-record.json
+          echo "artifact_name=${name}" >> "$GITHUB_OUTPUT"
+          echo "| Image Record | artifact \`${name}\` (registry copy deleted after 14 days) |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.record.outputs.artifact_name }}
+          path: image-record.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Clean up local images
+        if: always()
+        shell: bash
+        run: |
+          IMAGE_TAG="${{ steps.build.outputs.image_tag }}"
+          REGISTRY_IMAGE_TAG="${{ steps.push.outputs.registry_image_tag }}"
+          REFS=()
+          [[ -n "${IMAGE_TAG}" ]]          && REFS+=("${IMAGE_TAG}")
+          [[ -n "${REGISTRY_IMAGE_TAG}" ]] && REFS+=("${REGISTRY_IMAGE_TAG}")
+          for ref in ${REFS+"${REFS[@]}"}; do
+            echo "Removing ${ref}"
+            docker rmi "${ref}" || true
+          done
+          docker image prune --force || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvidia-sglang-build-log
+          path: |
+            build-nvidia-sglang.log
+            container/*rendered.Dockerfile
+          retention-days: 7
+
+  # ============================================================================
   # RESOLVE GPU IMAGE
   # ============================================================================
   # Picks the built image over the pinned one and records what was actually used.
@@ -1129,6 +1432,221 @@ jobs:
       expect_benchmark_result: ${{ matrix.expect_benchmark_result }}
 
   # ============================================================================
+  # SGLANG SMOKE TESTS -- one pod per check, XPU then NVIDIA
+  # ============================================================================
+  # Before the multi-pod SGLang tests, each freshly built SGLang image is run
+  # alone in one pod, twice (.ci/test/dynamo-smoke/sglang/run-smoke.sh):
+  #   engine  sglang.launch_server                      -- the engine itself
+  #   dynamo  NATS + etcd + dynamo.sglang + frontend    -- Dynamo on top of it
+  # Each must answer /health, list a model and return 200 for one chat
+  # completion. A smoke failure does not stop sglang-heterog-test: both report,
+  # so one run shows whether the image or the P/D wiring is at fault.
+  #
+  # needs heterog-test: not for its result (!cancelled() lets this run after a
+  # failed or skipped vLLM matrix), only so the smoke pods never compete with
+  # a running vLLM P/D test for the cards. max-parallel 1 for the same reason.
+  sglang-smoke:
+    name: "SGLang smoke: ${{ matrix.device }}"
+    needs: [changed-files, build-xpu-sglang, build-nvidia-sglang, heterog-test]
+    if: >-
+      !cancelled() &&
+      needs.build-xpu-sglang.result == 'success' &&
+      needs.build-nvidia-sglang.result == 'success' &&
+      (needs.changed-files.outputs.core == 'true' ||
+      needs.changed-files.outputs.sglang == 'true')
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - device: xpu
+            resource_template: onexpu-rdma-kueue
+            node: xpu_node
+          - device: nvidia
+            resource_template: onenvidia-rdma-kueue
+            node: nvidia_node
+    env:
+      NS: dynamo-system
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
+        with:
+          ref: ${{ needs.changed-files.outputs.checkout_ref }}
+
+      - name: Run SGLang smoke tests
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.device == 'xpu' && needs.build-xpu-sglang.outputs.image || needs.build-nvidia-sglang.outputs.image }}
+          DEVICE: ${{ matrix.device }}
+          TEMPLATE: ${{ matrix.resource_template }}
+          NODE_LABEL: ${{ matrix.node }}
+        run: |
+          bash .ci/test/dynamo-smoke/sglang/run-smoke.sh \
+            "$DEVICE" "$IMAGE" "$TEMPLATE" "$NODE_LABEL" "$RUNNER_TEMP/sglang-smoke-$DEVICE"
+
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sglang-smoke-${{ matrix.device }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sglang-smoke-${{ matrix.device }}/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ============================================================================
+  # SGLANG HETEROGENEOUS TESTS -- one matrix job, one test at a time
+  # ============================================================================
+  # The SGLang counterparts of the vLLM legs above, ported from
+  # intel-sandbox/scalable-deploy-intel .ci/test/dynamo-heterog/k8s/tests/sglang/
+  # (run 43949725318 is the reference run there). Same template, same rules as
+  # heterog-test: every leg sets every matrix field, max-parallel 1 (each P/D
+  # run takes the whole intel.com/rdma Kueue quota), fail-fast false.
+  #
+  # Manifests live in tests/sglang/ and run dynamo.sglang on the SGLang images
+  # built above; the bench Jobs run sglang.bench_serving, which prints the same
+  # "Successful requests:" line the template validates.
+  #
+  # needs sglang-smoke: ordering only, as for sglang-smoke on heterog-test.
+  # "Re-run failed jobs" on a failed vLLM leg therefore re-runs these too.
+  #
+  # Per-test notes:
+  #   px-dn / pn-dx / px-dx  Qwen3-0.6B TP=1 shape: pipeline_model true, as for
+  #                       the vLLM legs of the same name.
+  #   px-dx, px-dx-mooncake  two KV workers on ONE XPU node: VF template, as
+  #                       for the vLLM px-dx.
+  #   px-dn-tp2           gpt-oss-20b, prefill TP=2 on twoxpu-rdma-kueue,
+  #                       decode TP=1 (the sglang counterpart of px-dn-hnd-tp2;
+  #                       sglang has no KV-layout knob, so no "hnd").
+  #   e-pd-2nodes, epd-3way-2node  multimodal Qwen3-VL-32B-Instruct-FP8; the
+  #                       3-way puts Prefill and Dec on one NVIDIA node, so VF.
+  #   px-dx-mooncake      KV over sglang's Mooncake transfer engine instead of
+  #                       NIXL; its post-run check proves both workers loaded
+  #                       Mooncake and no transfer failed.
+  #   lmcache-agg         aggregated worker + LMCache MP server sidecar; the
+  #                       post-run check flushes the device cache, replays a
+  #                       request and requires the prefix back from LMCache.
+  #   mooncake-store-agg  aggregated worker with HiCache over Mooncake Store;
+  #                       same flush-and-replay post-run check.
+  #   omni-agg            GLM-Image AR + DiT on one XPU card, functional check.
+  #                       Keep its test_name at 19 chars or fewer (oneCCL
+  #                       hostname limit; see the manifest header).
+  # lmcache-agg, mooncake-store-agg and px-dx-mooncake need LMCache / Mooncake
+  # in the SGLang images; see the PR description for their image status.
+  sglang-heterog-test:
+    name: ${{ matrix.title }}
+    needs: [changed-files, build-xpu-sglang, build-nvidia-sglang, sglang-smoke]
+    if: >-
+      !cancelled() &&
+      needs.build-xpu-sglang.result == 'success' &&
+      needs.build-nvidia-sglang.result == 'success' &&
+      (needs.changed-files.outputs.core == 'true' ||
+      needs.changed-files.outputs.sglang == 'true')
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - test_name: sglang-px-dn
+            title: "SGLang Heterog: XPU Prefill + NVIDIA Decode"
+            test_yaml: px-dn.yaml
+            xpu_resource_template: onexpu-rdma-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: true
+            expect_benchmark_result: true
+            post_run_server_log_check: false
+          - test_name: sglang-pn-dx
+            title: "SGLang Heterog: NVIDIA Prefill + XPU Decode"
+            test_yaml: pn-dx.yaml
+            xpu_resource_template: onexpu-rdma-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: true
+            expect_benchmark_result: true
+            post_run_server_log_check: false
+          - test_name: sglang-px-dx
+            title: "SGLang Heterog: XPU Prefill + XPU Decode (one node)"
+            test_yaml: px-dx.yaml
+            xpu_resource_template: onexpu-rdma-vf-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: true
+            expect_benchmark_result: true
+            post_run_server_log_check: false
+          - test_name: sglang-px-dn-tp2
+            title: "SGLang Heterog: XPU Prefill TP2 + NVIDIA Decode"
+            test_yaml: px-dn-tp2.yaml
+            xpu_resource_template: twoxpu-rdma-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: false
+            expect_benchmark_result: true
+            post_run_server_log_check: false
+          - test_name: sglang-e-pd-2nodes
+            title: "SGLang Heterog: XPU Encode + NVIDIA Prefill-Decode"
+            test_yaml: e-pd_2nodes.yaml
+            xpu_resource_template: onexpu-rdma-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: false
+            expect_benchmark_result: true
+            post_run_server_log_check: false
+          - test_name: sglang-epd-3way-2node
+            title: "SGLang Heterog: XPU Encode + NVIDIA Prefill + NVIDIA Decode"
+            test_yaml: epd_3way_2node.yaml
+            xpu_resource_template: onexpu-rdma-kueue
+            nvidia_resource_template: onenvidia-rdma-vf-kueue
+            pipeline_model: false
+            expect_benchmark_result: true
+            post_run_server_log_check: false
+          - test_name: sglang-px-dx-mooncake
+            title: "SGLang Heterog: XPU Prefill + XPU Decode over Mooncake"
+            test_yaml: px-dx-mooncake.yaml
+            xpu_resource_template: onexpu-rdma-vf-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: false
+            expect_benchmark_result: true
+            post_run_server_log_check: true
+          - test_name: sglang-lmcache-agg
+            title: "SGLang XPU: LMCache aggregated"
+            test_yaml: lmcache_agg.yaml
+            xpu_resource_template: onexpu-rdma-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: false
+            expect_benchmark_result: false
+            post_run_server_log_check: true
+          - test_name: sglang-mooncake-store-agg
+            title: "SGLang XPU: Mooncake Store aggregated"
+            test_yaml: mooncake_store_agg.yaml
+            xpu_resource_template: onexpu-rdma-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: false
+            expect_benchmark_result: false
+            post_run_server_log_check: true
+          - test_name: sglang-omni-agg
+            title: "SGLang Omni: AR + DiT aggregated on XPU (GLM-Image)"
+            test_yaml: omni_ar-dit_agg.yaml
+            xpu_resource_template: onexpu-rdma-kueue
+            nvidia_resource_template: onenvidia-rdma-kueue
+            pipeline_model: false
+            expect_benchmark_result: false
+            post_run_server_log_check: false
+    uses: ./.github/workflows/epd-test-template.yml
+    secrets: inherit
+    with:
+      test_name: ${{ matrix.test_name }}
+      test_yaml_path: ".ci/test/dynamo-heterog/k8s/tests/sglang/${{ matrix.test_yaml }}"
+      runner: ${{ inputs.runner }}
+      CHECKOUT_COMMIT: ${{ needs.changed-files.outputs.checkout_ref }}
+      docker_image_xpu: ${{ needs.build-xpu-sglang.outputs.image }}
+      docker_image_gpu: ${{ needs.build-nvidia-sglang.outputs.image }}
+      xpu_resource_template: ${{ matrix.xpu_resource_template }}
+      nvidia_resource_template: ${{ matrix.nvidia_resource_template }}
+      xpu_node: "xpu_node"
+      nvidia_node: "nvidia_node"
+      model: ${{ matrix.pipeline_model && inputs.model || '' }}
+      tensor_parallel: ${{ matrix.pipeline_model && inputs.tensor_parallel || '' }}
+      expect_benchmark_result: ${{ matrix.expect_benchmark_result }}
+      post_run_server_log_check: ${{ matrix.post_run_server_log_check }}
+
+  # ============================================================================
   # IMAGE CLEANUP – worker nodes
   # ============================================================================
   # The build jobs already drop their tags from the runner's own docker daemon
@@ -1160,20 +1678,30 @@ jobs:
 
   cleanup-images:
     name: Clean up test images
+    # The sglang jobs are listed for the same reason as heterog-test: no SGLang
+    # leg may still be running on a node when its image is removed there.
     needs:
       - build-xpu
       - build-nvidia
       - heterog-test
+      - build-xpu-sglang
+      - build-nvidia-sglang
+      - sglang-smoke
+      - sglang-heterog-test
     if: >-
       always() &&
       (needs.build-xpu.outputs.image != '' ||
-      needs.build-nvidia.outputs.image != '')
+      needs.build-nvidia.outputs.image != '' ||
+      needs.build-xpu-sglang.outputs.image != '' ||
+      needs.build-nvidia-sglang.outputs.image != '')
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       NS: dynamo-system
       XPU_IMAGE: ${{ needs.build-xpu.outputs.image }}
       NVIDIA_IMAGE: ${{ needs.build-nvidia.outputs.image }}
+      XPU_SGLANG_IMAGE: ${{ needs.build-xpu-sglang.outputs.image }}
+      NVIDIA_SGLANG_IMAGE: ${{ needs.build-nvidia-sglang.outputs.image }}
       # Must match the xpu_node / nvidia_node values passed to every heterog
       # test above: the test manifests pin the XPU image to the first and the
       # GPU image to the second via dynamo.intel.com/node.
@@ -1234,6 +1762,11 @@ jobs:
           PAIRS=()
           [[ -n "${XPU_IMAGE}" ]]    && PAIRS+=("${XPU_NODE_LABEL}|${XPU_IMAGE}")
           [[ -n "${NVIDIA_IMAGE}" ]] && PAIRS+=("${NVIDIA_NODE_LABEL}|${NVIDIA_IMAGE}")
+          # SGLang: every tests/sglang manifest and smoke pod pins
+          # DOCKER_IMAGE_XPU to XPU_NODE and DOCKER_IMAGE_GPU to NVIDIA_NODE, so
+          # each image is removed from its own node label only.
+          [[ -n "${XPU_SGLANG_IMAGE}" ]]    && PAIRS+=("${XPU_NODE_LABEL}|${XPU_SGLANG_IMAGE}")
+          [[ -n "${NVIDIA_SGLANG_IMAGE}" ]] && PAIRS+=("${NVIDIA_NODE_LABEL}|${NVIDIA_SGLANG_IMAGE}")
 
           ROWS=()
           idx=0

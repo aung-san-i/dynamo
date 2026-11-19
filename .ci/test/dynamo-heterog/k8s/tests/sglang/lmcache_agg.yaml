@@ -1,0 +1,611 @@
+# lmcache-agg Test (sglang): LMCache KV offload/retrieve with Dynamo (aggregated, XPU)
+# The sglang counterpart of vllm/lmcache_agg.yaml: one aggregated dynamo.sglang
+# worker with --enable-lmcache in LMCache's multiprocess (MP) mode, against the
+# same lmcache-server sidecar (both containers share the pod's XPU claim).
+# sglang keeps its GPU radix cache on with LMCache (it requires it), so a shared
+# prefix is served from the device before LMCache is asked. The post-run check
+# therefore flushes the device cache through the worker's /engine/flush_cache
+# route (--engine-route flush_cache:tm), replays request 2, and requires the
+# prefix to come back from the LMCache server: Stored, lookup hit and Retrieved
+# on the server, and #cached-token > 0 on the worker's post-flush prefill.
+#
+# Runs in `all`. sglang uses LMCache's MP connector (lmcache.integration.sglang.
+# unified_lmcache_mp_connector); the lmcache server needs the OpenTelemetry deps that
+# Dockerfile.dynamo_xpu adds when the base lacks them (AICE-640 Issue-5).
+#
+# Usage:
+#   export DOCKER_IMAGE_XPU="..." XPU_RESOURCE_TEMPLATE="..." XPU_NODE="..."
+#   export TEST_NAME="sglang-lmcache-agg" MODEL="" TENSOR_PARALLEL=""
+#   kubectl apply -f <(envsubst < lmcache_agg.yaml) -n dynamo-system
+#
+# Cleanup:
+#   kubectl delete -f <(envsubst < lmcache_agg.yaml) -n dynamo-system
+---
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: ${TEST_NAME}
+  namespace: dynamo-system
+spec:
+  backendFramework: sglang
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "2"
+      extraPodSpec:
+        nodeSelector:
+          dynamo.intel.com/node: ${XPU_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+        mainContainer:
+          image: ${DOCKER_IMAGE_XPU}
+          env:
+            - name: DYN_STORE_KV
+              value: "mem"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: PYTHONHASHSEED
+              value: "0"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+
+    # Aggregated worker: no --disaggregation-mode -> registers as backend.generate;
+    # the lmcache-server sidecar holds the offloaded KV.
+    Backend:
+      componentType: worker
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "2"
+      extraPodSpec:
+        nodeSelector:
+          dynamo.intel.com/node: ${XPU_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+        resourceClaims:
+          - name: intel-gpu-rdma-resource
+            resourceClaimTemplateName: ${XPU_RESOURCE_TEMPLATE}
+        # LMCache MP server as a native sidecar (init container, restartPolicy
+        # Always): up and passing its startup probe before sglang starts. Same
+        # claim as the main container, so both see the same XPU card.
+        initContainers:
+          - name: lmcache-server
+            image: ${DOCKER_IMAGE_XPU}
+            restartPolicy: Always
+            command:
+              - /bin/bash
+              - -c
+              - |
+                # The image sets oneAPI up only in its ENTRYPOINT, which command: bypasses.
+                source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+                export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+                xpu-smi discovery || true
+                # --chunk-size 64 = sglang --page-size below. --http-host 0.0.0.0 lets
+                # the kubelet reach /healthcheck on the pod IP.
+                exec lmcache server \
+                  --host 127.0.0.1 --port 5555 \
+                  --chunk-size 64 \
+                  --l1-size-gb 5 --eviction-policy LRU \
+                  --supported-transfer-mode engine_driven \
+                  --http-host 0.0.0.0 --http-port 8080
+            startupProbe:
+              httpGet:
+                path: /healthcheck
+                port: 8080
+              periodSeconds: 5
+              failureThreshold: 60
+            securityContext:
+              runAsUser: 0
+              capabilities:
+                add:
+                  - "IPC_LOCK"
+                  - "SYS_PTRACE"
+                  - "SYS_ADMIN"
+                  - "SYS_RAWIO"
+            env:
+              # Chunk hashes must agree between server and worker.
+              - name: PYTHONHASHSEED
+                value: "0"
+            resources:
+              claims:
+                - name: intel-gpu-rdma-resource
+        mainContainer:
+          image: ${DOCKER_IMAGE_XPU}
+          workingDir: /workspace
+          command:
+            - /bin/bash
+            - -c
+            - |
+              # The image sets oneAPI up only in its ENTRYPOINT, which command: bypasses.
+              source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+              export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+              xpu-smi discovery || true
+              # LMCache MP config, LMCache's native top-level keys (see LMCache's
+              # docs/design/integration/sglang): the sidecar's address, and the same
+              # engine_driven transfer mode the server is started with.
+              printf 'mp_host: 127.0.0.1\nmp_port: 5555\nextra_config:\n  lmcache.mp.mp_transfer_mode: engine_driven\n' > /tmp/lmcache_mp.yaml
+              # --engine-route exposes the scheduler's flush_cache on the system
+              # port (/engine/flush_cache) for the post-run check. --disable-cuda-graph
+              # matches vllm's --enforce-eager here.
+              python -m dynamo.sglang \
+                --model-path ${MODEL:-Qwen/Qwen3-0.6B} \
+                --tp-size ${TENSOR_PARALLEL:-1} \
+                --device xpu \
+                --attention-backend intel_xpu \
+                --dtype bfloat16 \
+                --page-size 64 \
+                --mem-fraction-static 0.7 \
+                --disable-cuda-graph \
+                --enable-lmcache \
+                --lmcache-config-file /tmp/lmcache_mp.yaml \
+                --engine-route flush_cache:tm
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - "IPC_LOCK"
+                - "SYS_PTRACE"
+                - "SYS_ADMIN"
+                - "SYS_RAWIO"
+          env:
+            - name: MODEL
+              value: "$MODEL"
+            - name: TENSOR_PARALLEL
+              value: "$TENSOR_PARALLEL"
+            - name: DYN_STORE_KV
+              value: "mem"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: PYTHONHASHSEED
+              value: "0"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HF_HUB_OFFLINE
+              value: "0"
+          resources:
+            claims:
+              - name: intel-gpu-rdma-resource
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+
+# Post-run verification, executed on the runner by the template's "Post-run server
+# log parser" step (post_run_server_log_check: true). TEST_NAME is substituted at
+# deploy time; NS defaults to dynamo-system.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${TEST_NAME}-post-run-checks
+  namespace: dynamo-system
+data:
+  verify.sh: |
+    #!/usr/bin/env bash
+    # Runs on the RUNNER (kubectl available). Verifies LMCache MP-mode offload, and
+    # retrieval after a device-cache flush, for the aggregated sglang worker. Exit 0 = pass.
+    set -uo pipefail
+    TEST_NAME="${TEST_NAME:?TEST_NAME must be set by the caller}"
+    NS="${NS:-dynamo-system}"
+    SERVER_CONTAINER=lmcache-server
+    echo "========================================="
+    echo "sglang LMCache MP-mode verification (runner)"
+    echo "========================================="
+
+    # Counters always count every event. Under `lmcache server` they are served by
+    # its HTTP frontend on :8080, not the worker's system port.
+    srv_log() { kubectl logs -n "$NS" "$WORKER_POD" -c "$SERVER_CONTAINER" --tail=-1 2>/dev/null; }
+    srv_metric_sum() {
+      kubectl exec -n "$NS" "$WORKER_POD" -c "$SERVER_CONTAINER" -- python3 -c \
+        'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/metrics", timeout=10).read().decode())' 2>/dev/null \
+        | awk -v m="$1" '$1 == m || index($1, m "{") == 1 { s += $NF } END { printf "%d\n", s }'
+    }
+    sum_tokens() { grep -Eo "$1 [0-9]+ tokens in" | grep -oE '[0-9]+' | awk '{ s += $1 } END { printf "%d\n", s }'; }
+    # Pod lookup happens in the shared block; read the bench phase first.
+    PODS0=$(kubectl get pods -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME" -o name 2>/dev/null)
+    WORKER_POD=$(echo "$PODS0" | grep -iE 'backend|worker' | head -n1)
+    [ -n "$WORKER_POD" ] || { echo "ERROR: could not locate the aggregated worker pod"; echo "$PODS0"; exit 1; }
+    S_BEFORE=$(srv_log | wc -l)
+    STORED_BENCH=$(srv_log | sum_tokens Stored)
+    HIT_BEFORE=$(srv_metric_sum lmcache_mp_lookup_hit_tokens_total)
+    # ---- shared: flush the worker's device/host cache, then replay request 2 ----
+    # sglang serves a repeated prefix from its own radix cache before any external
+    # tier is asked, so reuse from that tier is only observable after a flush.
+    PODS=$(kubectl get pods -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME" -o name 2>/dev/null)
+    WORKER_POD=$(echo "$PODS" | grep -iE 'backend|worker' | head -n1)
+    FRONTEND_POD=$(echo "$PODS" | grep -i frontend | head -n1)
+    if [ -z "$WORKER_POD" ] || [ -z "$FRONTEND_POD" ]; then
+      echo "ERROR: could not locate the worker and frontend pods"; echo "$PODS"; exit 1
+    fi
+    MAIN=$(kubectl get -n "$NS" "$WORKER_POD" -o jsonpath='{.spec.containers[0].name}')
+    echo "Worker pod: $WORKER_POD (container $MAIN); frontend pod: $FRONTEND_POD"
+    worker_log() { kubectl logs -n "$NS" "$WORKER_POD" -c "$MAIN" --tail=-1 2>/dev/null; }
+
+    # Printed by the bench Job between @@ci-artifact markers; the template's
+    # post-run step cuts it out of the bench pod's log into POD_LOG_DIR, a
+    # runner-local directory, before it runs this script.
+    REPLAY_BODY="${POD_LOG_DIR:-}/replay-request-body.json"
+    if [ ! -s "$REPLAY_BODY" ]; then
+      echo "ERROR: replay request body not found at $REPLAY_BODY (bench Job did not write it?)"; exit 1
+    fi
+
+    # Only the scheduler's own flush_cache (exposed by --engine-route flush_cache:tm):
+    # it resets the radix tree and host pool but leaves external stores alone.
+    flush_device_cache() {
+      local out i
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        out=$(kubectl exec -n "$NS" "$WORKER_POD" -c "$MAIN" -- python3 -c '
+    import os, urllib.request
+    port = os.environ.get("DYN_SYSTEM_PORT", "9090")
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/engine/flush_cache", data=b"{}",
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    print(opener.open(req, timeout=120).read().decode())' 2>&1)
+        echo "  flush attempt $i: $out"
+        echo "$out" | grep -qE '"success": *true' && return 0
+        sleep 6
+      done
+      return 1
+    }
+
+    # Through the frontend, exactly as the bench sent it; body on stdin.
+    replay_request() {
+      kubectl exec -i -n "$NS" "$FRONTEND_POD" -- python3 -c '
+    import sys, urllib.request
+    req = urllib.request.Request("http://127.0.0.1:8000/v1/completions", data=sys.stdin.buffer.read(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    print(opener.open(req, timeout=300).read().decode())' < "$REPLAY_BODY"
+    }
+
+    # Sum of #cached-token over the "Prefill batch" lines of a log slice.
+    cached_tokens() { grep -E "Prefill batch" | grep -oE "#cached-token: [0-9]+" | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}'; }
+
+    W_BEFORE=$(worker_log | wc -l)
+    echo "--- flushing the worker's device cache ---"
+    flush_ok=false; flush_device_cache && flush_ok=true
+    echo "--- replaying request 2 through the frontend ---"
+    replay_ok=false
+    if REPLAY_OUT=$(replay_request 2>&1) && echo "$REPLAY_OUT" | grep -q '"choices"'; then replay_ok=true; fi
+    echo "  replay response: $(echo "$REPLAY_OUT" | head -c 600)"
+    [ -n "${POD_LOG_DIR:-}" ] && printf '%s\n' "$REPLAY_OUT" > "$POD_LOG_DIR/replay_response.json" 2>/dev/null || true
+    sleep 10
+    WLOG_AFTER=$(mktemp)
+    worker_log | tail -n +"$((W_BEFORE + 1))" > "$WLOG_AFTER"
+    echo "--- worker scheduler lines after the flush (OBSERVED) ---"
+    grep -E "Cache flushed|Prefill batch" "$WLOG_AFTER" || echo "<none>"
+    POST_CACHED=$(cached_tokens < "$WLOG_AFTER")
+    flushed_logged=false; grep -q "Cache flushed successfully" "$WLOG_AFTER" && flushed_logged=true
+    # ---- end shared ----
+    SLOG_AFTER=$(mktemp)
+    srv_log | tail -n +"$((S_BEFORE + 1))" > "$SLOG_AFTER"
+    RETRIEVED_AFTER=$(sum_tokens Retrieved < "$SLOG_AFTER")
+    HIT_AFTER=$(srv_metric_sum lmcache_mp_lookup_hit_tokens_total)
+    HIT_DELTA=$((HIT_AFTER - HIT_BEFORE))
+    echo "--- LMCache server lines after the flush (OBSERVED) ---"
+    grep -E "Stored [0-9]+ tokens|Retrieved [0-9]+ tokens|ERROR|Traceback" "$SLOG_AFTER" || echo "<none>"
+
+    # Pass criteria (the device cache is flushed before the replay, so LMCache is
+    # the only place the replayed prefix can come from):
+    #  1) the bench requests offloaded KV to the server     (Stored tokens > 0)
+    #  2) the device cache was flushed                      (route success + "Cache flushed")
+    #  3) the replay succeeded through the frontend
+    #  4) the replay's lookup hit the server                (lookup hit tokens grew)
+    #  5) the server retrieved KV for the replay            (Retrieved tokens > 0 after flush)
+    #  6) the worker counted those tokens as cached         (post-flush #cached-token > 0)
+    stored_ok=false; flush_all_ok=false; hit_ok=false; retrieved_ok=false; cached_ok=false
+    [ "$STORED_BENCH" -gt 0 ] && stored_ok=true
+    [ "$flush_ok" = true ] && [ "$flushed_logged" = true ] && flush_all_ok=true
+    [ "$HIT_DELTA" -gt 0 ] && hit_ok=true
+    [ "$RETRIEVED_AFTER" -gt 0 ] && retrieved_ok=true
+    [ "$POST_CACHED" -gt 0 ] && cached_ok=true
+
+    echo ""
+    echo "=== sglang LMCache verification (EXPECTED vs OBSERVED) ==="
+    echo "[1/6] Bench offloaded KV          EXPECTED Stored tokens > 0            OBSERVED $STORED_BENCH  -> $stored_ok"
+    echo "[2/6] Device cache flushed        EXPECTED route success + log line     OBSERVED route=$flush_ok log=$flushed_logged  -> $flush_all_ok"
+    echo "[3/6] Replay succeeded            EXPECTED a completion with choices    OBSERVED $replay_ok"
+    echo "[4/6] Replay hit LMCache          EXPECTED lookup hit tokens grow       OBSERVED $HIT_BEFORE -> $HIT_AFTER  -> $hit_ok"
+    echo "[5/6] Replay retrieved from it    EXPECTED Retrieved tokens > 0         OBSERVED $RETRIEVED_AFTER  -> $retrieved_ok"
+    echo "[6/6] Worker saw cached prefix    EXPECTED post-flush #cached-token > 0 OBSERVED $POST_CACHED  -> $cached_ok"
+    echo "==========================================================="
+    if [ "$stored_ok" = true ] && [ "$flush_all_ok" = true ] && [ "$replay_ok" = true ] \
+       && [ "$hit_ok" = true ] && [ "$retrieved_ok" = true ] && [ "$cached_ok" = true ]; then
+      echo "sglang LMCache test PASSED"; exit 0
+    fi
+    echo "ERROR: sglang LMCache test FAILED (stored_ok=$stored_ok flush_ok=$flush_all_ok replay_ok=$replay_ok hit_ok=$hit_ok retrieved_ok=$retrieved_ok cached_ok=$cached_ok)"
+    echo "--- worker lines mentioning LMCache/errors (for triage) ---"
+    worker_log | grep -iE "lmcache|Traceback|Error" | tail -40 || true
+    exit 1
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${TEST_NAME}-bench
+  namespace: dynamo-system
+  labels:
+    kueue.x-k8s.io/queue-name: dynamo-queue
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        kueue.x-k8s.io/queue-name: dynamo-queue
+        app.kubernetes.io/name: ${TEST_NAME}-bench
+        app.kubernetes.io/part-of: sglang-lmcache-agg
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${TEST_NAME}-k8s-service-discovery
+      nodeSelector:
+        dynamo.intel.com/node: ${XPU_NODE}
+      imagePullSecrets:
+        - name: amr-caas-registry
+      volumes:
+        - name: pytorch-models
+          hostPath:
+            path: /software/data/pytorch
+            type: Directory
+        - name: weka-models
+          hostPath:
+            path: /mnt/weka
+            type: Directory
+      containers:
+        - name: benchmark-runner
+          image: ${DOCKER_IMAGE_XPU}
+          workingDir: /workspace
+          command:
+            - /bin/sh
+            - -c
+            - |
+              FRONTEND_HOST="${TEST_NAME}-frontend.dynamo-system.svc.cluster.local"
+
+              # The model this Job benchmarks. MODEL is empty when the workflow
+              # passes no model input, so this test's own default is applied here,
+              # by the shell, where `:-` means something -- envsubst does not
+              # implement it. The result is held under a DIFFERENT name because
+              # every `$MODEL` in this script is substituted at render time (MODEL
+              # is in envsubst's variable list) and would arrive already empty;
+              # `$MODEL_PATH` is not in that list, so it survives to the shell.
+              MODEL_PATH="${MODEL:-Qwen/Qwen3-0.6B}"
+
+              # Anything this Job wants in the run artifact goes in $ARTIFACT_DIR;
+              # save_artifacts prints each file into this pod's log between
+              # "@@ci-artifact-begin <name>" / "@@ci-artifact-end <name>" lines, and
+              # the workflow's "Stage all logs for upload" step cuts them back out
+              # into bench/<name>. Called on every exit path via the trap below,
+              # and again right after the curl test (a SIGKILL later runs no
+              # trap); the workflow keeps the last copy.
+              ARTIFACT_DIR=/tmp/ci-artifacts
+              mkdir -p "$ARTIFACT_DIR"
+              save_artifacts() {
+                for f in "$ARTIFACT_DIR"/*; do
+                  [ -f "$f" ] || continue
+                  name=$(basename "$f")
+                  case "$name" in
+                    *.png)
+                      # Binary: base64 here, decoded by the workflow.
+                      echo "@@ci-artifact-begin-b64 $name"
+                      base64 "$f"
+                      ;;
+                    *)
+                      echo "@@ci-artifact-begin $name"
+                      cat "$f"
+                      # An end marker glued onto an unterminated last line is lost.
+                      if [ -n "$(tail -c1 "$f")" ]; then echo; fi
+                      ;;
+                  esac
+                  echo "@@ci-artifact-end $name"
+                done
+              }
+              trap save_artifacts EXIT
+
+              echo "========================================="
+              echo "Endpoint and FrontEnd Health Check"
+              echo "========================================="
+
+              echo "Waiting for the aggregated worker endpoint to be registered..."
+              timeout_sec=600
+              poll_sec=30
+              max_attempts=$((timeout_sec / poll_sec))
+              workers_ready=false
+              for attempt in $(seq 1 "$max_attempts"); do
+                # ?instances=true: Dynamo >= #16454 lists endpoints only on request;
+                # older frontends ignore the query.
+                health_response=$(curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health?instances=true" 2>/dev/null || echo "")
+                has_backend=$(echo "$health_response" | grep -c "${TEST_NAME}.*backend.generate" || true)
+                frontend_status=$(echo "$health_response" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+
+                if [ "$has_backend" -gt 0 ] && [ "$frontend_status" = "healthy" ]; then
+                  echo "Worker endpoint registered (attempt ${attempt}/${max_attempts})"
+                  workers_ready=true
+                  break
+                fi
+                echo "Attempt ${attempt}/${max_attempts}: waiting for backend worker (backend=$has_backend, status=$frontend_status)"
+                sleep "$poll_sec"
+              done
+
+              if [ "$workers_ready" != "true" ]; then
+                echo "ERROR: timeout waiting for worker endpoint"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health?instances=true" || true
+                exit 1
+              fi
+
+              echo "========================================="
+              echo "Model Registration Check"
+              echo "========================================="
+              model_ready=false
+              timeout_sec=180
+              poll_sec=15
+              max_attempts=$((timeout_sec / poll_sec))
+              for attempt in $(seq 1 "$max_attempts"); do
+                if curl --noproxy '*' -sf "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models" 2>/dev/null | grep -Fq '"id":"'; then
+                  echo "Model registration check passed (attempt ${attempt}/${max_attempts})"
+                  model_ready=true
+                  break
+                fi
+                echo "Attempt ${attempt}/${max_attempts}: model not registered yet"
+                sleep "$poll_sec"
+              done
+
+              if [ "$model_ready" != "true" ]; then
+                echo "ERROR: timeout waiting for model registration"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models" || true
+                exit 1
+              fi
+
+              # ---- LMCache functionality: two overlapping requests ----
+              # Request 2's prompt is a superset of request 1's, so its leading
+              # chunks must hit the KV that request 1 offloaded to LMCache. Sized
+              # for --chunk-size 64 (Qwen3 tokenizer): PROMPT1 is 189 tokens (2 full
+              # chunks stored), PROMPT2 278 (hits those 2, stores 2 more).
+              PROMPT1="Qwen3 is the latest generation of large language models in Qwen series, offering a comprehensive suite of dense and mixture-of-experts (MoE) models. Built upon extensive training, Qwen3 delivers groundbreaking advancements in reasoning, instruction-following, agent capabilities, and multilingual support, with the following key features: uniquely support of seamless switching between thinking mode (for complex logical reasoning, math, and coding) and non-thinking mode (for efficient, general-purpose dialogue) within single model, ensuring optimal performance across various scenarios. Significantly enhancement in its reasoning capabilities, surpassing previous QwQ (in thinking mode) and Qwen2.5 instruct models (in non-thinking mode) on mathematics, code generation, and commonsense logical reasoning. Superior human preference alignment, excelling in creative writing, role-playing, multi-turn dialogues, and instruction following, to deliver a more natural, engaging, and immersive conversational experience."
+              PROMPT2="Qwen3 is the latest generation of large language models in Qwen series, offering a comprehensive suite of dense and mixture-of-experts (MoE) models. Built upon extensive training, Qwen3 delivers groundbreaking advancements in reasoning, instruction-following, agent capabilities, and multilingual support, with the following key features: uniquely support of seamless switching between thinking mode (for complex logical reasoning, math, and coding) and non-thinking mode (for efficient, general-purpose dialogue) within single model, ensuring optimal performance across various scenarios. Significantly enhancement in its reasoning capabilities, surpassing previous QwQ (in thinking mode) and Qwen2.5 instruct models (in non-thinking mode) on mathematics, code generation, and commonsense logical reasoning. Superior human preference alignment, excelling in creative writing, role-playing, multi-turn dialogues, and instruction following, to deliver a more natural, engaging, and immersive conversational experience. Expertise in agent capabilities, enabling precise integration with external tools in both thinking and unthinking modes and achieving leading performance among open-source models in complex agent-based tasks. Support of 100+ languages and dialects with strong capabilities for multilingual instruction following and translation. Qwen3-0.6B has the following features: it is a causal language model, trained in a pretraining and a post-training stage, and it has"
+
+              CURL_LOG="$ARTIFACT_DIR/curl_test.log"
+              PROMPT_LOG="$ARTIFACT_DIR/input-prompt-curl-req.log"
+              ENDPOINT="http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/completions"
+
+              # Applied to both requests by the quality check step: a healthy
+              # continuation of the Qwen3 model card names the models. Truncating
+              # write, so the log starts here and the requests below append.
+              {
+                echo "expected-keywords: min 1 of model, models, Qwen, Qwen3, MoE, mixture-of-experts, dense, parameters, tasks, reasoning"
+                echo ""
+              } | tee "$PROMPT_LOG"
+
+              # Each response goes to its own file as well as to this container's
+              # stdout, so the run artifact carries the bodies and not just the
+              # `kubectl logs` transcript. tee per command rather than piping the
+              # whole block: a pipeline would put the requests in a subshell and
+              # swallow the exit status this test gates on.
+              run_completion() {
+                idx="$1"
+                label="$2"
+                prompt="$3"
+                body="$ARTIFACT_DIR/curl_response_${idx}.json"
+                {
+                  echo "========================================="
+                  echo "LMCache request ${idx} (${label}) - $(date)"
+                  echo "========================================="
+                } 2>&1 | tee -a "$CURL_LOG"
+                # Sent from one variable and logged from the same one, so the
+                # logged prompt cannot drift from what went on the wire. Both
+                # requests append: request 2's prompt is deliberately a superset
+                # of request 1's, and seeing both is what makes an offload/hit
+                # result readable after the fact. Greedy, so the text depends on
+                # the model rather than on one frozen sampled draw.
+                request_body="{\"model\": \"${MODEL_PATH}\", \"prompt\": \"${prompt}\", \"max_tokens\": 100, \"temperature\": 0}"
+                {
+                  echo "endpoint: POST $ENDPOINT"
+                  echo "request ${idx} (${label}) body:"
+                  printf '%s\n' "$request_body"
+                } | tee -a "$PROMPT_LOG" | tee -a "$CURL_LOG"
+
+                # curl's stderr to a file, not through a pipe: piping would make
+                # tee's exit status the one tested here and -f's HTTP-error
+                # detection would be lost.
+                err="/tmp/curl_stderr_${idx}.txt"
+                curl --noproxy '*' -fsS -X POST "$ENDPOINT" \
+                  -H "Content-Type: application/json" \
+                  -d "$request_body" \
+                  -o "$body" 2>"$err"
+                rc=$?
+                [ -s "$err" ] && tee -a "$CURL_LOG" < "$err"
+                if [ "$rc" -eq 0 ]; then
+                  tee -a "$CURL_LOG" < "$body"
+                  echo "" | tee -a "$CURL_LOG"
+                  return 0
+                fi
+                echo "ERROR: LMCache request ${idx} failed (curl exit $rc)" | tee -a "$CURL_LOG"
+                [ -s "$body" ] && tee -a "$CURL_LOG" < "$body"
+                return 1
+              }
+
+              run_completion 1 "offload" "$PROMPT1" || exit 1
+
+              # Give the engine a moment to finish offloading before the second request.
+              sleep 10
+
+              run_completion 2 "hit + store tail" "$PROMPT2" || exit 1
+
+              # Replayed by the post-run check once it has flushed the worker's
+              # device cache, to show the prefix returns from the external tier.
+              printf '%s\n' "{\"model\": \"${MODEL_PATH}\", \"prompt\": \"${PROMPT2}\", \"max_tokens\": 16, \"temperature\": 0}" > "$ARTIFACT_DIR/replay-request-body.json"
+
+              # In this pod's log before the post-run worker-log check, which
+              # runs on the runner, reads replay-request-body.json from it and can
+              # fail this job.
+              save_artifacts
+
+              # Allow the LMCache INFO lines to flush to the worker pod logs.
+              sleep 15
+
+              # LMCache verification (flush, replay, server log/metrics) is done on the runner in the template's
+              # "Post-run server log parser" step (the bench container has no kubectl
+              # and cannot read the worker pod logs). The runner runs the script in the
+              # ${TEST_NAME}-post-run-checks ConfigMap defined in this same file.
+              echo "Both LMCache requests sent; worker-log verification runs on the runner."
+          env:
+            - name: FRONTEND_PORT
+              value: "8000"
+            - name: MODEL
+              value: "$MODEL"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HF_HUB_OFFLINE
+              value: "0"
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true

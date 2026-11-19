@@ -1,0 +1,129 @@
+# Dynamo + sglang smoke (XPU): in-pod NATS + etcd + dynamo.sglang + dynamo.frontend
+# on :8000. Logs in /tmp/{nats,etcd,backend,frontend}.log. Proves Dynamo serves
+# through SGLang on XPU in one pod, before the multi-pod heterog tests.
+#
+# Ported from intel-sandbox/scalable-deploy-intel .ci/test/smoke/sglang/, with this
+# cluster's rules: Kueue queue label, dynamo.intel.com/node, no proxy env.
+#
+# Rendered by run-smoke.sh with:
+#   envsubst '${POD_NAME} ${DOCKER_IMAGE} ${RESOURCE_TEMPLATE} ${NODE}'
+# so the shell variables in the command below survive rendering.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${POD_NAME}
+  labels:
+    app.kubernetes.io/name: xpu-sglang-smoke
+    kueue.x-k8s.io/queue-name: dynamo-queue
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    dynamo.intel.com/node: ${NODE}
+  imagePullSecrets:
+    - name: amr-caas-registry
+  containers:
+  - name: with-resource
+    image: ${DOCKER_IMAGE}
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -Eeuo pipefail
+
+        cleanup() {
+          for pid in "${frontend_pid:-}" "${backend_pid:-}" "${etcd_pid:-}" "${nats_pid:-}"; do
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" 2>/dev/null || true
+            fi
+          done
+        }
+
+        check_process() {
+          local name="$1"
+          local pid="$2"
+          local exit_code=0
+
+          if ! kill -0 "$pid" 2>/dev/null; then
+            if ! wait "$pid"; then
+              exit_code=$?
+            fi
+            if [ "$exit_code" -eq 0 ]; then
+              exit_code=1
+            fi
+            echo "ERROR: ${name} exited unexpectedly with code ${exit_code}."
+            exit "$exit_code"
+          fi
+        }
+
+        trap cleanup EXIT INT TERM
+
+        # `command:` bypasses the image ENTRYPOINT, which sources oneAPI and puts
+        # torch's SYCL runtime first; redo both in the same order.
+        set +u; source /opt/intel/oneapi/setvars.sh --force > /dev/null 2>&1 || true; set -u
+        export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+        xpu-smi discovery || true
+
+        echo "Starting NATS server..."
+        { nats-server -js 2>&1 | tee /tmp/nats.log; } &
+        nats_pid=$!
+
+        echo "Starting etcd..."
+        export LIP=$(hostname -I | awk '{ print $1 }')
+        { etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://${LIP}:2379 --data-dir /tmp/etcd 2>&1 | tee /tmp/etcd.log; } &
+        etcd_pid=$!
+
+        # Wait for etcd to be ready
+        sleep 5
+
+        echo "Starting Dynamo backend worker..."
+        { python -m dynamo.sglang --model-path Qwen/Qwen3-0.6B --page-size 64 --context-length 4096 --mem-fraction-static 0.7 --max-total-tokens 32768 --disable-cuda-graph --device xpu --attention-backend intel_xpu 2>&1 | tee /tmp/backend.log; } &
+        backend_pid=$!
+
+        # Wait for backend to initialize
+        sleep 10
+
+        echo "Starting Dynamo frontend..."
+        { python -m dynamo.frontend --http-port=8000 2>&1 | tee /tmp/frontend.log; } &
+        frontend_pid=$!
+
+        # Wait for frontend to start
+        sleep 5
+
+        echo "All services started. Logs available at:"
+        echo "  NATS:     /tmp/nats.log"
+        echo "  etcd:     /tmp/etcd.log"
+        echo "  Backend:  /tmp/backend.log"
+        echo "  Frontend: /tmp/frontend.log"
+
+        # Keep the container alive only while all critical services are alive.
+        while true; do
+          check_process "NATS server" "$nats_pid"
+          check_process "etcd" "$etcd_pid"
+          check_process "Dynamo backend worker" "$backend_pid"
+          check_process "Dynamo frontend" "$frontend_pid"
+          sleep 5
+        done
+    securityContext:
+      runAsUser: 0
+      runAsGroup: 0
+      capabilities:
+        add: ["IPC_LOCK","SYS_PTRACE","SYS_ADMIN","SYS_RAWIO"]
+    env:
+      - name: HF_HOME
+        value: /models/huggingface
+      - name: TRANSFORMERS_CACHE
+        value: /models/huggingface/hub
+    resources:
+      claims:
+      - name: gpu
+    volumeMounts:
+      - name: pytorch-models
+        mountPath: /models
+  volumes:
+      - name: pytorch-models
+        hostPath:
+          path: /software/data/pytorch
+          type: Directory
+  resourceClaims:
+  - name: gpu
+    resourceClaimTemplateName: ${RESOURCE_TEMPLATE}
