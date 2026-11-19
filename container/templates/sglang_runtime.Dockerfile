@@ -34,11 +34,13 @@ ENV PATH=/usr/local/bin/etcd:$PATH
 # base-image OS packages up to the current patch releases. --only-upgrade skips
 # anything not already installed while keeping both operations in one layer.
 # libjemalloc2 lets CPython and C code opt into jemalloc via
-# LD_PRELOAD; it is not preloaded by default.
+# LD_PRELOAD; it is not preloaded by default. jq: the XPU heterog/smoke bench
+# Jobs parse the frontend's /health with it (the vLLM runtime image has it too).
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         libturbojpeg \
-        libjemalloc2 && \
+        libjemalloc2 \
+        jq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --only-upgrade \
         dirmngr \
         gnupg \
@@ -59,11 +61,12 @@ RUN apt-get update && \
 {% else %}
 # Install the TurboJPEG runtime used by frontend JPEG decoding.
 # libjemalloc2 lets CPython and C code opt into jemalloc via
-# LD_PRELOAD; it is not preloaded by default.
+# LD_PRELOAD; it is not preloaded by default. jq: see the cuda branch above.
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         libturbojpeg \
-        libjemalloc2 && \
+        libjemalloc2 \
+        jq && \
     rm -rf /var/lib/apt/lists/* && \
     ldconfig && \
     ldconfig -p | grep -q 'libturbojpeg.so.0'
@@ -476,6 +479,113 @@ RUN set -eux; \
         exit 1; \
     fi; \
     python3 -c 'import soundfile, torchaudio; from PIL import Image'
+{% endif %}
+
+{% if device == "xpu" and target not in ("dev", "local-dev") %}
+##################################################
+## XPU: LMCache (SYCL) + Mooncake (XPU, TENT) ####
+##################################################
+# Neither ships an XPU wheel, and the upstream lmsysorg/sglang XPU image has
+# neither, so the XPU heterog tests that use them (lmcache-agg:
+# `lmcache server` + --enable-lmcache; mooncake-store-agg: HiCache over Mooncake
+# Store + mooncake_master; px-dx-mooncake: --disaggregation-transfer-backend
+# mooncake) failed with "lmcache: not found" / "No module named 'mooncake'".
+# Built here from source with the base's oneAPI compilers (the base is
+# intel/deep-learning-essentials *-devel, setvars applied through ENV), the
+# recipe of intel-sandbox/scalable-deploy-intel docker/Dockerfile.dynamo_xpu,
+# where those tests pass. Refs live in context.yaml (sglang.xpu).
+#
+# Late in the stage on purpose: a change here rebuilds only these layers.
+# Both installs must leave the base's torch/sglang/NIXL stack untouched; the
+# pins file recorded first is re-checked after each install and fails the build
+# on any drift (NIXL included: LMCache lists nixl, and a PyPI nixl would replace
+# the XPU NIXL wheel installed above).
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG LMCACHE_REPO=https://github.com/LMCache/LMCache.git
+ARG LMCACHE_REF={{ context.sglang.xpu.lmcache_ref }}
+ARG MOONCAKE_REPO=https://github.com/kvcache-ai/Mooncake.git
+ARG MOONCAKE_REF={{ context.sglang.xpu.mooncake_ref }}
+
+# Pins: `pip list --format=freeze` prints name==version even for wheel-file
+# installs (pip freeze would print `torch @ file://...`, unusable as a
+# constraint). The same filter re-run after each install must print the same
+# lines; a package that appears (a PyPI nixl) or moves fails the diff.
+RUN printf '%s\n' '#!/bin/bash' \
+        "pip list --format=freeze 2>/dev/null | grep -i -E '^(torch|torchvision|torchaudio|triton|triton[-_]xpu|sglang|sgl[-_]kernel[-_a-z]*|nixl[-_a-z0-9]*)==' | sort" \
+        > /opt/dynamo/xpu-kv-pins.sh && \
+    chmod +x /opt/dynamo/xpu-kv-pins.sh && \
+    /opt/dynamo/xpu-kv-pins.sh > /opt/dynamo/xpu-kv-pins.txt && \
+    cp /opt/dynamo/xpu-kv-pins.txt /opt/dynamo/xpu-kv-constraints.txt && \
+    cat /opt/dynamo/xpu-kv-pins.txt && \
+    grep -q -i '^torch==' /opt/dynamo/xpu-kv-pins.txt && \
+    command -v icx && command -v icpx
+
+# Build dependencies: the Ubuntu list of Mooncake's dependencies.sh, with
+# libboost-dev rather than libboost-all-dev: the latter pulls libboost-mpi ->
+# OpenMPI -> apt UCX (libucx0), which would shadow the ze-enabled UCX in
+# /usr/local/ucx that NIXL needs. The dpkg check keeps it out.
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        git cmake ninja-build unzip patchelf \
+        libgoogle-glog-dev libgflags-dev libjsoncpp-dev libunwind-dev libnuma-dev \
+        libpython3-dev libboost-dev libssl-dev \
+        libyaml-cpp-dev libcurl4-openssl-dev libhiredis-dev liburing-dev \
+        libjemalloc-dev libmsgpack-dev libzmq3-dev libzstd-dev libasio-dev \
+        libxxhash-dev libcli11-dev libibverbs-dev librdmacm-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    if dpkg -s libucx0 > /dev/null 2>&1; then \
+        echo "ERROR: apt libucx0 got installed; it shadows /usr/local/ucx"; exit 1; \
+    fi
+
+# LMCache, MP-server mode (the tests run `lmcache server` beside the worker).
+# --no-deps keeps pip off the torch stack; common.txt minus the torch/vLLM/NIXL
+# lines supplies the rest. The OpenTelemetry packages need their own deps (the
+# sglang base has no opentelemetry-sdk; without them `lmcache server` fails on
+# opentelemetry.semconv). aiofile 3.9.0: 3.10.0 breaks lmcache. grpcio-tools
+# is a build requirement (build_py runs grpc_tools.protoc) that
+# --no-build-isolation would otherwise skip.
+RUN git clone "${LMCACHE_REPO}" /tmp/LMCache && \
+    cd /tmp/LMCache && \
+    git checkout "${LMCACHE_REF}" && \
+    grep -v -i -E '^(torch|torchvision|torchaudio|triton|triton-xpu|vllm|nixl[a-z0-9_-]*|sglang)([^a-z0-9_.-]|$)' \
+        requirements/common.txt > /tmp/lmcache-common.txt && \
+    C=/opt/dynamo/xpu-kv-constraints.txt && \
+    pip install --no-cache-dir -c "$C" --upgrade "setuptools>=77.0.3,<81.0.0" "setuptools_scm>=8" "packaging>=24.2" && \
+    pip install --no-cache-dir -c "$C" --no-deps caio aiofile==3.9.0 llvmlite prometheus_fastapi_instrumentator==8.0.2 && \
+    if ! pip show -q opentelemetry-sdk 2>/dev/null; then \
+        grep -i -E '^opentelemetry' /tmp/lmcache-common.txt > /tmp/lmcache-otel.txt && \
+        pip install --no-cache-dir -c "$C" -r /tmp/lmcache-otel.txt; \
+    fi && \
+    pip install --no-cache-dir -c "$C" --no-deps -r /tmp/lmcache-common.txt && \
+    pip install --no-cache-dir -c "$C" --no-deps "grpcio-tools==1.78.0" && \
+    BUILD_WITH_SYCL=1 pip install --no-cache-dir -c "$C" . --no-build-isolation --no-deps && \
+    cd / && rm -rf /tmp/LMCache /tmp/lmcache-*.txt && \
+    command -v lmcache && \
+    python3 -c "import lmcache, opentelemetry.sdk.metrics" && \
+    /opt/dynamo/xpu-kv-pins.sh | diff /opt/dynamo/xpu-kv-pins.txt - && \
+    echo "torch/sglang/NIXL stack intact after LMCache"
+
+# Mooncake transfer engine + Store for XPU (TENT on; CUDA off), flags as in
+# Mooncake's build docs ("Build with Intel XPU"). yalantinglibs is fetched by
+# CMake, so the build needs network. A failed patch fails the build.
+RUN --mount=type=bind,source=./container/deps/sglang/xpu/mooncake-xpu-pin-store-segments_pr5160.patch,target=/tmp/mooncake-pr5160.patch,readonly \
+    git clone "${MOONCAKE_REPO}" /tmp/Mooncake && \
+    cd /tmp/Mooncake && \
+    git checkout "${MOONCAKE_REF}" && \
+    git apply /tmp/mooncake-pr5160.patch && \
+    git submodule update --init extern/pybind11 && \
+    pip install --no-cache-dir -c /opt/dynamo/xpu-kv-constraints.txt -v . \
+        -Ccmake.define.CMAKE_C_COMPILER=icx \
+        -Ccmake.define.CMAKE_CXX_COMPILER=icpx \
+        -Ccmake.define.USE_TENT=ON \
+        -Ccmake.define.USE_XPU=ON \
+        -Ccmake.define.USE_CUDA=OFF && \
+    cd / && rm -rf /tmp/Mooncake && \
+    python3 -c "import torch, mooncake.engine; from mooncake.store import MooncakeDistributedStore" && \
+    command -v mooncake_master && \
+    /opt/dynamo/xpu-kv-pins.sh | diff /opt/dynamo/xpu-kv-pins.txt - && \
+    echo "torch/sglang/NIXL stack intact after Mooncake"
+SHELL ["/bin/sh", "-c"]
 {% endif %}
 
 USER dynamo
