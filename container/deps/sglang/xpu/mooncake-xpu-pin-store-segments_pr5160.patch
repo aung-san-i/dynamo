@@ -1,0 +1,211 @@
+Mooncake Store on Intel XPU: pin Store segments so local memcpy transfers DMA
+directly. kvcache-ai/Mooncake#5160 (open), cut at Mooncake e5ef0e42. Applied by
+docker/Dockerfile.dynamo_xpu. Drop once #5160 is in MOONCAKE_VERSION.
+
+diff --git a/mooncake-store/include/device/accelerator_device.h b/mooncake-store/include/device/accelerator_device.h
+index 5c4adc7f..267e6eb7 100644
+--- a/mooncake-store/include/device/accelerator_device.h
++++ b/mooncake-store/include/device/accelerator_device.h
+@@ -3,6 +3,7 @@
+ #include <atomic>
+ #include <cstddef>
+ #include <cstdint>
++#include <string>
+ 
+ #include "pinned_host_buffer.h"
+ 
+@@ -52,6 +53,19 @@ class AcceleratorDevice {
+     virtual void SetContext(int32_t device_id) const = 0;
+     virtual bool Copy(void* dst, const void* src, size_t size,
+                       CopyDirection direction) const = 0;
++    // Register existing host memory with the device runtime so device copies
++    // DMA it directly instead of staging it (the role cudaHostRegister plays
++    // on CUDA). Unsupported by default.
++    virtual bool RegisterHostMemory(void* /*addr*/, size_t /*size*/,
++                                    std::string* error_message) const {
++        if (error_message) *error_message = "not supported by this device";
++        return false;
++    }
++    virtual bool UnregisterHostMemory(void* /*addr*/,
++                                      std::string* error_message) const {
++        if (error_message) *error_message = "not supported by this device";
++        return false;
++    }
+     virtual PinnedHostBuffer AllocatePinnedHost(size_t size) const = 0;
+ };
+ 
+diff --git a/mooncake-store/src/device/xpu_accelerator_device.cpp b/mooncake-store/src/device/xpu_accelerator_device.cpp
+index 811862ef..d882ea16 100644
+--- a/mooncake-store/src/device/xpu_accelerator_device.cpp
++++ b/mooncake-store/src/device/xpu_accelerator_device.cpp
+@@ -153,6 +153,41 @@ class XpuRuntime {
+         }
+     }
+ 
++    // Import existing host memory (e.g. a Store segment) into the shared
++    // context, so copies between it and any device DMA it directly instead
++    // of staging pageable memory.
++    bool RegisterHost(void* addr, size_t size, std::string* error_message) {
++        std::lock_guard<std::mutex> lock(mu_);
++        if (!context_) {
++            if (error_message) *error_message = "no XPU context";
++            return false;
++        }
++        try {
++            sycl::ext::oneapi::experimental::prepare_for_device_copy(addr, size,
++                                                                     *context_);
++            return true;
++        } catch (const sycl::exception& e) {
++            if (error_message) *error_message = e.what();
++            return false;
++        }
++    }
++
++    bool UnregisterHost(void* addr, std::string* error_message) {
++        std::lock_guard<std::mutex> lock(mu_);
++        if (!context_) {
++            if (error_message) *error_message = "no XPU context";
++            return false;
++        }
++        try {
++            sycl::ext::oneapi::experimental::release_from_device_copy(
++                addr, *context_);
++            return true;
++        } catch (const sycl::exception& e) {
++            if (error_message) *error_message = e.what();
++            return false;
++        }
++    }
++
+     // Pinned host memory in the shared context, usable by every queue.
+     void* AllocHost(size_t size) {
+         std::lock_guard<std::mutex> lock(mu_);
+@@ -225,6 +260,21 @@ class XpuAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
+         return XpuRuntime::Instance().Copy(dst, src, size, g_current_device);
+     }
+ 
++    bool RegisterHostMemory(void* addr, size_t size,
++                            std::string* error_message) const override {
++        auto& runtime = XpuRuntime::Instance();
++        if (!runtime.Init()) {
++            if (error_message) *error_message = "no usable XPU device";
++            return false;
++        }
++        return runtime.RegisterHost(addr, size, error_message);
++    }
++
++    bool UnregisterHostMemory(void* addr,
++                              std::string* error_message) const override {
++        return XpuRuntime::Instance().UnregisterHost(addr, error_message);
++    }
++
+     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
+         auto& runtime = XpuRuntime::Instance();
+         if (!runtime.Init()) return PinnedHostBuffer();
+diff --git a/mooncake-store/src/registered_pinned_memory.cpp b/mooncake-store/src/registered_pinned_memory.cpp
+index b9b33512..6d29205f 100644
+--- a/mooncake-store/src/registered_pinned_memory.cpp
++++ b/mooncake-store/src/registered_pinned_memory.cpp
+@@ -6,13 +6,23 @@
+ 
+ #if defined(USE_CUDA)
+ #include <cuda_runtime_api.h>
++#elif defined(USE_XPU)
++#include "device/accelerator_registry.h"
+ #endif
+ 
+ namespace mooncake {
+ namespace {
+ 
++#if defined(USE_CUDA)
++constexpr const char* kPinApi = "cudaHostRegister";
++#elif defined(USE_XPU)
++constexpr const char* kPinApi = "XPU prepare_for_device_copy";
++#else
++constexpr const char* kPinApi = "host memory registration";
++#endif
++
+ void LogPinSkip(const std::string& owner, const char* reason, size_t size) {
+-    LOG(WARNING) << "Skip cudaHostRegister for " << owner << ": " << reason
++    LOG(WARNING) << "Skip " << kPinApi << " for " << owner << ": " << reason
+                  << ", size=" << size;
+ }
+ 
+@@ -40,11 +50,37 @@ RegisteredPinnedMemoryManager::UnregisterResult UnregisterPinnedRegionWithCuda(
+     return RegisteredPinnedMemoryManager::UnregisterResult::kError;
+ }
+ 
++#elif defined(USE_XPU)
++// Store segments are plain host allocations; Level Zero treats them as
++// pageable and stages every device copy through driver buffers. Importing them
++// once lets local memcpy transfers DMA directly.
++bool RegisterPinnedRegionWithXpu(void* addr, size_t size,
++                                 std::string* error_message) {
++    const auto* xpu = device::GetAcceleratorRegistry().GetDevice(
++        device::AcceleratorVendor::kIntel);
++    if (!xpu) {
++        if (error_message) *error_message = "no XPU accelerator registered";
++        return false;
++    }
++    return xpu->RegisterHostMemory(addr, size, error_message);
++}
++
++RegisteredPinnedMemoryManager::UnregisterResult UnregisterPinnedRegionWithXpu(
++    void* addr, std::string* error_message) {
++    const auto* xpu = device::GetAcceleratorRegistry().GetDevice(
++        device::AcceleratorVendor::kIntel);
++    if (xpu && xpu->UnregisterHostMemory(addr, error_message)) {
++        return RegisteredPinnedMemoryManager::UnregisterResult::kSuccess;
++    }
++    return RegisteredPinnedMemoryManager::UnregisterResult::kError;
++}
+ #endif
+ 
+ RegisteredPinnedMemoryManager::PinOps DefaultPinOps() {
+ #if defined(USE_CUDA)
+     return {RegisterPinnedRegionWithCuda, UnregisterPinnedRegionWithCuda};
++#elif defined(USE_XPU)
++    return {RegisterPinnedRegionWithXpu, UnregisterPinnedRegionWithXpu};
+ #else
+     return {};
+ #endif
+@@ -75,8 +111,8 @@ RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager()
+ RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager(
+     RegisteredPinnedMemoryConfig config, PinOps pin_ops)
+     : limit_bytes_(config.max_bytes), pin_ops_(pin_ops) {
+-#if defined(USE_CUDA)
+-    LOG(INFO) << "Store segment pinned memory is "
++#if defined(USE_CUDA) || defined(USE_XPU)
++    LOG(INFO) << "Store segment pinned memory (" << kPinApi << ") is "
+               << (limit_bytes_ != 0 ? "enabled" : "disabled")
+               << ", max_bytes=" << limit_bytes_;
+ #else
+@@ -122,7 +158,7 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
+         }
+ 
+         if (size > limit_bytes_ || pinned_bytes_ > limit_bytes_ - size) {
+-            LOG(WARNING) << "Skip cudaHostRegister for " << owner
++            LOG(WARNING) << "Skip " << kPinApi << " for " << owner
+                          << ": quota exceeded, requested=" << size
+                          << ", pinned=" << pinned_bytes_
+                          << ", limit=" << limit_bytes_;
+@@ -146,8 +182,8 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
+             std::lock_guard<std::mutex> lock(mutex_);
+             remove_inactive_region_locked(addr, size);
+         }
+-        LOG(WARNING) << "cudaHostRegister failed for " << owner
+-                     << ", size=" << size << ", error=" << error_message
++        LOG(WARNING) << kPinApi << " failed for " << owner << ", size=" << size
++                     << ", error=" << error_message
+                      << ". Continue with pageable host memory.";
+         return nullptr;
+     }
+@@ -164,7 +200,7 @@ std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
+         }
+     }
+ 
+-    LOG(INFO) << "cudaHostRegister succeeded for " << owner << ", size=" << size
++    LOG(INFO) << kPinApi << " succeeded for " << owner << ", size=" << size
+               << ", pinned=" << pinned_bytes << ", limit=" << limit_bytes_;
+     return region;
+ }

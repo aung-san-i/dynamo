@@ -72,6 +72,16 @@ on:
         required: false
         type: boolean
         default: true
+      post_run_server_log_check:
+        description: >-
+          Run a post-run check on the runner after a successful bench. The test
+          YAML must define a ConfigMap ${TEST_NAME}-post-run-checks with a
+          data.verify.sh script (the runner has kubectl); its exit code gates the
+          job. Used by functional tests that prove a KV path from the worker logs
+          (sglang lmcache-agg, mooncake-store-agg, px-dx-mooncake).
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -743,6 +753,67 @@ jobs:
           "$RUNNER_TEMP/dump-diagnostics.sh" bench-timeout || true
           exit 1
 
+      # Runs only when the bench step succeeded, so a failed bench skips it. The
+      # verification logic lives in the test YAML's ${TEST_NAME}-post-run-checks
+      # ConfigMap (applied with the graph); it is fetched and run here, on the
+      # runner, which can read the worker pod logs and exec into the pods.
+      #
+      # POD_LOG_DIR: some checks replay a request the bench Job saved (e.g.
+      # replay-request-body.json). The Job cannot hand a file to the runner
+      # directly -- it has exited, and no NFS is shared with this runner -- so it
+      # prints its files between @@ci-artifact markers (save_artifacts) and they
+      # are cut out of its log here, the same way "Stage all logs for upload"
+      # does for bench/. Anything the check writes into POD_LOG_DIR ships in the
+      # artifact, since POD_LOG_DIR is under LOCAL_LOG_DIR.
+      - name: Post-run server log check
+        if: ${{ inputs.post_run_server_log_check }}
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -uo pipefail
+          exec > >(tee -a "$LOCAL_LOG_DIR/post-run-check.log") 2>&1
+
+          POD_LOG_DIR="$LOCAL_LOG_DIR/pod-artifacts"
+          mkdir -p "$POD_LOG_DIR"
+          BENCHMARK_POD=$(kubectl get pods -n "$NS" -l job-name="$TEST_NAME-bench" -o name | head -n1)
+          if [ -n "$BENCHMARK_POD" ]; then
+            kubectl logs -n "$NS" "$BENCHMARK_POD" 2>/dev/null | awk -v dir="$POD_LOG_DIR" '
+              $1 == "@@ci-artifact-begin" && $2 ~ /^[A-Za-z0-9._-]+$/ {
+                if (out != "") close(out)
+                out = dir "/" $2
+                printf "" > out
+                next
+              }
+              $1 == "@@ci-artifact-end" { if (out != "") close(out); out = ""; next }
+              out != "" { print > out }
+            '
+          else
+            echo "WARNING: no bench pod found; POD_LOG_DIR stays empty"
+          fi
+          echo "Bench files available to the check in $POD_LOG_DIR:"
+          ls -la "$POD_LOG_DIR" || true
+
+          echo "Fetching post-run check script from ConfigMap ${TEST_NAME}-post-run-checks..."
+          if ! kubectl get configmap "${TEST_NAME}-post-run-checks" -n "$NS" \
+              -o jsonpath='{.data.verify\.sh}' > "$RUNNER_TEMP/post_run_verify.sh" 2>"$RUNNER_TEMP/post_run_verify.err"; then
+            echo "ERROR: could not read ConfigMap ${TEST_NAME}-post-run-checks"
+            cat "$RUNNER_TEMP/post_run_verify.err" || true
+            "$RUNNER_TEMP/dump-diagnostics.sh" post-run-check-failed || true
+            exit 1
+          fi
+          if [ ! -s "$RUNNER_TEMP/post_run_verify.sh" ]; then
+            echo "ERROR: ConfigMap ${TEST_NAME}-post-run-checks has no data.verify.sh content"
+            exit 1
+          fi
+          echo "--- running post-run verification (TEST_NAME=$TEST_NAME) ---"
+          rc=0
+          TEST_NAME="$TEST_NAME" NS="$NS" POD_LOG_DIR="$POD_LOG_DIR" bash "$RUNNER_TEMP/post_run_verify.sh" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "ERROR: post-run verification failed (exit $rc)"
+            "$RUNNER_TEMP/dump-diagnostics.sh" post-run-check-failed || true
+          fi
+          exit "$rc"
+
       - name: Collect logs
         if: always()
         run: |
@@ -1068,6 +1139,9 @@ jobs:
           echo "Deleting DynamoGraphDeployment: $TEST_NAME"
           kubectl delete dynamographdeployment "$TEST_NAME" -n "$NS" --ignore-not-found=true --wait=true --timeout=6m || true
           kubectl delete pods -n "$NS" -l "$SERVICE_SELECTOR" --ignore-not-found=true --wait=true --timeout=6m || true
+
+          # The post-run check ConfigMap some test YAMLs carry; a no-op for the rest.
+          kubectl delete configmap "$TEST_NAME-post-run-checks" -n "$NS" --ignore-not-found=true || true
 
           if kubectl get job "$TEST_NAME-bench" -n "$NS" >/dev/null 2>&1; then
             echo "ERROR: benchmark Job still exists after cleanup: $TEST_NAME-bench"

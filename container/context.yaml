@@ -185,6 +185,15 @@ sglang:
     # to avoid affecting sglang-cuda or other frameworks.
     nixl_ref: v1.5.0
     nixl_ucx_ref: v1.23.0-rc1
+    # KV-cache stacks built from source into the XPU runtime (no XPU wheels on
+    # PyPI), for the lmcache-agg, mooncake-store-agg and px-dx-mooncake XPU
+    # heterog tests. Same refs as intel-sandbox/scalable-deploy-intel's
+    # docker/Dockerfile.dynamo_xpu, where those tests pass.
+    #   lmcache_ref  v0.5.7-xpu = LMCache release 0.5.7 (SYCL build)
+    #   mooncake_ref e5ef0e42 carries the XPU build fix (Mooncake#5176), plus
+    #                deps/sglang/xpu/mooncake-xpu-pin-store-segments_pr5160.patch
+    lmcache_ref: v0.5.7-xpu
+    mooncake_ref: e5ef0e42
   # Builds the NIXL C++ SDK in wheel_builder so the dev stage can link nixl-sys
   # (see templates/dev.Dockerfile). Runtime stays on the upstream lmsysorg/sglang
   # NIXL Python stack — its wheel COPY is narrowed to ai_dynamo*.whl so the SDK

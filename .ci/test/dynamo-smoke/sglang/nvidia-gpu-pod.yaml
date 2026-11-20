@@ -1,0 +1,54 @@
+# sglang engine smoke (NVIDIA): bare sglang.launch_server on :8000, which serves
+# /health, /v1/models and /v1/chat/completions. Proves the SGLang CUDA image runs
+# its engine alone, before any Dynamo component is involved.
+#
+# Ported from intel-sandbox/scalable-deploy-intel .ci/test/smoke/sglang/, with this
+# cluster's rules: Kueue queue label, dynamo.intel.com/node, no proxy env.
+#
+# Rendered by run-smoke.sh with:
+#   envsubst '${POD_NAME} ${DOCKER_IMAGE} ${RESOURCE_TEMPLATE} ${NODE}'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${POD_NAME}
+  labels:
+    app.kubernetes.io/name: xpu-sglang-smoke
+    kueue.x-k8s.io/queue-name: dynamo-queue
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    dynamo.intel.com/node: ${NODE}
+  imagePullSecrets:
+    - name: amr-caas-registry
+  containers:
+  - name: with-gpu
+    image: ${DOCKER_IMAGE}
+    command:
+      - /bin/bash
+      - -c
+      - |
+        python3 -m sglang.launch_server --model-path Qwen/Qwen3-0.6B --host 0.0.0.0 --port 8000
+    securityContext:
+      runAsUser: 0
+      runAsGroup: 0
+      capabilities:
+        add: ["IPC_LOCK","SYS_PTRACE","SYS_ADMIN","SYS_RAWIO"]
+    env:
+      - name: HF_HOME
+        value: /models/huggingface
+      - name: TRANSFORMERS_CACHE
+        value: /models/huggingface/hub
+    resources:
+      claims:
+      - name: gpu
+    volumeMounts:
+      - name: pytorch-models
+        mountPath: /models
+  volumes:
+      - name: pytorch-models
+        hostPath:
+          path: /software/data/pytorch
+          type: Directory
+  resourceClaims:
+  - name: gpu
+    resourceClaimTemplateName: ${RESOURCE_TEMPLATE}

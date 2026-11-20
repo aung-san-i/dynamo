@@ -2039,6 +2039,12 @@ reason = "Mere aggregation; system component"
 
 [[exceptions]]
 type = "dpkg"
+name = "libmsgpackc2"
+allow = ["GPL-3.0-only"]
+reason = "Mere aggregation; runtime library of the XPU SGLang image's source-built Mooncake (upstream msgpack-c is BSL-1.0); approved by the repo owner 2026-11-20, PR #123"
+
+[[exceptions]]
+type = "dpkg"
 name = "libmunge2"
 allow = ["GPL-2.0-only", "GPL-2.0-or-later", "GPL-3.0-only", "LGPL-2.1-only", "LGPL-2.1-or-later"]
 reason = "Mere aggregation; system component"
@@ -2210,6 +2216,12 @@ type = "dpkg"
 name = "libxnvctrl0"
 allow = ["GPL-2.0-only"]
 reason = "Mere aggregation; system component"
+
+[[exceptions]]
+type = "dpkg"
+name = "libyaml-cpp0.8"
+allow = ["GPL-2.0-only"]
+reason = "Mere aggregation; runtime library of the XPU SGLang image's source-built Mooncake (upstream yaml-cpp is MIT); approved by the repo owner 2026-11-20, PR #123"
 
 [[exceptions]]
 type = "dpkg"

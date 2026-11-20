@@ -1,0 +1,463 @@
+# omni_ar-dit_agg Test (sglang): GLM-Image AR + DiT, aggregated on one XPU card
+#
+# SGLang's counterpart of vllm/omni_ar-dit_2nodes.yaml: same model (zai-org/GLM-Image),
+# request, PNG check and timing loop, but one worker running both stages. Dynamo
+# supports SGLang diffusion only as a single DiffGenerator worker
+# (--image-diffusion-worker); it has no SGLang AR/DiT disaggregation, so this test
+# covers what is supported rather than splitting the stages across nodes.
+#
+# Topology (2 pods, 1 accelerator, one node):
+#   Frontend -> XPU node, no device
+#   Backend  -> XPU node, 1 B60: AR (vision_language_encoder, transformers generate)
+#               then DiT (transformer) in one process; registers backend.generate
+#
+# GLM-Image is ~34G (AR 19G, DiT 13G, T5 + VAE ~1.6G), more than a 24G B60 holds.
+# SGLang offloads both large components on devices under 30G by default
+# (ServerArgs._adjust_offload; vision_language_encoder is in the DiT offload group),
+# loading each onto the card only for its own stage. No flag is needed, which
+# matters because dynamo passes DiffGenerator only model path, TP/DP and ports.
+#
+# Settings match the vLLM test: the AR samples with GLM-Image's generation_config
+# (temperature 0.9, top_p 0.75, top_k 16512); 1024x1024 gives max_new_tokens 1281;
+# the request's nvext sets 50 steps (SGLang's default is 30), guidance 1.5, seed 42.
+#
+# Needs SGLang's [diffusion] extra in the XPU image (sglang_Dockerfile.xpu).
+#
+# Keep TEST_NAME at 19 chars or fewer (the workflow uses sglang-omni-agg). The AR stage
+# ends in torch.distributed.barrier(), XCCL's first collective here, and oneCCL
+# segfaults in atl_ofi_get_local_proc_coord on hostnames over 61 chars: its 64-byte
+# buffer drops the "-<rank>" suffix it later parses. The Backend pod's hostname is
+# r<6 digits>-<TEST_NAME>-backend-<8>-<10>-<5>, i.e. 42 + len(TEST_NAME).
+# GLM-Image is pre-staged in the HF cache on the pytorch NFS export (see the vLLM
+# test's MODEL NOTE); the worker resolves that snapshot offline. OMNI_MODEL rather
+# than MODEL keeps envsubst from replacing it with the workflow's text model.
+#
+# Usage:
+#   export DOCKER_IMAGE_XPU="..." XPU_RESOURCE_TEMPLATE="..." XPU_NODE="..."
+#   export TEST_NAME="sglang-omni-agg"
+#   kubectl apply -f <(envsubst < omni_ar-dit_agg.yaml) -n dynamo-system
+#
+# Cleanup:
+#   kubectl delete -f <(envsubst < omni_ar-dit_agg.yaml) -n dynamo-system
+---
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: ${TEST_NAME}
+  namespace: dynamo-system
+spec:
+  backendFramework: sglang
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "2"
+      extraPodSpec:
+        nodeSelector:
+          dynamo.intel.com/node: ${XPU_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+        mainContainer:
+          image: ${DOCKER_IMAGE_XPU}
+          env:
+            - name: DYN_STORE_KV
+              value: "mem"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: PYTHONHASHSEED
+              value: "0"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+
+    # Image diffusion worker: registers the model at backend.generate. No memory
+    # limit: the offloaded AR and DiT (~32G) live in host memory between stages.
+    Backend:
+      componentType: worker
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "2"
+      extraPodSpec:
+        nodeSelector:
+          dynamo.intel.com/node: ${XPU_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+        resourceClaims:
+          - name: intel-gpu-rdma-resource
+            resourceClaimTemplateName: ${XPU_RESOURCE_TEMPLATE}
+        mainContainer:
+          image: ${DOCKER_IMAGE_XPU}
+          workingDir: /workspace
+          command:
+            - /bin/bash
+            - -c
+            - |
+              # The image sets oneAPI up only in its ENTRYPOINT, which command: bypasses.
+              source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+              export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+              xpu-smi discovery || true
+              # The cached snapshot's directory, whatever refs/main points at. A path
+              # keeps SGLang from reaching for the hub; --served-model-name keeps the
+              # API id the bench Job sends.
+              MODEL_DIR=$(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download('$OMNI_MODEL', local_files_only=True))") || exit 1
+              echo "Resolved $OMNI_MODEL -> $MODEL_DIR"
+              exec python -m dynamo.sglang \
+                --model-path "$MODEL_DIR" \
+                --served-model-name "$OMNI_MODEL" \
+                --image-diffusion-worker \
+                --media-output-fs-url file:///tmp/dynamo_media \
+                --trust-remote-code \
+                --skip-tokenizer-init
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - "IPC_LOCK"
+                - "SYS_PTRACE"
+                - "SYS_ADMIN"
+                - "SYS_RAWIO"
+          env:
+            - name: OMNI_MODEL
+              value: "zai-org/GLM-Image"
+            # Same as the other sglang XPU workers on this image: SGLang's FPM
+            # DeviceTimer hardcodes torch.cuda.Event (AICE-640 Issue-2).
+            - name: DYN_FORWARDPASS_METRIC_PORT
+              value: ""
+            - name: DYN_STORE_KV
+              value: "mem"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: PYTHONHASHSEED
+              value: "0"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HF_HUB_OFFLINE
+              value: "0"
+          resources:
+            claims:
+              - name: intel-gpu-rdma-resource
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${TEST_NAME}-bench
+  namespace: dynamo-system
+  labels:
+    kueue.x-k8s.io/queue-name: dynamo-queue
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  activeDeadlineSeconds: 2400
+  template:
+    metadata:
+      labels:
+        kueue.x-k8s.io/queue-name: dynamo-queue
+        app.kubernetes.io/name: ${TEST_NAME}-bench
+        app.kubernetes.io/part-of: sglang-omni-agg
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${TEST_NAME}-k8s-service-discovery
+      nodeSelector:
+        dynamo.intel.com/node: ${XPU_NODE}
+      imagePullSecrets:
+        - name: amr-caas-registry
+      volumes:
+        - name: pytorch-models
+          hostPath:
+            path: /software/data/pytorch
+            type: Directory
+        - name: weka-models
+          hostPath:
+            path: /mnt/weka
+            type: Directory
+      containers:
+        - name: benchmark-runner
+          image: ${DOCKER_IMAGE_XPU}
+          workingDir: /workspace
+          command:
+            - /bin/bash
+            - -c
+            - |
+              FRONTEND_HOST="${TEST_NAME}-frontend.dynamo-system.svc.cluster.local"
+
+              # Files for the run artifact go in $ARTIFACT_DIR; save_artifacts prints
+              # them into this pod's log between @@ci-artifact markers (the PNG as
+              # base64), and the workflow cuts them back out into bench/<name>.
+              # Run on every exit and again right after the smoke request, since a
+              # SIGKILL during the timing loop runs no trap.
+              ARTIFACT_DIR=/tmp/ci-artifacts
+              mkdir -p "$ARTIFACT_DIR"
+              save_artifacts() {
+                for f in "$ARTIFACT_DIR"/*; do
+                  [ -f "$f" ] || continue
+                  name=$(basename "$f")
+                  case "$name" in
+                    *.png)
+                      # Binary: base64 here, decoded by the workflow.
+                      echo "@@ci-artifact-begin-b64 $name"
+                      base64 "$f"
+                      ;;
+                    *)
+                      echo "@@ci-artifact-begin $name"
+                      cat "$f"
+                      # An end marker glued onto an unterminated last line is lost.
+                      if [ -n "$(tail -c1 "$f")" ]; then echo; fi
+                      ;;
+                  esac
+                  echo "@@ci-artifact-end $name"
+                done
+              }
+              trap save_artifacts EXIT
+              trap 'exit 143' TERM INT
+
+              echo "========================================="
+              echo "Endpoint and FrontEnd Health Check"
+              echo "========================================="
+
+              # One endpoint: the diffusion worker at {ns}.backend.generate. Matched
+              # with jq per endpoint (see the vLLM omni test): /health is one line,
+              # and the operator appends a hash to the namespace, so match on
+              # this run's namespace prefix and the exact component suffix.
+              echo "Waiting for the image diffusion worker to register..."
+              timeout_sec=1800
+              poll_sec=30
+              max_attempts=$((timeout_sec / poll_sec))
+              workers_ready=false
+              for attempt in $(seq 1 "$max_attempts"); do
+                health_response=$(curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health?instances=true" 2>/dev/null || echo "")
+                has_backend=$(printf '%s' "$health_response" | jq -r --arg ns "dynamo-system-${TEST_NAME}" '
+                  [ .endpoints[]? | select(startswith("dyn://\($ns)") and endswith(".backend.generate")) ] | length
+                ' 2>/dev/null || echo 0)
+                frontend_status=$(echo "$health_response" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+                if [ "$has_backend" -gt 0 ] && [ "$frontend_status" = "healthy" ]; then
+                  echo "Image diffusion worker registered (attempt ${attempt}/${max_attempts})"
+                  workers_ready=true
+                  break
+                fi
+                echo "Attempt ${attempt}/${max_attempts}: backend=$has_backend frontend=$frontend_status"
+                sleep "$poll_sec"
+              done
+              if [ "$workers_ready" != "true" ]; then
+                echo "ERROR: timeout waiting for the image diffusion worker"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health?instances=true" || true
+                exit 1
+              fi
+
+              echo "========================================="
+              echo "Model Registration Check"
+              echo "========================================="
+              model_ready=false
+              for attempt in $(seq 1 20); do
+                if curl --noproxy '*' -sf "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models" 2>/dev/null | grep -Fq "\"id\":\"${SERVED_MODEL_NAME}\""; then
+                  echo "Model registration check passed (attempt ${attempt}/20)"
+                  model_ready=true
+                  break
+                fi
+                echo "Attempt ${attempt}/20: ${SERVED_MODEL_NAME} not registered yet"
+                sleep 15
+              done
+              if [ "$model_ready" != "true" ]; then
+                echo "ERROR: timeout waiting for model registration"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models" || true
+                exit 1
+              fi
+
+              {
+                echo "========================================="
+                echo "Image Generation Smoke Test - $(date)"
+                echo "========================================="
+                echo ""
+                echo "--- /v1/models ---"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models"
+                echo ""
+              } 2>&1 | tee "$ARTIFACT_DIR/curl_test.log"
+
+              # b64_json returns the PNG inline; "url" would point into the worker
+              # pod's /tmp/dynamo_media. nvext carries the vLLM test's DiT settings.
+              # The smoke request and the timing loop send this one variable, so
+              # the logged prompt cannot drift from what was sent.
+              ENDPOINT="http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/images/generations"
+              REQUEST_BODY="{
+                \"model\": \"${SERVED_MODEL_NAME}\",
+                \"prompt\": \"${PROMPT}\",
+                \"size\": \"${IMAGE_SIZE}\",
+                \"response_format\": \"b64_json\",
+                \"nvext\": {
+                  \"num_inference_steps\": 50,
+                  \"guidance_scale\": 1.5,
+                  \"seed\": 42
+                }
+              }"
+              {
+                echo "endpoint: POST $ENDPOINT"
+                echo "request body:"
+                printf '%s\n' "$REQUEST_BODY"
+              } | tee "$ARTIFACT_DIR/input-prompt-curl-req.log"
+
+              gen_success=false
+              gen_max_attempts=2
+              gen_interval=20
+              for attempt in $(seq 1 "$gen_max_attempts"); do
+                echo "Image generation attempt ${attempt}/${gen_max_attempts}..."
+                start_ns=$(date +%s%N)
+                response=$(curl --noproxy '*' -sS --max-time "$REQUEST_TIMEOUT" -X POST "$ENDPOINT" \
+                  -H 'Content-Type: application/json' \
+                  -d "$REQUEST_BODY" 2>&1)
+                echo "took $(( ($(date +%s%N) - start_ns) / 1000000 )) ms"
+                if echo "$response" | jq -e '.data[0].b64_json' >/dev/null 2>&1; then
+                  echo "$response" | jq -r '.data[0].b64_json' | base64 -d > /tmp/omni_output.png
+                  # A real PNG, not an error body that happens to decode.
+                  magic=$(head -c 8 /tmp/omni_output.png | od -An -tx1 | tr -d ' \n')
+                  size=$(wc -c < /tmp/omni_output.png)
+                  echo "Decoded /tmp/omni_output.png: ${size} bytes, magic=${magic}"
+                  if [ "$magic" = "89504e470d0a1a0a" ] && [ "$size" -gt 1024 ]; then
+                    echo "PNG signature and size OK"
+                    gen_success=true
+                    break
+                  fi
+                  echo "Decoded payload is not a valid PNG; retrying in ${gen_interval}s..."
+                else
+                  echo "No b64_json in response:"
+                  echo "$response" | head -c 2000
+                  echo ""
+                  echo "Retrying in ${gen_interval}s..."
+                fi
+                sleep "$gen_interval"
+              done
+              if [ "$gen_success" != "true" ]; then
+                echo "ERROR: image generation failed after ${gen_max_attempts} attempts"
+                exit 1
+              fi
+
+              if cp /tmp/omni_output.png "$ARTIFACT_DIR/generated_image.png"; then
+                echo "Staged generated_image.png for collection"
+              else
+                echo "WARNING: could not stage the PNG; it will not reach the artifact"
+              fi
+              save_artifacts
+
+              echo "========================================="
+              echo "Running AR+DiT Latency Benchmark"
+              echo "========================================="
+              echo "Configuration:"
+              echo "  FRONTEND_HOST: $FRONTEND_HOST"
+              echo "  MODEL:         ${SERVED_MODEL_NAME}"
+              echo "  IMAGE_SIZE:    ${IMAGE_SIZE}"
+              echo "  NUM_REQUESTS:  ${NUM_REQUESTS}"
+              echo ""
+
+              # Sequential end-to-end requests: one worker, one image at a time.
+              total_ms=0
+              ok=0
+              for i in $(seq 1 "$NUM_REQUESTS"); do
+                start_ns=$(date +%s%N)
+                body=$(curl --noproxy '*' -sS --max-time "$REQUEST_TIMEOUT" -X POST "$ENDPOINT" \
+                  -H 'Content-Type: application/json' \
+                  -d "$REQUEST_BODY" 2>&1)
+                end_ns=$(date +%s%N)
+                elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+                if echo "$body" | jq -e '.data[0].b64_json' >/dev/null 2>&1; then
+                  bytes=$(echo "$body" | jq -r '.data[0].b64_json' | base64 -d | wc -c)
+                  echo "request ${i}/${NUM_REQUESTS}: ${elapsed_ms} ms, ${bytes} bytes"
+                  total_ms=$((total_ms + elapsed_ms))
+                  ok=$((ok + 1))
+                else
+                  echo "request ${i}/${NUM_REQUESTS}: FAILED after ${elapsed_ms} ms"
+                  echo "$body" | head -c 500
+                fi
+              done
+
+              echo ""
+              echo "--- Results ---"
+              echo "successful: ${ok}/${NUM_REQUESTS}"
+              if [ "$ok" -gt 0 ]; then
+                echo "mean e2e latency: $((total_ms / ok)) ms"
+              fi
+              if [ "$ok" -ne "$NUM_REQUESTS" ]; then
+                echo "ERROR: ${NUM_REQUESTS} requested, only ${ok} succeeded"
+                exit 1
+              fi
+
+              echo ""
+              echo "========================================="
+              echo "Benchmark Complete"
+              echo "========================================="
+          env:
+            - name: FRONTEND_PORT
+              value: "8000"
+            # The worker's --served-model-name, i.e. its OMNI_MODEL.
+            - name: SERVED_MODEL_NAME
+              value: "zai-org/GLM-Image"
+            - name: PROMPT
+              value: "a red apple, a green apple and a yellow alphonso mango on a white table"
+            - name: IMAGE_SIZE
+              value: "1024x1024"
+            # 2, not the vLLM test's 5: one card runs both stages and swaps ~32G of
+            # weights per image (the AR alone took ~4 min incl. loading in run
+            # 43526885544), and the template gives the bench Job 30 minutes.
+            - name: NUM_REQUESTS
+              value: "2"
+            # Per-request cap, so a worker that died mid-request (its pod stays
+            # Ready) fails the request instead of hanging the whole window.
+            - name: REQUEST_TIMEOUT
+              value: "900"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true

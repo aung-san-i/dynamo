@@ -451,6 +451,8 @@ vllm:
   - 'container/templates/ffmpeg_encoder_guard.Dockerfile'
   # Heterogeneous EPD/P-D test manifests are consumed by PR-XPU and manual EPD workflows.
   - '.ci/test/dynamo-heterog/k8s/tests/**'
+  # The SGLang manifests run only on the SGLang images; they belong to `sglang`.
+  - '!.ci/test/dynamo-heterog/k8s/tests/sglang/**'
   - '!**/*.md'
   - '!**/*.rst'
 
@@ -461,6 +463,10 @@ sglang:
   - 'container/templates/sglang_*'
   - 'container/templates/ffmpeg_encoder_guard.Dockerfile'
   - 'container/deps/sglang/**'
+  # SGLang heterog manifests and smoke pods, run by xpu-heterogeneous-run.yml's
+  # sglang-smoke and sglang-heterog-test jobs.
+  - '.ci/test/dynamo-heterog/k8s/tests/sglang/**'
+  - '.ci/test/dynamo-smoke/sglang/**'
   - '!**/*.md'
   - '!**/*.rst'
 
