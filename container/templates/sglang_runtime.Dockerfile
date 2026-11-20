@@ -99,13 +99,17 @@ RUN --mount=type=bind,source=./container/deps/sglang/xpu/mooncake-xpu-pin-store-
 # Which Debian packages the runtime needs: install both wheels here, ldd every
 # ELF file in them and in mooncake_master, and map each resolved library to its
 # owning package with dpkg -S. Packages the base already has, and any -dev
-# package, are dropped; an unresolved library ("not found") fails the build.
+# package, are dropped; a library no Debian package owns (torch/lib, oneAPI) is
+# skipped; an unresolved library ("not found") fails the build. torch/lib is put
+# on LD_LIBRARY_PATH for ldd only: LMCache's torch extensions link libtorch,
+# which a real process gets from `import torch`, not from the system paths.
 RUN pip install --no-cache-dir --no-deps /xpu-kv/*.whl && \
     SITE="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["platlib"])')" && \
     { find "$SITE/mooncake" "$SITE/lmcache" -type f \( -name '*.so' -o -name '*.so.*' -o -perm -u+x \) 2>/dev/null; \
       command -v mooncake_master || true; } | sort -u > /tmp/xpu-kv-elves.txt && \
+    TORCH_LIB="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')" && \
     : > /tmp/xpu-kv-ldd.txt && \
-    while read -r f; do ldd "$f" 2>/dev/null | sed "s|^|$f: |" >> /tmp/xpu-kv-ldd.txt || true; done < /tmp/xpu-kv-elves.txt && \
+    while read -r f; do LD_LIBRARY_PATH="$TORCH_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd "$f" 2>/dev/null | sed "s|^|$f: |" >> /tmp/xpu-kv-ldd.txt || true; done < /tmp/xpu-kv-elves.txt && \
     echo "=== ldd of the LMCache/Mooncake binaries" && cat /tmp/xpu-kv-ldd.txt && \
     if grep -q 'not found' /tmp/xpu-kv-ldd.txt; then echo "ERROR: unresolved libraries"; grep 'not found' /tmp/xpu-kv-ldd.txt; exit 1; fi && \
     grep -o '=> /[^ ]*' /tmp/xpu-kv-ldd.txt | cut -c4- | sort -u > /tmp/xpu-kv-libs.txt && \
@@ -113,7 +117,7 @@ RUN pip install --no-cache-dir --no-deps /xpu-kv/*.whl && \
     while read -r lib; do \
         for c in "$lib" "$(realpath "$lib")" "/usr$lib" "${lib#/usr}"; do \
             p=$(dpkg -S "$c" 2>/dev/null | head -n1 | cut -d: -f1) && [ -n "$p" ] && { echo "$p" >> /tmp/xpu-kv-pkgs.txt; break; }; \
-        done; \
+        done || true; \
     done < /tmp/xpu-kv-libs.txt && \
     sort -u /tmp/xpu-kv-pkgs.txt | grep -v -- '-dev$' | comm -23 - /tmp/base-dpkg.txt > /xpu-kv/runtime-apt.txt && \
     echo "=== runtime Debian packages for LMCache/Mooncake (not in the base)" && cat /xpu-kv/runtime-apt.txt
@@ -639,7 +643,8 @@ RUN pip list --format=freeze 2>/dev/null \
     python3 -c "import lmcache, opentelemetry.sdk.metrics" && \
     python3 -c "import torch, mooncake.engine; from mooncake.store import MooncakeDistributedStore" && \
     SITE="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["platlib"])')" && \
-    { find "$SITE/mooncake" "$SITE/lmcache" -type f \( -name '*.so' -o -name '*.so.*' \) -exec ldd {} + 2>/dev/null || true; } > /tmp/xpu-kv-ldd.txt && \
+    TORCH_LIB="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')" && \
+    { find "$SITE/mooncake" "$SITE/lmcache" -type f \( -name '*.so' -o -name '*.so.*' \) -exec env LD_LIBRARY_PATH="$TORCH_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd {} + 2>/dev/null || true; } > /tmp/xpu-kv-ldd.txt && \
     if grep -q 'not found' /tmp/xpu-kv-ldd.txt; then echo "ERROR: unresolved libraries in the runtime"; grep 'not found' /tmp/xpu-kv-ldd.txt; exit 1; fi && \
     pip list --format=freeze 2>/dev/null \
         | grep -i -E '^(torch|torchvision|torchaudio|triton|triton[-_]xpu|sglang|sgl[-_]kernel[-_a-z]*|nixl[-_a-z0-9]*)==' \
