@@ -8,7 +8,7 @@ name: XPU-Heterogeneous-Run
 # ============================================================================
 # guard -> changed-files -> build-xpu / build-nvidia -> resolve-images ->
 # heterog-test (vLLM matrix, 7 legs, max-parallel 1) -> sglang-smoke (matrix:
-# xpu, nvidia) -> sglang-heterog-test (SGLang matrix, 10 legs, max-parallel 1)
+# xpu, nvidia) -> sglang-heterog-test (SGLang matrix, 7 legs, max-parallel 1)
 # -> cleanup-images -> xpu-status-check (in the caller).
 #
 # The SGLang half has its own images, built by build-xpu-sglang and
@@ -1532,8 +1532,8 @@ jobs:
   #   omni-agg            GLM-Image AR + DiT on one XPU card, functional check.
   #                       Keep its test_name at 19 chars or fewer (oneCCL
   #                       hostname limit; see the manifest header).
-  # lmcache-agg, mooncake-store-agg and px-dx-mooncake need LMCache / Mooncake
-  # in the SGLang images; see the PR description for their image status.
+  # lmcache-agg, mooncake-store-agg and px-dx-mooncake are skipped for now (see
+  # the note in the matrix); the XPU image builds LMCache and Mooncake for them.
   sglang-heterog-test:
     name: ${{ matrix.title }}
     needs: [changed-files, build-xpu-sglang, build-nvidia-sglang, sglang-smoke]
@@ -1596,30 +1596,14 @@ jobs:
             pipeline_model: false
             expect_benchmark_result: true
             post_run_server_log_check: false
-          - test_name: sglang-px-dx-mooncake
-            title: "SGLang Heterog: XPU Prefill + XPU Decode over Mooncake"
-            test_yaml: px-dx-mooncake.yaml
-            xpu_resource_template: onexpu-rdma-vf-kueue
-            nvidia_resource_template: onenvidia-rdma-kueue
-            pipeline_model: false
-            expect_benchmark_result: true
-            post_run_server_log_check: true
-          - test_name: sglang-lmcache-agg
-            title: "SGLang XPU: LMCache aggregated"
-            test_yaml: lmcache_agg.yaml
-            xpu_resource_template: onexpu-rdma-kueue
-            nvidia_resource_template: onenvidia-rdma-kueue
-            pipeline_model: false
-            expect_benchmark_result: false
-            post_run_server_log_check: true
-          - test_name: sglang-mooncake-store-agg
-            title: "SGLang XPU: Mooncake Store aggregated"
-            test_yaml: mooncake_store_agg.yaml
-            xpu_resource_template: onexpu-rdma-kueue
-            nvidia_resource_template: onenvidia-rdma-kueue
-            pipeline_model: false
-            expect_benchmark_result: false
-            post_run_server_log_check: true
+          # Skipped for now (PR #123, 2026-11-20): sglang-px-dx-mooncake,
+          # sglang-lmcache-agg and sglang-mooncake-store-agg. Their manifests
+          # stay in tests/sglang/ (px-dx-mooncake.yaml, lmcache_agg.yaml,
+          # mooncake_store_agg.yaml) and the XPU image still carries LMCache and
+          # Mooncake; re-add the three legs here to run them again:
+          #   sglang-px-dx-mooncake      onexpu-rdma-vf-kueue, bench + post-run check
+          #   sglang-lmcache-agg         onexpu-rdma-kueue, post-run check only
+          #   sglang-mooncake-store-agg  onexpu-rdma-kueue, post-run check only
           - test_name: sglang-omni-agg
             title: "SGLang Omni: AR + DiT aggregated on XPU (GLM-Image)"
             test_yaml: omni_ar-dit_agg.yaml
