@@ -651,26 +651,6 @@ RUN pip list --format=freeze 2>/dev/null \
         | sort | diff /tmp/xpu-kv-pins.txt - && \
     echo "torch/sglang/NIXL stack intact after LMCache + Mooncake" && \
     rm -rf /tmp/xpu-kv /tmp/xpu-kv-pins.txt /tmp/xpu-kv-ldd.txt
-
-# SGLang v0.5.23 hard-codes torch.cuda.Event() in disaggregated prefill
-# (maybe_send_cached_prefix_chunk and the Mooncake indices event), which kills
-# the XPU prefill scheduler on the first prefix-cache hit. Apply the source part
-# of upstream sgl-project/sglang#43299 (see the patch header). --forward makes an
-# already-applied patch fail the build: that is the signal to drop it once the
-# base image carries the fix. The grep proves no CUDA-only event is left;
-# py_compile proves the patched files still parse. (Not an import: importing
-# sglang.srt.disaggregation.* outside a running server pulls the whole stack and
-# stops on tvm_ffi, which the real server never needs on this path.)
-RUN --mount=type=bind,source=./container/deps/sglang/xpu/sglang-pr43299-xpu-disagg-event.patch,target=/tmp/sglang-pr43299.patch,readonly \
-    SITE="$(python3 -c 'import os, sglang; print(os.path.dirname(os.path.dirname(sglang.__file__)))')" && \
-    cd "$SITE" && \
-    patch -p2 --forward --batch < /tmp/sglang-pr43299.patch && \
-    if grep -n -E 'torch\.cuda\.(Event|current_stream)\(' sglang/srt/disaggregation/prefill.py; then \
-        echo "ERROR: CUDA-only event/stream calls left in disaggregation/prefill.py"; exit 1; \
-    fi && \
-    find sglang/srt/disaggregation -name '*.orig' -delete && \
-    python3 -m py_compile sglang/srt/disaggregation/prefill.py sglang/srt/disaggregation/common/conn.py sglang/srt/disaggregation/nixl/conn.py && \
-    echo "sglang#43299 applied"
 SHELL ["/bin/sh", "-c"]
 {% endif %}
 
