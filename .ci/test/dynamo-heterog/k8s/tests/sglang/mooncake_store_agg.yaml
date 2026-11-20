@@ -1,0 +1,555 @@
+# mooncake-store-agg Test (sglang): Mooncake Store KV offload/retrieve with Dynamo (aggregated, XPU)
+# The sglang counterpart of vllm/mooncake_store_agg.yaml: one aggregated dynamo.sglang
+# worker with HiCache (--enable-hierarchical-cache) and Mooncake as its L3 storage
+# backend. The pod runs its own mooncake_master and the worker contributes the Store
+# segment (embedded mode), so no Mooncake service is needed. Plain TCP: the store
+# moves HiCache's host-pool pages, never XPU memory, so no NIC bandwidth is claimed.
+# sglang serves a repeated prefix from its device (L1) and host (L2) tiers first,
+# so the post-run check flushes both through /engine/flush_cache (which leaves L3
+# alone), replays request 2, and requires the prefix to come back from Mooncake.
+#
+# Usage:
+#   export DOCKER_IMAGE_XPU="..." XPU_RESOURCE_TEMPLATE="..." XPU_NODE="..."
+#   export TEST_NAME="sglang-mooncake-store-agg" MODEL="" TENSOR_PARALLEL=""
+#   kubectl apply -f <(envsubst < mooncake_store_agg.yaml) -n dynamo-system
+#
+# Cleanup:
+#   kubectl delete -f <(envsubst < mooncake_store_agg.yaml) -n dynamo-system
+---
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: ${TEST_NAME}
+  namespace: dynamo-system
+spec:
+  backendFramework: sglang
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "2"
+      extraPodSpec:
+        nodeSelector:
+          dynamo.intel.com/node: ${XPU_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+        mainContainer:
+          image: ${DOCKER_IMAGE_XPU}
+          env:
+            - name: DYN_STORE_KV
+              value: "mem"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: PYTHONHASHSEED
+              value: "0"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+
+    # Aggregated worker: no --disaggregation-mode -> registers as backend.generate.
+    # HiCache writes every inserted page through to host memory and on to Mooncake.
+    Backend:
+      componentType: worker
+      replicas: 1
+      extraPodMetadata:
+        labels:
+          kueue.x-k8s.io/queue-name: dynamo-queue
+          kueue.x-k8s.io/pod-group-name: ${TEST_NAME}
+        annotations:
+          kueue.x-k8s.io/pod-group-total-count: "2"
+      extraPodSpec:
+        nodeSelector:
+          dynamo.intel.com/node: ${XPU_NODE}
+        imagePullSecrets:
+          - name: amr-caas-registry
+        volumes:
+          - name: pytorch-models
+            hostPath:
+              path: /software/data/pytorch
+              type: Directory
+          - name: weka-models
+            hostPath:
+              path: /mnt/weka
+              type: Directory
+        resourceClaims:
+          - name: intel-gpu-rdma-resource
+            resourceClaimTemplateName: ${XPU_RESOURCE_TEMPLATE}
+        mainContainer:
+          image: ${DOCKER_IMAGE_XPU}
+          workingDir: /workspace
+          command:
+            - /bin/bash
+            - -c
+            - |
+              # The image sets oneAPI up only in its ENTRYPOINT, which command: bypasses.
+              source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+              export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+              xpu-smi discovery || true
+              # Store config, read by sglang from SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.
+              # Embedded mode: this worker contributes the 4 GB segment to its in-pod master.
+              printf '%s' '{"local_hostname": "localhost", "metadata_server": "P2PHANDSHAKE", "master_server_address": "127.0.0.1:50051", "protocol": "tcp", "device_name": "", "global_segment_size": "4gb"}' > "$SGLANG_HICACHE_MOONCAKE_CONFIG_PATH"
+              mooncake_master --rpc_port 50051 > /tmp/mooncake_master.log 2>&1 &
+              # write_through backs every inserted page up to host and storage at once;
+              # wait_complete makes a request wait for its storage prefetch, so a
+              # replay cannot start before the L3 hit has landed. --hicache-size (GB)
+              # caps the host pool; the default ratio would pin 2x the device KV.
+              # --hicache-io-backend direct: the kernel backend's kvcacheio ops are CUDA-only.
+              python -m dynamo.sglang \
+                --model-path ${MODEL:-Qwen/Qwen3-0.6B} \
+                --tp-size ${TENSOR_PARALLEL:-1} \
+                --device xpu \
+                --attention-backend intel_xpu \
+                --dtype bfloat16 \
+                --page-size 64 \
+                --mem-fraction-static 0.7 \
+                --disable-cuda-graph \
+                --enable-hierarchical-cache \
+                --hicache-size 4 \
+                --hicache-write-policy write_through \
+                --hicache-io-backend direct \
+                --hicache-storage-backend mooncake \
+                --hicache-storage-prefetch-policy wait_complete \
+                --engine-route flush_cache:tm
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - "IPC_LOCK"
+                - "SYS_PTRACE"
+                - "SYS_ADMIN"
+                - "SYS_RAWIO"
+          env:
+            - name: MODEL
+              value: "$MODEL"
+            - name: TENSOR_PARALLEL
+              value: "$TENSOR_PARALLEL"
+            - name: SGLANG_HICACHE_MOONCAKE_CONFIG_PATH
+              value: /tmp/mooncake_store.json
+            - name: DYN_STORE_KV
+              value: "mem"
+            - name: DYN_REQUEST_PLANE
+              value: "tcp"
+            - name: PYTHONHASHSEED
+              value: "0"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HF_HUB_OFFLINE
+              value: "0"
+          resources:
+            claims:
+              - name: intel-gpu-rdma-resource
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true
+
+# Post-run verification, executed on the runner by the template's "Post-run server
+# log parser" step (post_run_server_log_check: true). TEST_NAME is substituted at
+# deploy time; NS defaults to dynamo-system.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${TEST_NAME}-post-run-checks
+  namespace: dynamo-system
+data:
+  verify.sh: |
+    #!/usr/bin/env bash
+    # Runs on the RUNNER (kubectl available). Verifies that the aggregated sglang
+    # worker's HiCache stored KV in Mooncake and loaded it back after its device and
+    # host tiers were flushed. Exit 0 = pass, non-zero = fail.
+    set -uo pipefail
+    TEST_NAME="${TEST_NAME:?TEST_NAME must be set by the caller}"
+    NS="${NS:-dynamo-system}"
+    echo "========================================="
+    echo "sglang HiCache + Mooncake Store verification (runner)"
+    echo "========================================="
+    # ---- shared: flush the worker's device/host cache, then replay request 2 ----
+    # sglang serves a repeated prefix from its own radix cache before any external
+    # tier is asked, so reuse from that tier is only observable after a flush.
+    PODS=$(kubectl get pods -n "$NS" -l nvidia.com/dynamo-graph-deployment-name="$TEST_NAME" -o name 2>/dev/null)
+    WORKER_POD=$(echo "$PODS" | grep -iE 'backend|worker' | head -n1)
+    FRONTEND_POD=$(echo "$PODS" | grep -i frontend | head -n1)
+    if [ -z "$WORKER_POD" ] || [ -z "$FRONTEND_POD" ]; then
+      echo "ERROR: could not locate the worker and frontend pods"; echo "$PODS"; exit 1
+    fi
+    MAIN=$(kubectl get -n "$NS" "$WORKER_POD" -o jsonpath='{.spec.containers[0].name}')
+    echo "Worker pod: $WORKER_POD (container $MAIN); frontend pod: $FRONTEND_POD"
+    worker_log() { kubectl logs -n "$NS" "$WORKER_POD" -c "$MAIN" --tail=-1 2>/dev/null; }
+
+    # Printed by the bench Job between @@ci-artifact markers; the template's
+    # post-run step cuts it out of the bench pod's log into POD_LOG_DIR, a
+    # runner-local directory, before it runs this script.
+    REPLAY_BODY="${POD_LOG_DIR:-}/replay-request-body.json"
+    if [ ! -s "$REPLAY_BODY" ]; then
+      echo "ERROR: replay request body not found at $REPLAY_BODY (bench Job did not write it?)"; exit 1
+    fi
+
+    # Only the scheduler's own flush_cache (exposed by --engine-route flush_cache:tm):
+    # it resets the radix tree and host pool but leaves external stores alone.
+    flush_device_cache() {
+      local out i
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        out=$(kubectl exec -n "$NS" "$WORKER_POD" -c "$MAIN" -- python3 -c '
+    import os, urllib.request
+    port = os.environ.get("DYN_SYSTEM_PORT", "9090")
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/engine/flush_cache", data=b"{}",
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    print(opener.open(req, timeout=120).read().decode())' 2>&1)
+        echo "  flush attempt $i: $out"
+        echo "$out" | grep -qE '"success": *true' && return 0
+        sleep 6
+      done
+      return 1
+    }
+
+    # Through the frontend, exactly as the bench sent it; body on stdin.
+    replay_request() {
+      kubectl exec -i -n "$NS" "$FRONTEND_POD" -- python3 -c '
+    import sys, urllib.request
+    req = urllib.request.Request("http://127.0.0.1:8000/v1/completions", data=sys.stdin.buffer.read(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    print(opener.open(req, timeout=300).read().decode())' < "$REPLAY_BODY"
+    }
+
+    # Sum of #cached-token over the "Prefill batch" lines of a log slice.
+    cached_tokens() { grep -E "Prefill batch" | grep -oE "#cached-token: [0-9]+" | grep -oE '[0-9]+' | awk '{s+=$1} END {printf "%d", s+0}'; }
+
+    W_BEFORE=$(worker_log | wc -l)
+    echo "--- flushing the worker's device cache ---"
+    flush_ok=false; flush_device_cache && flush_ok=true
+    echo "--- replaying request 2 through the frontend ---"
+    replay_ok=false
+    if REPLAY_OUT=$(replay_request 2>&1) && echo "$REPLAY_OUT" | grep -q '"choices"'; then replay_ok=true; fi
+    echo "  replay response: $(echo "$REPLAY_OUT" | head -c 600)"
+    [ -n "${POD_LOG_DIR:-}" ] && printf '%s\n' "$REPLAY_OUT" > "$POD_LOG_DIR/replay_response.json" 2>/dev/null || true
+    sleep 10
+    WLOG_AFTER=$(mktemp)
+    worker_log | tail -n +"$((W_BEFORE + 1))" > "$WLOG_AFTER"
+    echo "--- worker scheduler lines after the flush (OBSERVED) ---"
+    grep -E "Cache flushed|Prefill batch" "$WLOG_AFTER" || echo "<none>"
+    POST_CACHED=$(cached_tokens < "$WLOG_AFTER")
+    flushed_logged=false; grep -q "Cache flushed successfully" "$WLOG_AFTER" && flushed_logged=true
+    # ---- end shared ----
+    WLOG=$(mktemp); worker_log > "$WLOG"
+    echo "--- HiCache / Mooncake startup lines (OBSERVED) ---"
+    grep -E "hicache_attached=|Mooncake (store|Configuration)|hicache_write_policy" "$WLOG" || echo "<none>"
+    ERR_RE="Failed to setup Mooncake store|Failed to register buffer|Launch mooncake store server timeout|Configuration loading failed|Traceback"
+    ERRS=$(grep -cE "$ERR_RE" "$WLOG" || true)
+
+    # Pass criteria (after the flush, L1 and L2 are empty, so a cached prefix on the
+    # replay can only have been prefetched from Mooncake):
+    #  1) HiCache has a host tier and the Mooncake store came up. ("Attaching
+    #     HiCache storage backend" is only logged by the runtime attach endpoint,
+    #     never for a backend given at launch.)
+    #  2) the device/host cache was flushed            (route success + "Cache flushed")
+    #  3) the replay succeeded through the frontend
+    #  4) the replay's prefill reused stored KV         (post-flush #cached-token > 0)
+    #  5) no store setup/registration error or traceback
+    attach_ok=false; flush_all_ok=false; cached_ok=false; clean_ok=false
+    grep -q "hicache_attached=True" "$WLOG" && grep -q "Mooncake store setup successfully" "$WLOG" && attach_ok=true
+    [ "$flush_ok" = true ] && [ "$flushed_logged" = true ] && flush_all_ok=true
+    [ "$POST_CACHED" -gt 0 ] && cached_ok=true
+    [ "${ERRS:-0}" -eq 0 ] && clean_ok=true
+
+    echo ""
+    echo "=== sglang Mooncake Store verification (EXPECTED vs OBSERVED) ==="
+    echo "[1/5] Mooncake backend attached   EXPECTED attach + setup lines          OBSERVED $attach_ok"
+    echo "[2/5] Device/host cache flushed   EXPECTED route success + log line      OBSERVED route=$flush_ok log=$flushed_logged  -> $flush_all_ok"
+    echo "[3/5] Replay succeeded            EXPECTED a completion with choices     OBSERVED $replay_ok"
+    echo "[4/5] Replay loaded from Mooncake EXPECTED post-flush #cached-token > 0  OBSERVED $POST_CACHED  -> $cached_ok"
+    echo "[5/5] No store errors             EXPECTED 0 lines /$ERR_RE/             OBSERVED ${ERRS:-0}  -> $clean_ok"
+    echo "=================================================================="
+    if [ "$attach_ok" = true ] && [ "$flush_all_ok" = true ] && [ "$replay_ok" = true ] \
+       && [ "$cached_ok" = true ] && [ "$clean_ok" = true ]; then
+      echo "sglang Mooncake Store test PASSED"; exit 0
+    fi
+    echo "ERROR: sglang Mooncake Store test FAILED (attach_ok=$attach_ok flush_ok=$flush_all_ok replay_ok=$replay_ok cached_ok=$cached_ok clean_ok=$clean_ok)"
+    echo "--- worker lines mentioning HiCache/Mooncake/errors (for triage) ---"
+    grep -iE "hicache|mooncake|prefetch|Traceback|Error" "$WLOG" | tail -40 || true
+    echo "--- mooncake_master log tail ---"
+    kubectl exec -n "$NS" "$WORKER_POD" -c "$MAIN" -- tail -20 /tmp/mooncake_master.log 2>/dev/null || true
+    exit 1
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${TEST_NAME}-bench
+  namespace: dynamo-system
+  labels:
+    kueue.x-k8s.io/queue-name: dynamo-queue
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        kueue.x-k8s.io/queue-name: dynamo-queue
+        app.kubernetes.io/name: ${TEST_NAME}-bench
+        app.kubernetes.io/part-of: sglang-mooncake-store-agg
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${TEST_NAME}-k8s-service-discovery
+      nodeSelector:
+        dynamo.intel.com/node: ${XPU_NODE}
+      imagePullSecrets:
+        - name: amr-caas-registry
+      volumes:
+        - name: pytorch-models
+          hostPath:
+            path: /software/data/pytorch
+            type: Directory
+        - name: weka-models
+          hostPath:
+            path: /mnt/weka
+            type: Directory
+      containers:
+        - name: benchmark-runner
+          image: ${DOCKER_IMAGE_XPU}
+          workingDir: /workspace
+          command:
+            - /bin/sh
+            - -c
+            - |
+              FRONTEND_HOST="${TEST_NAME}-frontend.dynamo-system.svc.cluster.local"
+
+              # The model this Job benchmarks. MODEL is empty when the workflow
+              # passes no model input, so this test's own default is applied here,
+              # by the shell, where `:-` means something -- envsubst does not
+              # implement it. The result is held under a DIFFERENT name because
+              # every `$MODEL` in this script is substituted at render time (MODEL
+              # is in envsubst's variable list) and would arrive already empty;
+              # `$MODEL_PATH` is not in that list, so it survives to the shell.
+              MODEL_PATH="${MODEL:-Qwen/Qwen3-0.6B}"
+
+              # Anything this Job wants in the run artifact goes in $ARTIFACT_DIR;
+              # save_artifacts prints each file into this pod's log between
+              # "@@ci-artifact-begin <name>" / "@@ci-artifact-end <name>" lines, and
+              # the workflow's "Stage all logs for upload" step cuts them back out
+              # into bench/<name>. Called on every exit path via the trap below,
+              # and again right after the curl test (a SIGKILL later runs no
+              # trap); the workflow keeps the last copy.
+              ARTIFACT_DIR=/tmp/ci-artifacts
+              mkdir -p "$ARTIFACT_DIR"
+              save_artifacts() {
+                for f in "$ARTIFACT_DIR"/*; do
+                  [ -f "$f" ] || continue
+                  name=$(basename "$f")
+                  case "$name" in
+                    *.png)
+                      # Binary: base64 here, decoded by the workflow.
+                      echo "@@ci-artifact-begin-b64 $name"
+                      base64 "$f"
+                      ;;
+                    *)
+                      echo "@@ci-artifact-begin $name"
+                      cat "$f"
+                      # An end marker glued onto an unterminated last line is lost.
+                      if [ -n "$(tail -c1 "$f")" ]; then echo; fi
+                      ;;
+                  esac
+                  echo "@@ci-artifact-end $name"
+                done
+              }
+              trap save_artifacts EXIT
+
+              echo "========================================="
+              echo "Endpoint and FrontEnd Health Check"
+              echo "========================================="
+
+              echo "Waiting for the aggregated worker endpoint to be registered..."
+              timeout_sec=600
+              poll_sec=30
+              max_attempts=$((timeout_sec / poll_sec))
+              workers_ready=false
+              for attempt in $(seq 1 "$max_attempts"); do
+                # ?instances=true: Dynamo >= #16454 lists endpoints only on request;
+                # older frontends ignore the query.
+                health_response=$(curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health?instances=true" 2>/dev/null || echo "")
+                has_backend=$(echo "$health_response" | grep -c "${TEST_NAME}.*backend.generate" || true)
+                frontend_status=$(echo "$health_response" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+
+                if [ "$has_backend" -gt 0 ] && [ "$frontend_status" = "healthy" ]; then
+                  echo "Worker endpoint registered (attempt ${attempt}/${max_attempts})"
+                  workers_ready=true
+                  break
+                fi
+                echo "Attempt ${attempt}/${max_attempts}: waiting for backend worker (backend=$has_backend, status=$frontend_status)"
+                sleep "$poll_sec"
+              done
+
+              if [ "$workers_ready" != "true" ]; then
+                echo "ERROR: timeout waiting for worker endpoint"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/health?instances=true" || true
+                exit 1
+              fi
+
+              echo "========================================="
+              echo "Model Registration Check"
+              echo "========================================="
+              model_ready=false
+              timeout_sec=180
+              poll_sec=15
+              max_attempts=$((timeout_sec / poll_sec))
+              for attempt in $(seq 1 "$max_attempts"); do
+                if curl --noproxy '*' -sf "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models" 2>/dev/null | grep -Fq '"id":"'; then
+                  echo "Model registration check passed (attempt ${attempt}/${max_attempts})"
+                  model_ready=true
+                  break
+                fi
+                echo "Attempt ${attempt}/${max_attempts}: model not registered yet"
+                sleep "$poll_sec"
+              done
+
+              if [ "$model_ready" != "true" ]; then
+                echo "ERROR: timeout waiting for model registration"
+                curl --noproxy '*' -sS "http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/models" || true
+                exit 1
+              fi
+
+              # ---- Mooncake Store functionality: two overlapping requests ----
+              # Request 2's prompt is a superset of request 1's, so its leading
+              # blocks must load the KV that request 1 stored in Mooncake. The store
+              # keys whole 64-token pages (--page-size 64), so the shared passage is
+              # several pages long.
+              PASSAGE="Disaggregated serving splits a large language model request into a prefill phase, which reads the whole prompt and builds the key-value cache, and a decode phase, which generates one token at a time while reading that cache. The key-value cache grows with every prompt token, so for long prompts it is large, and recomputing it is the most expensive part of answering a request whose beginning has been seen before. A KV cache store keeps those blocks outside the accelerator, in host memory or on another machine, so that a later request with the same prefix can load them instead of recomputing them. Mooncake is one such store: a master tracks which blocks exist and where they live, clients put blocks into memory segments contributed by the serving processes, and a transfer engine moves the bytes between devices, host memory and the network. When a request arrives, the serving engine hashes its prompt in fixed-size blocks, asks the store which of those hashes it already holds, and loads the longest run of matching blocks before it computes the rest. The quality of that reuse depends on the prompts sharing an exact prefix, on the block size, and on how long the store keeps blocks before evicting them to make room for new ones."
+              PROMPT1="${PASSAGE} The capital city of France is"
+              PROMPT2="${PASSAGE} The capital city of France is Paris. The capital city of Italy is"
+
+              CURL_LOG="$ARTIFACT_DIR/curl_test.log"
+              PROMPT_LOG="$ARTIFACT_DIR/input-prompt-curl-req.log"
+              ENDPOINT="http://${FRONTEND_HOST}:${FRONTEND_PORT}/v1/completions"
+
+              # Applied to both requests by the quality check step: each prompt ends
+              # on px-dn's closed factual prefix (a Question/Answer framing made the
+              # cold request loop on "The answer is correct."). Truncating write, so the log
+              # starts here and the requests below append.
+              {
+                echo "expected-keywords: min 1 of Paris, Rome"
+                echo ""
+              } | tee "$PROMPT_LOG"
+
+              # Each response goes to its own file as well as to this container's
+              # stdout, so the run artifact carries the bodies and not just the
+              # `kubectl logs` transcript. tee per command rather than piping the
+              # whole block: a pipeline would put the requests in a subshell and
+              # swallow the exit status this test gates on.
+              run_completion() {
+                idx="$1"
+                label="$2"
+                prompt="$3"
+                body="$ARTIFACT_DIR/curl_response_${idx}.json"
+                {
+                  echo "========================================="
+                  echo "Mooncake Store request ${idx} (${label}) - $(date)"
+                  echo "========================================="
+                } 2>&1 | tee -a "$CURL_LOG"
+                # Sent from one variable and logged from the same one, so the
+                # logged prompt cannot drift from what went on the wire. Both
+                # requests append: request 2's prompt is deliberately a superset
+                # of request 1's, and seeing both is what makes an offload/hit
+                # result readable after the fact. Greedy, so the text depends on
+                # the model rather than on one frozen sampled draw.
+                request_body="{\"model\": \"${MODEL_PATH}\", \"prompt\": \"${prompt}\", \"max_tokens\": 100, \"temperature\": 0}"
+                {
+                  echo "endpoint: POST $ENDPOINT"
+                  echo "request ${idx} (${label}) body:"
+                  printf '%s\n' "$request_body"
+                } | tee -a "$PROMPT_LOG" | tee -a "$CURL_LOG"
+
+                # curl's stderr to a file, not through a pipe: piping would make
+                # tee's exit status the one tested here and -f's HTTP-error
+                # detection would be lost.
+                err="/tmp/curl_stderr_${idx}.txt"
+                curl --noproxy '*' -fsS -X POST "$ENDPOINT" \
+                  -H "Content-Type: application/json" \
+                  -d "$request_body" \
+                  -o "$body" 2>"$err"
+                rc=$?
+                [ -s "$err" ] && tee -a "$CURL_LOG" < "$err"
+                if [ "$rc" -eq 0 ]; then
+                  tee -a "$CURL_LOG" < "$body"
+                  echo "" | tee -a "$CURL_LOG"
+                  return 0
+                fi
+                echo "ERROR: Mooncake Store request ${idx} failed (curl exit $rc)" | tee -a "$CURL_LOG"
+                [ -s "$body" ] && tee -a "$CURL_LOG" < "$body"
+                return 1
+              }
+
+              run_completion 1 "store" "$PROMPT1" || exit 1
+
+              # Saves are asynchronous; give the store put time to land before request 2.
+              sleep 10
+
+              run_completion 2 "load + store tail" "$PROMPT2" || exit 1
+
+              # Replayed by the post-run check once it has flushed the worker's
+              # device cache, to show the prefix returns from the external tier.
+              printf '%s\n' "{\"model\": \"${MODEL_PATH}\", \"prompt\": \"${PROMPT2}\", \"max_tokens\": 16, \"temperature\": 0}" > "$ARTIFACT_DIR/replay-request-body.json"
+
+              # In this pod's log before the post-run worker-log check, which
+              # runs on the runner, reads replay-request-body.json from it and can
+              # fail this job.
+              save_artifacts
+
+              # write_through backs pages up to Mooncake asynchronously; give the
+              # backup thread time to drain before the runner flushes the cache.
+              sleep 25
+
+              # Mooncake Store verification (flush, replay, worker log) is done on the runner in the template's
+              # "Post-run server log parser" step (the bench container has no kubectl
+              # and cannot read the worker pod logs). The runner runs the script in the
+              # ${TEST_NAME}-post-run-checks ConfigMap defined in this same file.
+              echo "Both Mooncake Store requests sent; worker-log verification runs on the runner."
+          env:
+            - name: FRONTEND_PORT
+              value: "8000"
+            - name: MODEL
+              value: "$MODEL"
+            - name: HF_HOME
+              value: /models/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /models/huggingface/hub
+            - name: HF_HUB_OFFLINE
+              value: "0"
+          volumeMounts:
+            - name: pytorch-models
+              mountPath: /models
+            - name: weka-models
+              mountPath: /mnt/weka
+              readOnly: true

@@ -1,0 +1,93 @@
+SGLang disaggregated prefill on non-CUDA devices: create the early-send wait
+event with self.device_module.Event() instead of torch.cuda.Event(), and make
+the NIXL sender wait on it. Source part of sgl-project/sglang#43299
+(b9407b44c7, merged 2026-10-29), which the v0.5.23 release does not contain.
+
+Without it the XPU prefill scheduler dies with "Tried to instantiate dummy base
+class Event" at prefill.py maybe_send_cached_prefix_chunk / the Mooncake
+indices event, on the first request that hits the prefix cache (PR #123 run
+44677422589: sglang-px-dn, -px-dx, -px-dn-tp2, -px-dx-mooncake). Applied with
+patch -p2 in site-packages by templates/sglang_runtime.Dockerfile (XPU only).
+Drop it once the lmsysorg/sglang XPU base carries #43299 (the build fails on
+an already-applied patch, which is the signal).
+
+diff --git a/python/sglang/srt/disaggregation/common/conn.py b/python/sglang/srt/disaggregation/common/conn.py
+index 2c4e40c0be6d..631b7dc993b3 100644
+--- a/python/sglang/srt/disaggregation/common/conn.py
++++ b/python/sglang/srt/disaggregation/common/conn.py
+@@ -2322,8 +2322,8 @@ def send(
+         ):
+             self._transfer_start_time = time.perf_counter()
+ 
+-        # The early-send event belongs to exactly one chunk; the Mooncake and
+-        # Mori workers synchronize on it before reading source KV.
++        # The early-send event belongs to exactly one chunk; the Mooncake, Mori
++        # and NIXL workers synchronize on it before reading source KV.
+         wait_event = self._early_send_wait_event
+         self._early_send_wait_event = None
+         self.kv_mgr.add_transfer_request(
+diff --git a/python/sglang/srt/disaggregation/nixl/conn.py b/python/sglang/srt/disaggregation/nixl/conn.py
+index b35e29730732..6ec4fe303f2e 100644
+--- a/python/sglang/srt/disaggregation/nixl/conn.py
++++ b/python/sglang/srt/disaggregation/nixl/conn.py
+@@ -1604,6 +1604,9 @@ def transfer_worker(self, queue: FastQueue, staging_buffer=None, worker_index=0)
+         # see kv_buffer_tensors (set by ModelRunner after engine init).
+         # Never cache on self -- multiple workers would race the ring.
+         staging_strategy = None
++        # The early-send wait is this thread's first device call; with no device
++        # bound it opens a context on device 0 on every rank not on GPU 0.
++        device_bound = False
+ 
+         while True:
+             kv_chunk: TransferKVChunk = queue.get()
+@@ -1631,6 +1634,18 @@ def transfer_worker(self, queue: FastQueue, staging_buffer=None, worker_index=0)
+                     self._staging_outstanding[room] += 1
+                     kv_chunk.staging_counted = True
+ 
++                # Same wait as mooncake's worker: before reading source KV, skipped
++                # for a failed room, cleared so a deferred re-enqueue does not wait.
++                if kv_chunk.wait_event is not None:
++                    if self.check_status(room) != KVPoll.Failed:
++                        if not device_bound:
++                            torch.get_device_module(get_device().device).set_device(
++                                self.kv_args.gpu_id
++                            )
++                            device_bound = True
++                        kv_chunk.wait_event.synchronize()
++                    kv_chunk.wait_event = None
++
+                 if self.check_status(room) == KVPoll.Failed:
+                     self._staging_outstanding.pop(room, None)
+                     if self.enable_deferred_decode_kv_release:
+@@ -3301,6 +3316,7 @@ def add_transfer_request(
+                 prefill_aux_index=aux_index,
+                 state_indices=state_indices,
+                 num_kv_tokens=num_kv_tokens,
++                wait_event=wait_event,
+             )
+         )
+         return None
+diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
+index ccc089181892..424498e713bd 100644
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -1498,7 +1498,7 @@ def maybe_send_cached_prefix_chunk(
+         # event now so the transfer worker can wait on those writes before the
+         # RDMA read, instead of racing them.
+         if self.enable_overlap:
+-            ev = torch.cuda.Event()
++            ev = self.device_module.Event()
+             ev.record(self.forward_stream)
+             req.disagg_kv_sender._early_send_wait_event = ev
+         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+@@ -1770,8 +1770,8 @@ def _request_row_payload():
+                     pin_memory=True,
+                 )
+                 page_indices.copy_(page_indices_dev, non_blocking=True)
+-                indices_event = torch.cuda.Event()
+-                indices_event.record(torch.cuda.current_stream())
++                indices_event = self.device_module.Event()
++                indices_event.record(self.device_module.current_stream())
+             else:
+                 page_indices = kv_to_page_indices(kv_indices, page_size)
+             segment_is_last = last_chunk and is_final_segment
