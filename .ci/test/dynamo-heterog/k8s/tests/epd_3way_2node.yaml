@@ -189,11 +189,6 @@ spec:
               value: "0"
             - name: VLLM_LOGGING_LEVEL
               value: "INFO"
-            # V2 model runner's _dummy_run has no mm_encoder_only guard, so profiling
-            # executes the language model whose weights are Meta tensors in
-            # --disaggregation-mode=encode (rms_norm has no Meta kernel).
-            - name: VLLM_USE_V2_MODEL_RUNNER
-              value: "0"
           resources:
             claims:
               - name: intel-gpu-rdma-resource

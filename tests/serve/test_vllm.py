@@ -49,6 +49,7 @@ from tests.utils.payloads import (
     CompletionPayload,
     EmbeddingMultiWorkerDispatchPayload,
     EmbeddingPayload,
+    HttpErrorPayload,
     ToolCallingChatPayload,
 )
 
@@ -195,10 +196,6 @@ vllm_configs = {
         # max_thinking_tokens payload below: vLLM only enables the thinking-
         # budget logits processor when reasoning_config is populated.
         script_args=["--reasoning-parser", "qwen3"],
-        # vLLM #43808 (0.23.0) moved the MRv2 thinking_token_budget check from
-        # startup to request time, removing the auto-fallback to V1. Force V1
-        # runner here until native MRv2 support is added.
-        env={"VLLM_USE_V2_MODEL_RUNNER": "0"},
         marks=[
             pytest.mark.core,
             pytest.mark.gpu_1,
@@ -743,6 +740,19 @@ vllm_configs = {
         ],
         model="Qwen/Qwen3-0.6B",
         request_payloads=[
+            # An uncompilable grammar (regex lookahead) must return 400, not 500;
+            # the valid-grammar payloads after it show the worker still serves.
+            HttpErrorPayload(
+                body={
+                    "messages": [{"role": "user", "content": "Say a."}],
+                    "max_tokens": 5,
+                    "guided_regex": "(?=a)a",
+                },
+                expected_response=[],
+                expected_log=[],
+                endpoint="/v1/chat/completions",
+                timeout=10,
+            ),
             chat_payload(
                 "Generate a person with name and age",
                 repeat_count=1,
@@ -970,6 +980,18 @@ vllm_configs = {
         ],
     ),
 }
+
+# The embedding worker pool depends on vLLM internals; check it post-merge so a
+# vLLM change that breaks it fails main's CI without adding PR CI time.
+vllm_configs["embedding_agg_multiprocess"] = dataclasses.replace(
+    vllm_configs["embedding_agg"],
+    name="embedding_agg_multiprocess",
+    script_args=["--embedding-worker-processes", "2"],
+    marks=[
+        mark for mark in vllm_configs["embedding_agg"].marks if mark.name != "pre_merge"
+    ]
+    + [pytest.mark.post_merge],
+)
 
 
 @pytest.fixture(params=params_with_model_mark(vllm_configs))
