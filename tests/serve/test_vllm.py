@@ -49,6 +49,7 @@ from tests.utils.payloads import (
     CompletionPayload,
     EmbeddingMultiWorkerDispatchPayload,
     EmbeddingPayload,
+    HttpErrorPayload,
     ToolCallingChatPayload,
 )
 
@@ -739,6 +740,19 @@ vllm_configs = {
         ],
         model="Qwen/Qwen3-0.6B",
         request_payloads=[
+            # An uncompilable grammar (regex lookahead) must return 400, not 500;
+            # the valid-grammar payloads after it show the worker still serves.
+            HttpErrorPayload(
+                body={
+                    "messages": [{"role": "user", "content": "Say a."}],
+                    "max_tokens": 5,
+                    "guided_regex": "(?=a)a",
+                },
+                expected_response=[],
+                expected_log=[],
+                endpoint="/v1/chat/completions",
+                timeout=10,
+            ),
             chat_payload(
                 "Generate a person with name and age",
                 repeat_count=1,
@@ -966,6 +980,18 @@ vllm_configs = {
         ],
     ),
 }
+
+# The embedding worker pool depends on vLLM internals; check it post-merge so a
+# vLLM change that breaks it fails main's CI without adding PR CI time.
+vllm_configs["embedding_agg_multiprocess"] = dataclasses.replace(
+    vllm_configs["embedding_agg"],
+    name="embedding_agg_multiprocess",
+    script_args=["--embedding-worker-processes", "2"],
+    marks=[
+        mark for mark in vllm_configs["embedding_agg"].marks if mark.name != "pre_merge"
+    ]
+    + [pytest.mark.post_merge],
+)
 
 
 @pytest.fixture(params=params_with_model_mark(vllm_configs))
