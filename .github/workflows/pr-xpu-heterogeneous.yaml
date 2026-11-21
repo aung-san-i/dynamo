@@ -193,10 +193,48 @@ jobs:
       build_nvidia_image: 'pr-label'
 
   # ==========================================================================
+  # PR-XPU -- pr-xpu.yaml, on the same run page as the pipeline above.
+  # ==========================================================================
+  # Runs for exactly the events `run` runs for (same condition), on every PR --
+  # no `xpu` label needed -- so one run page and one `xpu-status-check` cover
+  # both workflows. pr-xpu.yaml has no pull_request or push trigger of its own
+  # for that reason: it would otherwise run a second time.
+  #
+  # `needs: [run]` + always(): AFTER the heterogeneous pipeline, whatever its
+  # result. The xpu-heterog-hardware slot above serializes RUNS, not the jobs
+  # inside one run, and both workflows deploy to the same cluster namespace
+  # and the same ResourceClaimTemplates; started side by side they would
+  # compete for the same XPU and NVIDIA nodes. The cost is wall-clock time: its
+  # second XPU build starts only once the pipeline above has finished.
+  #
+  # No concurrency block on this job: it already runs inside this run's
+  # xpu-heterog-hardware slot, and asking for that slot again would deadlock.
+  pr-xpu:
+    name: PR-XPU
+    needs: [run]
+    if: >-
+      always() &&
+      ((github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository) ||
+      github.event_name == 'push' ||
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      (startsWith(github.event.comment.body, '/run_xpu_heterogeneous') ||
+      startsWith(github.event.comment.body, '/run_xpu_heterog')) &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
+    uses: ./.github/workflows/pr-xpu.yaml
+    secrets: inherit
+    with:
+      # Same expression as `run` above: a slash command or a sync PR runs
+      # everything, any other PR is diff-gated by pr-xpu.yaml's changed-files.
+      force_all_tests: ${{ github.event_name == 'issue_comment' || startsWith(github.head_ref, 'sync/upstream-') }}
+
+  # ==========================================================================
   # STATUS CHECK -- the branch-protection context. Keep this job id.
   # ==========================================================================
   # A called workflow's conclusion is already the conjunction of its jobs, so
-  # asserting on needs.run.result covers the whole pipeline.
+  # asserting on needs.run.result and needs.pr-xpu.result covers both
+  # workflows. Both get the same per-event verdict below.
   #
   # `skipped` used to pass unconditionally. It no longer does, because with the
   # sync-only restriction removed a skip no longer means "not applicable" -- it
@@ -218,30 +256,43 @@ jobs:
   # A non-success, non-skipped result always fails, as before.
   xpu-status-check:
     runs-on: xpu-heterogeneous-ubuntu-latest
-    needs: [run]
+    needs: [run, pr-xpu]
     if: always()
     steps:
-      - name: Check the XPU heterogeneous pipeline result
+      - name: Check the XPU heterogeneous pipeline and PR-XPU results
         env:
-          RESULT: ${{ needs.run.result }}
+          RUN_RESULT: ${{ needs.run.result }}
+          PR_XPU_RESULT: ${{ needs.pr-xpu.result }}
           EVENT: ${{ github.event_name }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           echo "event: ${EVENT}"
-          echo "xpu-heterogeneous-run result: ${RESULT}"
-          case "${RESULT}" in
-            success)
-              echo "OK: XPU heterogeneous pipeline succeeded"
-              ;;
-            skipped)
-              if [[ "${EVENT}" == "pull_request" ]]; then
-                echo "::error::The XPU heterogeneous pipeline did not run for this PR, so nothing has tested this commit. Head branch is in ${HEAD_REPO:-an unknown repository}, not ${GITHUB_REPOSITORY}, so the pipeline is not allowed to run it directly. It must be copied to a pull-request/N branch in ${GITHUB_REPOSITORY} first; that run reports against this same commit and will replace this failure."
-                exit 1
-              fi
-              echo "NOT APPLICABLE: ${EVENT} run with no pipeline to report on (no slash command, or the comment author is not an owner, member or collaborator). This result is filed against the default branch, not against any PR."
-              ;;
-            *)
-              echo "::error::XPU heterogeneous pipeline ${RESULT}"
-              exit 1
-              ;;
-          esac
+          echo "xpu-heterogeneous-run result: ${RUN_RESULT}"
+          echo "pr-xpu result: ${PR_XPU_RESULT}"
+
+          # Same verdict as before, applied to each workflow in turn; the check
+          # fails if either one fails.
+          FAILED=0
+          verdict() {
+            local what="$1" result="$2"
+            case "${result}" in
+              success)
+                echo "OK: ${what} succeeded"
+                ;;
+              skipped)
+                if [[ "${EVENT}" == "pull_request" ]]; then
+                  echo "::error::${what} did not run for this PR, so nothing has tested this commit. Head branch is in ${HEAD_REPO:-an unknown repository}, not ${GITHUB_REPOSITORY}, so it is not allowed to run it directly. It must be copied to a pull-request/N branch in ${GITHUB_REPOSITORY} first; that run reports against this same commit and will replace this failure."
+                  FAILED=1
+                  return
+                fi
+                echo "NOT APPLICABLE: ${what}: ${EVENT} run with nothing to report on (no slash command, or the comment author is not an owner, member or collaborator). This result is filed against the default branch, not against any PR."
+                ;;
+              *)
+                echo "::error::${what} ${result}"
+                FAILED=1
+                ;;
+            esac
+          }
+          verdict "XPU heterogeneous pipeline" "${RUN_RESULT}"
+          verdict "PR-XPU (pr-xpu.yaml)" "${PR_XPU_RESULT}"
+          exit "${FAILED}"

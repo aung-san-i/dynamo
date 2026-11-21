@@ -3,52 +3,114 @@
 
 name: PR-XPU
 
+# ============================================================================
+# Two ways in:
+#   1. Called by pr-xpu-heterogeneous.yaml (workflow_call) for EVERY PR into
+#      main, every copy-pr-bot push to pull-request/N and every authorized
+#      /run_xpu_heterog slash command. Its jobs then show on the same run page
+#      as the heterogeneous pipeline, and the caller's `xpu-status-check`
+#      covers both. No `xpu` label is needed.
+#   2. The nightly cron below, on main, as its own run.
+#
+# There is deliberately NO pull_request and NO push trigger here any more:
+# pr-xpu-heterogeneous.yaml already fires on both and calls this file, so a
+# trigger here as well would run every test twice.
+#
+# Every image this workflow builds is cleaned up by this workflow, the same
+# three ways xpu-heterogeneous-run.yml does it: the runner's docker daemon
+# (build-xpu, "Clean up local images"), the registry (an image-record-*
+# artifact that xpu-image-retention.yaml reads, deleting the image after 14
+# days) and the worker nodes (cleanup-images). Its names never collide with
+# the heterogeneous pipeline's in the same run: image tag `-pr-xpu`, artifacts
+# `pr-xpu-*` / `image-record-xpu-prxpu-*`, test names `pr-xpu-px-dn` /
+# `pr-xpu-pn-dx` (the test name is also the deployment name in the cluster).
+# ============================================================================
+
 on:
   schedule:
     - cron: '0 23 * * *'
-  push:
-    branches:
-      - "pull-request/[0-9]+"
+  workflow_call:
+    inputs:
+      force_all_tests:
+        description: >-
+          Skip change detection and run every test. The caller sets it for a
+          slash command and for sync/upstream-* PRs, the same as for the
+          heterogeneous pipeline.
+        required: false
+        type: boolean
+        default: false
 
+# Standalone (the nightly cron, github.workflow == 'PR-XPU'): one run per ref,
+# a newer one cancels an older one, as before.
+#
+# Called (github.workflow is the CALLER's name): a group unique to this run,
+# and never cancel. The caller already holds the xpu-heterog-hardware slot
+# for the whole run; a shared group here could cancel half of a combined run,
+# and joining xpu-heterog-hardware itself would deadlock against that slot.
 concurrency:
-  group: pr-xpu-${{ github.ref_name }}
-  cancel-in-progress: true
+  group: ${{ github.workflow == 'PR-XPU' && format('pr-xpu-{0}', github.ref_name) || format('pr-xpu-called-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.workflow == 'PR-XPU' }}
 
 jobs:
 
   # ============================================================================
-  # GATE – only run XPU CI when the PR has the "xpu" label.
-  # Push trigger (pull-request/* branch) already guarantees only internal
-  # users / copy-pr-bot can reach this workflow.
+  # GATE – resolve what to test. Runs on every PR (no `xpu` label gate).
+  # Authorization for a slash command is done by the caller's `if:`.
   # ============================================================================
 
   guard:
     runs-on: ubuntu-24.04
     outputs:
-      has_xpu_label: ${{ steps.pr-info.outputs.has_xpu_label }}
+      proceed: ${{ steps.pr-info.outputs.proceed }}
+      pr_number: ${{ steps.pr-info.outputs.pr_number }}
+      checkout_ref: ${{ steps.pr-info.outputs.checkout_ref }}
     steps:
-      - name: Get PR info and check xpu label
+      - name: Resolve PR number and commit to test
         id: pr-info
         env:
           GH_TOKEN: ${{ github.token }}
+          # Through env, never spliced into the script: values from the event
+          # payload are data, not shell.
+          PR_NUMBER_EVENT: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            echo "has_xpu_label=true" >> "$GITHUB_OUTPUT"
-            echo "🌙 Nightly XPU CI run – skipping PR label gate"
-            exit 0
-          fi
-
-          PR_NUMBER="${GITHUB_REF_NAME##*/}"
-
-          # Check for xpu label
-          HAS_XPU=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
-            --jq '[.labels[].name] | any(. == "xpu")')
-          echo "has_xpu_label=${HAS_XPU}" >> "$GITHUB_OUTPUT"
-          if [[ "${HAS_XPU}" == "true" ]]; then
-            echo "✅ PR #${PR_NUMBER} has 'xpu' label – running XPU CI"
-          else
-            echo "⏭️ PR #${PR_NUMBER} does not have 'xpu' label – skipping XPU CI"
-          fi
+          set -euo pipefail
+          PR_NUMBER=""
+          case "${GITHUB_EVENT_NAME}" in
+            schedule)
+              CHECKOUT_REF="${GITHUB_SHA}"
+              echo "🌙 Nightly XPU CI run on ${GITHUB_REF_NAME}"
+              ;;
+            push)
+              # copy-pr-bot push to pull-request/N: test the pushed commit.
+              CHECKOUT_REF="${GITHUB_SHA}"
+              if [[ "${GITHUB_REF_NAME}" =~ ^pull-request/([0-9]+)$ ]]; then
+                PR_NUMBER="${BASH_REMATCH[1]}"
+              fi
+              ;;
+            pull_request)
+              # The PR head, NOT GITHUB_SHA: on a pull_request event GITHUB_SHA
+              # is GitHub's refs/pull/N/merge commit, which never lands. Same
+              # choice as xpu-heterogeneous-run.yml's guard.
+              PR_NUMBER="${PR_NUMBER_EVENT}"
+              CHECKOUT_REF="${PR_HEAD_SHA}"
+              ;;
+            issue_comment)
+              # An issue_comment run's GITHUB_SHA is main's tip, so the PR head
+              # has to be looked up.
+              PR_NUMBER="${ISSUE_NUMBER}"
+              CHECKOUT_REF=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')
+              ;;
+            *)
+              echo "::error::PR-XPU does not know how to handle event '${GITHUB_EVENT_NAME}'"
+              exit 1
+              ;;
+          esac
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=${CHECKOUT_REF}" >> "$GITHUB_OUTPUT"
+          echo "event=${GITHUB_EVENT_NAME} PR=${PR_NUMBER:-none}; running XPU CI at ${CHECKOUT_REF}"
 
   # ============================================================================
   # CHANGE DETECTION
@@ -56,11 +118,11 @@ jobs:
 
   changed-files:
     needs: [guard]
-    if: needs.guard.outputs.has_xpu_label == 'true'
+    if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-24.04
     outputs:
-      core: ${{ github.event_name == 'schedule' && 'true' || steps.changes.outputs.core }}
-      vllm: ${{ github.event_name == 'schedule' && 'true' || steps.changes.outputs.vllm }}
+      core: ${{ (github.event_name == 'schedule' || inputs.force_all_tests) && 'true' || steps.changes.outputs.core }}
+      vllm: ${{ (github.event_name == 'schedule' || inputs.force_all_tests) && 'true' || steps.changes.outputs.vllm }}
       sglang: ${{ steps.changes.outputs.sglang }}
       docker_image_gpu: ${{ steps.shared-images.outputs.docker_image_gpu }}
     steps:
@@ -69,9 +131,11 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check for changes
-        if: github.event_name != 'schedule'
+        if: github.event_name != 'schedule' && !inputs.force_all_tests
         id: changes
-        uses: $/.github/actions/changed-files
+        # Was `$/.github/actions/changed-files`, an invalid path that made every
+        # run of this workflow a startup_failure (last attempt 2026-09-29).
+        uses: ./.github/actions/changed-files
         with:
           gh_token: ${{ github.token }}
       - name: Set shared images
@@ -85,7 +149,7 @@ jobs:
   # ============================================================================
 
   build-xpu:
-    needs: [changed-files]
+    needs: [guard, changed-files]
     if: >-
       needs.changed-files.outputs.core == 'true' ||
       needs.changed-files.outputs.vllm == 'true'
@@ -101,7 +165,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.guard.outputs.checkout_ref }}
 
       - name: Generate Dockerfile
         shell: bash
@@ -124,7 +188,11 @@ jobs:
 
           IMAGE_NAME="dynamo-${{ env.FRAMEWORK }}-${{ env.TARGET }}-${{ env.DEVICE }}"
           SHORT_SHA="$(git rev-parse HEAD | cut -c1-7)"
-          IMAGE_TAG="${IMAGE_NAME}:${{ github.run_id }}-${SHORT_SHA}"
+          # `-pr-xpu`: when called from pr-xpu-heterogeneous.yaml, the
+          # heterogeneous pipeline's build-xpu pushes <run_id>-<sha> in the SAME
+          # run, so without the suffix this push would overwrite its tag and
+          # two image records would name one image.
+          IMAGE_TAG="${IMAGE_NAME}:${{ github.run_id }}-${SHORT_SHA}-pr-xpu"
 
           echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
@@ -176,11 +244,88 @@ jobs:
           echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Registry Image | \`${REGISTRY_IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
 
+      # Same record as xpu-heterogeneous-run.yml's build-xpu writes, so
+      # xpu-image-retention.yaml deletes this image from the registry once it
+      # is older than 14 days. Retention selects artifacts by the
+      # `image-record-` prefix and takes the run id from the artifact itself, so
+      # the extra `prxpu` keeps the name unique within a combined run without
+      # changing how it is found. Before "Clean up local images": the digest is
+      # read from the local tag. A failed upload fails this job on purpose: an
+      # image without a record stays in the registry forever.
+      - name: Record pushed image
+        id: record
+        shell: bash
+        env:
+          IMAGE: ${{ steps.push.outputs.registry_image_tag }}
+          PR_NUMBER: ${{ needs.guard.outputs.pr_number }}
+          PHASE: ${{ github.event_name == 'schedule' && 'nightly' || 'pre-merge' }}
+        run: |
+          set -euo pipefail
+          digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE}" \
+            | grep -m1 "^${IMAGE%:*}@" | cut -d@ -f2 || true)
+          name="image-record-${DEVICE}-prxpu-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          jq -n \
+            --arg image "${IMAGE}" --arg digest "${digest}" --arg device "${DEVICE}" \
+            --arg pushed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg pr_number "${PR_NUMBER}" --arg phase "${PHASE}" \
+            --arg repository "${GITHUB_REPOSITORY}" --arg sha "$(git rev-parse HEAD)" \
+            --arg run_id "${GITHUB_RUN_ID}" --arg run_number "${GITHUB_RUN_NUMBER}" \
+            --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '$ARGS.named' > image-record.json
+          cat image-record.json
+          echo "artifact_name=${name}" >> "$GITHUB_OUTPUT"
+          echo "| Image Record | artifact \`${name}\` (registry copy deleted after 14 days) |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.record.outputs.artifact_name }}
+          path: image-record.json
+          if-no-files-found: error
+          retention-days: 30
+
+      # Remove THIS run's tags from the runner's docker daemon -- copied from
+      # xpu-heterogeneous-run.yml. The tags embed github.run_id, so nothing is
+      # ever reclaimed by being overwritten; without this the daemon grows by a
+      # full image per run. Scoped to this run's own tags (no `docker system
+      # prune`, which would drop the shared build cache). `docker rmi` on a
+      # pushed tag only drops the local reference; the registry copy the tests
+      # pull is unaffected. always(), and every command `|| true`: a failed
+      # build still cleans up, and a cleanup failure never fails a green build.
+      - name: Clean up local images
+        if: always()
+        shell: bash
+        run: |
+          IMAGE_TAG="${{ steps.build.outputs.image_tag }}"
+          REGISTRY_IMAGE_TAG="${{ steps.push.outputs.registry_image_tag }}"
+          echo "Disk usage before cleanup:"
+          docker system df || true
+          REFS=()
+          if [[ -n "${IMAGE_TAG}" ]]; then
+            # The -test image is built but never pushed, so this is the only
+            # thing that ever removes it.
+            REFS+=("${IMAGE_TAG}" "${IMAGE_TAG}-test")
+          fi
+          if [[ -n "${REGISTRY_IMAGE_TAG}" ]]; then
+            REFS+=("${REGISTRY_IMAGE_TAG}")
+          fi
+          for ref in ${REFS+"${REFS[@]}"}; do
+            echo "Removing ${ref}"
+            docker rmi "${ref}" || true
+          done
+          # Dangling layers orphaned by the rmi calls above. Untagged only.
+          docker image prune --force || true
+          echo "Disk usage after cleanup:"
+          docker system df || true
+
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xpu-build-log
+          # Not `xpu-build-log`: the heterogeneous pipeline uploads that name in
+          # the same run, and an artifact name can be used once per run.
+          name: pr-xpu-build-log
           path: |
             build-xpu.log
             build-xpu-test.log
@@ -190,9 +335,17 @@ jobs:
   # HETEROGENEOUS P/D TESTS
   # ============================================================================
 
+  # test_name is ALSO the deployment name in the cluster (epd-test-template.yml
+  # deploys the DynamoGraphDeployment as $TEST_NAME in dynamo-system) and the
+  # prefix of the log artifact (<test_name>-<run_id>-<attempt>). The
+  # heterogeneous pipeline runs `px-dn` and `pn-dx` with the same template in
+  # the same run, so these carry a `pr-xpu-` prefix. The previous
+  # `log_dir_name` input is gone: the template never defined it, which was the
+  # second startup_failure in this file.
+
   heterog-test-px-dn:
     name: "Heterog: XPU Prefill + NVIDIA Decode"
-    needs: [changed-files, build-xpu]
+    needs: [guard, changed-files, build-xpu]
     if: >-
       needs.build-xpu.result == 'success' &&
       (needs.changed-files.outputs.core == 'true' ||
@@ -200,10 +353,11 @@ jobs:
     uses: ./.github/workflows/epd-test-template.yml
     secrets: inherit
     with:
-      test_name: "px-dn"
+      test_name: "pr-xpu-px-dn"
       test_yaml_path: ".ci/test/dynamo-heterog/k8s/tests/px-dn.yaml"
       runner: "xpu"
-      CHECKOUT_COMMIT: ${{ github.sha }}
+      PR_NUMBER: ${{ needs.guard.outputs.pr_number }}
+      CHECKOUT_COMMIT: ${{ needs.guard.outputs.checkout_ref }}
       docker_image_xpu: ${{ needs.build-xpu.outputs.image }}
       docker_image_gpu: "${{ needs.changed-files.outputs.docker_image_gpu }}"
       xpu_resource_template: "onexpu-rdma-kueue"
@@ -212,11 +366,10 @@ jobs:
       nvidia_node: "nvidia_node"
       model: 'Qwen/Qwen3-0.6B'
       tensor_parallel: '1'
-      log_dir_name: "dynamo-heterog-logs-px-dn"
 
   heterog-test-pn-dx:
     name: "Heterog: NVIDIA Prefill + XPU Decode"
-    needs: [changed-files, build-xpu, heterog-test-px-dn]
+    needs: [guard, changed-files, build-xpu, heterog-test-px-dn]
     if: >-
       always() &&
       needs.build-xpu.result == 'success' &&
@@ -226,10 +379,11 @@ jobs:
     uses: ./.github/workflows/epd-test-template.yml
     secrets: inherit
     with:
-      test_name: "pn-dx"
+      test_name: "pr-xpu-pn-dx"
       test_yaml_path: ".ci/test/dynamo-heterog/k8s/tests/pn-dx.yaml"
       runner: "xpu"
-      CHECKOUT_COMMIT: ${{ github.sha }}
+      PR_NUMBER: ${{ needs.guard.outputs.pr_number }}
+      CHECKOUT_COMMIT: ${{ needs.guard.outputs.checkout_ref }}
       docker_image_xpu: ${{ needs.build-xpu.outputs.image }}
       docker_image_gpu: "${{ needs.changed-files.outputs.docker_image_gpu }}"
       xpu_resource_template: "onexpu-rdma-kueue"
@@ -238,16 +392,198 @@ jobs:
       nvidia_node: "nvidia_node"
       model: 'Qwen/Qwen3-0.6B'
       tensor_parallel: '1'
-      log_dir_name: "dynamo-heterog-logs-pn-dx"
+
+  # ============================================================================
+  # IMAGE CLEANUP – worker nodes
+  # ============================================================================
+  # Copied from xpu-heterogeneous-run.yml's cleanup-images, minus the NVIDIA
+  # image: this workflow never builds one, and the pinned nvcr.io image is
+  # shared by every run. Each test pod pulls the XPU image into the node's
+  # container runtime and deleting the pod leaves it there; one short
+  # privileged pod per XPU node removes it with the node's own crictl.
+  #
+  # The registry copy is NOT removed here, so "Re-run failed jobs" still works;
+  # xpu-image-retention.yaml deletes it after 14 days from the image record.
+  #
+  # Needs both tests, so neither can still be using the image when it goes.
+  # Every failure is a ::warning::, never a red job: a leaked image costs disk,
+  # a red cleanup would fail the status check of a run whose tests passed.
+  #
+  # The leftover-pod sweep below only touches pods labelled with THIS run's id.
+  # xpu-heterogeneous-run.yml's sweep removes every cleanup pod, which is safe
+  # there because it holds the xpu-heterog-hardware slot; this workflow's
+  # nightly run does not, so it must not delete another run's pods.
+
+  cleanup-images:
+    name: Clean up test images
+    needs:
+      - build-xpu
+      - heterog-test-px-dn
+      - heterog-test-pn-dx
+    if: always() && needs.build-xpu.outputs.image != ''
+    runs-on: xpu
+    timeout-minutes: 20
+    env:
+      NS: dynamo-system
+      XPU_IMAGE: ${{ needs.build-xpu.outputs.image }}
+      # Must match the xpu_node value passed to both tests above.
+      XPU_NODE_LABEL: xpu_node
+      KUEUE_QUEUE: dynamo-queue
+      CLEANUP_IMAGE: docker.io/library/busybox:1.36
+    steps:
+      - name: Remove images from worker nodes
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          POD_LABEL="app.kubernetes.io/name=xpu-heterog-image-cleanup"
+
+          # Runs inside the per-node pod. A missing crictl or an unreachable
+          # runtime exits 2 rather than reporting "absent". rmi is retried
+          # because a container the kubelet has not yet garbage collected
+          # still holds the image for a few seconds after its pod is deleted.
+          read -r -d '' NODE_SCRIPT <<'EOF' || true
+          set -u
+          if ! chroot /host /bin/sh -c 'command -v crictl' >/dev/null 2>&1; then
+            echo "crictl not found on the node"
+            exit 2
+          fi
+          i=0
+          while :; do
+            ids=$(chroot /host crictl images --quiet "$IMAGE") || { echo "crictl images failed"; exit 2; }
+            if [ -z "$ids" ]; then
+              echo "absent: $IMAGE"
+              exit 0
+            fi
+            if chroot /host crictl rmi "$IMAGE"; then
+              echo "removed: $IMAGE"
+              exit 0
+            fi
+            i=$((i + 1))
+            if [ "$i" -ge 6 ]; then
+              echo "still in use after $i attempts: $IMAGE"
+              exit 1
+            fi
+            sleep 10
+          done
+          EOF
+
+          # Leftovers from an earlier attempt of THIS run only.
+          kubectl delete pods -n "${NS}" -l "${POD_LABEL},github-run-id=${GITHUB_RUN_ID}" --ignore-not-found=true --wait=false || true
+
+          ROWS=()
+          idx=0
+          label="${XPU_NODE_LABEL}"
+          image="${XPU_IMAGE}"
+
+          if ! nodes=$(kubectl get nodes -l "dynamo.intel.com/node=${label}" -o jsonpath='{.items[*].metadata.name}' 2>&1); then
+            echo "::warning::Could not list nodes labelled dynamo.intel.com/node=${label}: ${nodes}"
+            ROWS+=("| \`${label}\` | - | \`${image}\` | ⚠️ could not list nodes |")
+            nodes=""
+          elif [[ -z "${nodes}" ]]; then
+            echo "::warning::No node carries dynamo.intel.com/node=${label}; ${image} was not removed from any node"
+            ROWS+=("| \`${label}\` | - | \`${image}\` | ⚠️ no node with this label |")
+          fi
+
+          for node in ${nodes}; do
+            idx=$((idx + 1))
+            # `prxpu` keeps these names apart from the heterogeneous
+            # pipeline's image-cleanup-<run>-<attempt>-<n> pods in the same run.
+            pod="image-cleanup-prxpu-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${idx}"
+
+            # Built with jq so the image ref, node name and script reach the
+            # manifest as JSON strings. kueue.x-k8s.io/queue-name is mandatory
+            # (the cluster's enforce-kueue-labels policy). Pinned with a
+            # hostname nodeSelector, NOT nodeName: Kueue gates a labelled pod
+            # until it is admitted, and nodeName plus schedulingGates is
+            # rejected.
+            jq -n \
+              --arg pod "${pod}" --arg node "${node}" --arg image "${image}" \
+              --arg helper "${CLEANUP_IMAGE}" --arg script "${NODE_SCRIPT}" \
+              --arg run "${GITHUB_RUN_ID}" --arg queue "${KUEUE_QUEUE}" \
+              '{
+                apiVersion: "v1", kind: "Pod",
+                metadata: {
+                  name: $pod,
+                  labels: {
+                    "app.kubernetes.io/name": "xpu-heterog-image-cleanup",
+                    "github-run-id": $run,
+                    "kueue.x-k8s.io/queue-name": $queue
+                  }
+                },
+                spec: {
+                  nodeSelector: {"kubernetes.io/hostname": $node},
+                  restartPolicy: "Never",
+                  tolerations: [{operator: "Exists"}],
+                  containers: [{
+                    name: "rmi",
+                    image: $helper,
+                    command: ["/bin/sh", "-c", $script],
+                    env: [
+                      {name: "IMAGE", value: $image},
+                      {name: "PATH", value: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+                    ],
+                    securityContext: {privileged: true},
+                    resources: {requests: {cpu: "10m", memory: "16Mi"}},
+                    volumeMounts: [{name: "host", mountPath: "/host"}]
+                  }],
+                  volumes: [{name: "host", hostPath: {path: "/", type: "Directory"}}]
+                }
+              }' | kubectl apply -n "${NS}" -f - || {
+              echo "::warning::Could not create cleanup pod on ${node}; ${image} left on that node"
+              ROWS+=("| \`${label}\` | \`${node}\` | \`${image}\` | ⚠️ pod not created |")
+              continue
+            }
+
+            # 5 minutes covers Kueue admission, pulling the helper image and
+            # all six rmi attempts inside the pod.
+            phase=""
+            for _ in $(seq 1 60); do
+              phase=$(kubectl get pod "${pod}" -n "${NS}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+              [[ "${phase}" == "Succeeded" || "${phase}" == "Failed" ]] && break
+              sleep 5
+            done
+
+            echo "::group::${node}: ${image} (${phase:-unknown})"
+            log=$(kubectl logs -n "${NS}" "${pod}" 2>&1 || true)
+            echo "${log}"
+            if [[ "${phase}" != "Succeeded" ]]; then
+              kubectl describe pod -n "${NS}" "${pod}" || true
+            fi
+            echo "::endgroup::"
+
+            if [[ "${phase}" == "Succeeded" ]]; then
+              ROWS+=("| \`${label}\` | \`${node}\` | \`${image}\` | ✅ $(tail -n1 <<< "${log}" | cut -d: -f1) |")
+            else
+              echo "::warning::Could not remove ${image} from node ${node} (pod phase: ${phase:-unknown}); see the group above"
+              ROWS+=("| \`${label}\` | \`${node}\` | \`${image}\` | ⚠️ ${phase:-timed out} |")
+            fi
+
+            kubectl delete pod "${pod}" -n "${NS}" --ignore-not-found=true --wait=false || true
+          done
+
+          {
+            echo "### 🧹 Worker-node image cleanup (PR-XPU)"
+            echo "| Node label | Node | Image | Result |"
+            echo "|------------|------|-------|--------|"
+            for row in ${ROWS+"${ROWS[@]}"}; do
+              echo "${row}"
+            done
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================================
   # STATUS CHECK
   # ============================================================================
+  # When called, this reports as "PR-XPU / xpu-status-check", a different
+  # context from the caller's required `xpu-status-check`, which also asserts
+  # on this whole workflow's result. cleanup-images is deliberately not in
+  # `needs`: a cleanup warning must not turn a passing run red.
 
   xpu-status-check:
     runs-on: ubuntu-latest
     needs: [guard, changed-files, build-xpu, heterog-test-px-dn, heterog-test-pn-dx]
-    if: always() && needs.guard.outputs.has_xpu_label == 'true'
+    if: always() && needs.guard.outputs.proceed == 'true'
     steps:
       - name: Check all XPU jobs
         run: |
