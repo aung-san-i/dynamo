@@ -1,0 +1,134 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Image - NVIDIA (vLLM)
+
+# Build-only: the vLLM NVIDIA runtime image, pushed to the registry. No tests.
+# The work is done by xpu-image-build.yml.
+#
+# Any branch, tag or commit can be built:
+#   Manual   Actions tab -> "Build Image - NVIDIA (vLLM)" -> Run workflow, or
+#              gh workflow run build-image-nvidia.yaml -f ref=<branch|tag|sha>
+#            `ref` empty = the branch the run was started from.
+#   Comment  on a PR, by an owner/member/collaborator:
+#              /build_nvidia                    the PR head
+#              /build_nvidia ref=<branch|sha>   any branch/tag/SHA instead
+#              /build_nvidia push=false         build, do not push
+#
+# Workflows triggered by a comment always run from the default branch, so the
+# slash command works once this file is on main.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, SHA or refs/pull/N/head to build (empty = the selected branch)"
+        required: false
+        type: string
+        default: ""
+      push:
+        description: "Push to the registry"
+        required: false
+        type: boolean
+        default: true
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  resolve:
+    name: Resolve request
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/build_nvidia') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.r.outputs.ref }}
+      push: ${{ steps.r.outputs.push }}
+    steps:
+      - name: Resolve ref and push
+        id: r
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_REF: ${{ inputs.ref }}
+          IN_PUSH: ${{ inputs.push }}
+          COMMENT: ${{ github.event.comment.body }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT}" == "workflow_dispatch" ]]; then
+            REF="${IN_REF:-${GITHUB_REF}}"; PUSH="${IN_PUSH:-true}"
+          else
+            LINE="$(printf '%s\n' "${COMMENT}" | head -n1)"
+            REF="refs/pull/${PR_NUMBER}/head"; PUSH=true
+            set -f
+            for tok in ${LINE#/build_nvidia}; do
+              case "${tok}" in
+                ref=?*) REF="${tok#ref=}" ;;
+                push=true|push=false) PUSH="${tok#push=}" ;;
+                *) echo "::error::Unknown option '${tok}' (use ref=<ref>, push=true|false)"; exit 1 ;;
+              esac
+            done
+          fi
+          { echo "ref=${REF}"; echo "push=${PUSH}"; } | tee -a "$GITHUB_OUTPUT"
+
+      - name: Acknowledge the slash command
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        env:
+          REF: ${{ steps.r.outputs.ref }}
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              comment_id: context.payload.comment.id, content: 'eyes'
+            }).catch(e => core.warning(`reaction failed: ${e.message}`));
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
+              body: `🔨 Building the vLLM NVIDIA image from \`${process.env.REF}\` (no tests).\n[View workflow run →](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`
+            });
+
+  build:
+    needs: [resolve]
+    uses: ./.github/workflows/xpu-image-build.yml
+    secrets: inherit
+    with:
+      framework: vllm
+      device: cuda
+      ref: ${{ needs.resolve.outputs.ref }}
+      push: ${{ needs.resolve.outputs.push == 'true' }}
+
+  report:
+    name: Report
+    needs: [resolve, build]
+    if: always() && needs.resolve.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Summarize
+        uses: actions/github-script@v7
+        env:
+          REF: ${{ needs.resolve.outputs.ref }}
+          RESULT: ${{ needs.build.result }}
+          IMAGE: ${{ needs.build.outputs.image }}
+        with:
+          script: |
+            const ok = process.env.RESULT === 'success';
+            const body = [
+              `### vLLM NVIDIA image build from \`${process.env.REF}\``, '',
+              `${ok ? '✅' : '❌'} ${process.env.RESULT}` + (process.env.IMAGE ? ` — \`${process.env.IMAGE}\`` : ''), '',
+              `[View workflow run →](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`
+            ].join('\n');
+            await core.summary.addRaw(body).write();
+            if (context.eventName === 'issue_comment') {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body
+              });
+            }
+            if (!ok) core.setFailed(`build result: ${process.env.RESULT}`);
