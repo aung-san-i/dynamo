@@ -24,6 +24,17 @@ name: PR-XPU
 # the heterogeneous pipeline's in the same run: image tag `-pr-xpu`, artifacts
 # `pr-xpu-*` / `image-record-xpu-prxpu-*`, test names `pr-xpu-px-dn` /
 # `pr-xpu-pn-dx` (the test name is also the deployment name in the cluster).
+#
+# Two groups of tests:
+#   1. heterog-test-px-dn / heterog-test-pn-dx -- this fork's two P/D legs.
+#   2. xpu-ci -- UPSTREAM's XPU pytest suite, the job upstream's pr-xpu.yaml
+#      runs (`xpu-ci-vllm`, framework vllm, markers
+#      'vllm and pre_merge and not multimodal'). Upstream calls xpu-ci.yaml,
+#      which expects the GitHub runner to be the XPU machine; here the cards
+#      are on the cluster's XPU node, so this calls xpu-ci-k8s.yaml, which
+#      runs the same build, sanity check and pytest stages (GMS, xpu_1, xpu_2)
+#      as Pods on that node. It runs after group 1, so the two never share the
+#      node's cards at the same time.
 # ============================================================================
 
 on:
@@ -573,6 +584,32 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================================
+  # UPSTREAM XPU PYTEST SUITE (xpu-ci-k8s.yaml)
+  # ============================================================================
+  # Upstream's pr-xpu.yaml job `xpu-ci-vllm`, with the same inputs. Gated by
+  # the same changed-files outputs as upstream (core or vllm). Runs after the
+  # two P/D legs whatever their result (always()), so it never competes with
+  # them for the XPU node's cards; it builds its own image (`-xpu-ci` tag) and
+  # cleans it up itself.
+
+  xpu-ci:
+    name: XPU-CI
+    needs: [guard, changed-files, heterog-test-pn-dx]
+    if: >-
+      always() &&
+      needs.guard.outputs.proceed == 'true' &&
+      needs.changed-files.result == 'success' &&
+      (needs.changed-files.outputs.core == 'true' ||
+      needs.changed-files.outputs.vllm == 'true')
+    uses: ./.github/workflows/xpu-ci-k8s.yaml
+    secrets: inherit
+    with:
+      framework: vllm
+      pytest_markers: 'vllm and pre_merge and not multimodal'
+      source_ref: ${{ needs.guard.outputs.checkout_ref }}
+      pr_number: ${{ needs.guard.outputs.pr_number }}
+
+  # ============================================================================
   # STATUS CHECK
   # ============================================================================
   # When called, this reports as "PR-XPU / xpu-status-check", a different
@@ -582,7 +619,7 @@ jobs:
 
   xpu-status-check:
     runs-on: ubuntu-latest
-    needs: [guard, changed-files, build-xpu, heterog-test-px-dn, heterog-test-pn-dx]
+    needs: [guard, changed-files, build-xpu, heterog-test-px-dn, heterog-test-pn-dx, xpu-ci]
     if: always() && needs.guard.outputs.proceed == 'true'
     steps:
       - name: Check all XPU jobs

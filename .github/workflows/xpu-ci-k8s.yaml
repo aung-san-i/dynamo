@@ -1,0 +1,537 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: XPU-CI-K8s
+
+# ============================================================================
+# Upstream's XPU pytest suite (xpu-ci.yaml), run on the cluster's XPU node.
+# ============================================================================
+# Fork-only file. upstream xpu-ci.yaml is left byte-identical so upstream syncs
+# never conflict; this file reproduces what it TESTS, not how it schedules.
+#
+# WHY NOT xpu-ci.yaml ITSELF. Upstream assumes the GitHub runner is the XPU
+# machine: every test job does `stat /dev/dri/renderD128` and `docker run
+# --device /dev/dri` on the runner. In this lab the runner
+# (xpu-heterogeneous-ubuntu-latest) is a build and control host; the XPU cards
+# are on the Kubernetes node labelled dynamo.intel.com/node=xpu_node, behind
+# Kueue and DRA ResourceClaimTemplates. So:
+#
+#   build (runner)  -- same render + docker build as xpu-ci.yaml (runtime image
+#                      and the Dockerfile.test `test_image` target), plus the
+#                      image sanity check, which needs no card
+#                      (`--no-gpu-check`). The test image is pushed to the lab
+#                      registry so the XPU node can pull it.
+#   test (cluster)  -- one Pod per stage on the XPU node, a card claimed through
+#                      the same ResourceClaimTemplates as the heterogeneous
+#                      tests, running upstream's exact pytest command and
+#                      markers. One stage at a time (max-parallel: 1).
+#                        gms   onexpu-rdma-kueue  GMS runtime check, then
+#                                                 pytest -m "none and xpu_1"
+#                                                 (vllm only, as upstream)
+#                        xpu1  onexpu-rdma-kueue  pytest -m "<markers> and xpu_1"
+#                        xpu2  twoxpu-rdma-kueue  pytest -m "<markers> and xpu_2"
+#                                                 (upstream asks for an `xpu-2`
+#                                                 runner, which does not exist
+#                                                 here; two claimed cards do)
+#   cleanup         -- the image is removed from the runner's docker daemon
+#                      (build job), from the XPU node (cleanup-images), and
+#                      from the registry after 14 days by
+#                      xpu-image-retention.yaml, which reads the
+#                      image-record-* artifact the build job uploads.
+#
+# Pass/fail is upstream's: a stage fails on pytest's exit code (5, "no tests
+# collected", included) or when no JUnit XML is produced.
+#
+# HARDWARE. No concurrency block: when called from pr-xpu-heterogeneous.yaml
+# (via pr-xpu.yaml) the run already holds the xpu-heterog-hardware slot, and a
+# second claim on it would deadlock. Within the run the caller orders this
+# after every other test, and Kueue + DRA arbitrate the cards on the node.
+#
+# Differences from upstream's `docker run`, all forced by running as a Pod:
+#   --network host      -> not needed: a Pod has its own localhost, which is
+#                          all the tests use.
+#   --shm-size=200m     -> /dev/shm is a 1Gi memory emptyDir.
+#   --ulimit memlock=-1 -> IPC_LOCK capability, as in the heterogeneous pods.
+#   -v /models:/models  -> the node's /software/data/pytorch at /models, with
+#                          HF_HOME=/models/huggingface: the model cache every
+#                          heterogeneous test on that node already uses.
+#   ZE_AFFINITY_MASK    -> not set: the DRA claim exposes only the claimed
+#                          cards to the Pod.
+
+on:
+  workflow_call:
+    inputs:
+      framework:
+        description: 'Framework name (vllm, sglang, dynamo)'
+        required: false
+        type: string
+        default: 'vllm'
+      target:
+        description: 'Target stage for Docker rendering'
+        required: false
+        type: string
+        default: 'runtime'
+      source_ref:
+        description: 'Commit SHA to build and test. Empty = caller SHA.'
+        required: false
+        type: string
+        default: ''
+      pytest_markers:
+        description: 'Pytest marker expression, as xpu-ci.yaml takes it'
+        required: false
+        type: string
+        default: ''
+      pr_number:
+        description: 'PR number, for the image record only'
+        required: false
+        type: string
+        default: ''
+
+env:
+  FRAMEWORK: ${{ inputs.framework || 'vllm' }}
+  TARGET: ${{ inputs.target || 'runtime' }}
+  DEVICE: xpu
+  PLATFORM: linux/amd64
+  SOURCE_REF: ${{ inputs.source_ref || github.sha }}
+  REGISTRY: sc09super01-srv.intel.com/dynamo
+  NS: dynamo-system
+
+jobs:
+
+  # ==========================================================================
+  # BUILD + SANITY CHECK (runner)
+  # ==========================================================================
+  build:
+    name: build-xpu-ci
+    runs-on: xpu-heterogeneous-ubuntu-latest
+    outputs:
+      test_image: ${{ steps.push.outputs.registry_test_image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          lfs: true
+
+      - name: Generate Dockerfile
+        shell: bash
+        run: |
+          echo "::group::Generating XPU Dockerfile"
+          python3 ./container/render.py \
+              --target="${TARGET}" \
+              --framework="${FRAMEWORK}" \
+              --device="${DEVICE}" \
+              --platform="${PLATFORM}" \
+              --show-result \
+              --output-short-filename
+          echo "::endgroup::"
+
+      # Same two images as xpu-ci.yaml. The tag carries `xpu-ci` because the
+      # heterogeneous pipeline and pr-xpu.yaml push dynamo-vllm-runtime-xpu
+      # tags with the same run id in the same run.
+      - name: Build XPU image and test image
+        id: build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          IMAGE_NAME="dynamo-${FRAMEWORK}-${TARGET}-${DEVICE}"
+          SHORT_SHA="$(git rev-parse HEAD | cut -c1-7)"
+          IMAGE_TAG="${IMAGE_NAME}:${GITHUB_RUN_ID}-${SHORT_SHA}-xpu-ci"
+          TEST_IMAGE_TAG="${IMAGE_TAG}-test"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "test_image_tag=${TEST_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          docker build --progress=plain --tag "${IMAGE_TAG}" \
+            -f ./container/rendered.Dockerfile . 2>&1 | tee build-xpu.log
+          docker build --progress=plain --target test_image --tag "${TEST_IMAGE_TAG}" \
+            -f container/Dockerfile.test --build-arg BASE_IMAGE="${IMAGE_TAG}" . 2>&1 | tee build-xpu-test.log
+          {
+            echo "### 🐳 XPU-CI images built"
+            echo "| Image | Tag |"
+            echo "|---|---|"
+            echo "| runtime | \`${IMAGE_TAG}\` |"
+            echo "| test | \`${TEST_IMAGE_TAG}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Upstream runs this in test-xpu. It needs no card (--no-gpu-check), so it
+      # stays on the runner.
+      - name: Run sanity check on runtime image
+        shell: bash
+        run: |
+          docker run --rm "${{ steps.build.outputs.image_tag }}" \
+            python /workspace/dev/sanity_check.py --runtime-check --no-gpu-check
+
+      - name: Push test image to registry
+        id: push
+        shell: bash
+        run: |
+          set -euxo pipefail
+          REF="${REGISTRY}/${{ steps.build.outputs.test_image_tag }}"
+          docker tag "${{ steps.build.outputs.test_image_tag }}" "${REF}"
+          docker push "${REF}"
+          echo "registry_test_image=${REF}" >> "$GITHUB_OUTPUT"
+          echo "| registry | \`${REF}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      # Same record as xpu-heterogeneous-run.yml writes, so xpu-image-retention.yaml
+      # deletes the registry copy after 14 days (it selects artifacts by the
+      # `image-record-` prefix and takes the run id from the artifact itself).
+      # A failed upload fails the job on purpose: an image without a record
+      # stays in the registry forever.
+      - name: Record pushed image
+        id: record
+        shell: bash
+        env:
+          IMAGE: ${{ steps.push.outputs.registry_test_image }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          PHASE: ${{ github.event_name == 'schedule' && 'nightly' || 'pre-merge' }}
+        run: |
+          set -euo pipefail
+          digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE}" \
+            | grep -m1 "^${IMAGE%:*}@" | cut -d@ -f2 || true)
+          name="image-record-${DEVICE}-xpuci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          jq -n \
+            --arg image "${IMAGE}" --arg digest "${digest}" --arg device "${DEVICE}" \
+            --arg pushed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg pr_number "${PR_NUMBER}" --arg phase "${PHASE}" \
+            --arg repository "${GITHUB_REPOSITORY}" --arg sha "$(git rev-parse HEAD)" \
+            --arg run_id "${GITHUB_RUN_ID}" --arg run_number "${GITHUB_RUN_NUMBER}" \
+            --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '$ARGS.named' > image-record.json
+          cat image-record.json
+          echo "artifact_name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload image record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.record.outputs.artifact_name }}
+          path: image-record.json
+          if-no-files-found: error
+          retention-days: 30
+
+      # This run's tags only; never `docker system prune` (shared build cache).
+      # The registry copy the Pods pull is unaffected by a local rmi.
+      - name: Clean up local images
+        if: always()
+        shell: bash
+        run: |
+          REFS=()
+          [[ -n "${{ steps.build.outputs.image_tag }}" ]] && REFS+=("${{ steps.build.outputs.image_tag }}")
+          [[ -n "${{ steps.build.outputs.test_image_tag }}" ]] && REFS+=("${{ steps.build.outputs.test_image_tag }}")
+          [[ -n "${{ steps.push.outputs.registry_test_image }}" ]] && REFS+=("${{ steps.push.outputs.registry_test_image }}")
+          for ref in ${REFS+"${REFS[@]}"}; do
+            echo "Removing ${ref}"
+            docker rmi "${ref}" || true
+          done
+          docker image prune --force || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpu-ci-build-log
+          path: |
+            build-xpu.log
+            build-xpu-test.log
+          retention-days: 7
+
+  # ==========================================================================
+  # PYTEST ON THE XPU NODE (one Pod per stage)
+  # ==========================================================================
+  test:
+    name: ${{ matrix.title }}
+    needs: [build]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: xpu-heterogeneous-ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - stage: gms
+            title: "XPU-CI: GMS runtime + GMS tests (1 card)"
+            claim_template: onexpu-rdma-kueue
+            marks: "none and xpu_1"
+            vllm_only: true
+          - stage: xpu1
+            title: "XPU-CI: pytest xpu_1 (1 card)"
+            claim_template: onexpu-rdma-kueue
+            marks: "${{ inputs.pytest_markers }} and xpu_1"
+            vllm_only: false
+          - stage: xpu2
+            title: "XPU-CI: pytest xpu_2 (2 cards)"
+            claim_template: twoxpu-rdma-kueue
+            marks: "${{ inputs.pytest_markers }} and xpu_2"
+            vllm_only: false
+    env:
+      STAGE: ${{ matrix.stage }}
+      CLAIM_TEMPLATE: ${{ matrix.claim_template }}
+      PYTEST_MARKS: ${{ matrix.marks }}
+      TEST_IMAGE: ${{ needs.build.outputs.test_image }}
+      XPU_NODE_LABEL: xpu_node
+      KUEUE_QUEUE: dynamo-queue
+    steps:
+      - name: Skip (GMS stage is vLLM only, as in xpu-ci.yaml)
+        if: matrix.vllm_only && env.FRAMEWORK != 'vllm'
+        run: echo "GMS stage applies to vllm only; framework is ${FRAMEWORK}"
+
+      - name: Run stage in a Pod on the XPU node
+        if: ${{ !(matrix.vllm_only && env.FRAMEWORK != 'vllm') }}
+        id: pod
+        shell: bash
+        run: |
+          set -uo pipefail
+          POD="xpu-ci-${STAGE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "pod=${POD}" >> "$GITHUB_OUTPUT"
+          mkdir -p out/test-results
+
+          # The container script. pytest options are upstream's
+          # (.github/actions/pytest, dind mode, parallel_mode none). After
+          # pytest it waits for the runner to copy test-results out, then exits
+          # with pytest's code, so the Pod phase also carries the verdict.
+          read -r -d '' SCRIPT <<'EOF' || true
+          umask 0022
+          mkdir -p /workspace/test-results
+          rc=0
+          if [ "${STAGE}" = "gms" ]; then
+            echo "== GMS runtime check"
+            python - <<'PY' || rc=$?
+          import torch
+          from gpu_memory_service.common.vmm import _sycl_vmm
+          from gpu_memory_service.common.vmm.xpu_utils import XpuVMM
+          assert torch.xpu.is_available(), "torch.xpu.is_available() is false"
+          assert _sycl_vmm.device_count() > 0, "_sycl_vmm found no XPU devices"
+          XpuVMM().ensure_initialized()
+          print(f"XPU: {torch.xpu.get_device_name(0)}")
+          print(f"SYCL VMM devices: {_sycl_vmm.device_count()}")
+          PY
+            echo "== SYCL VMM ldd (diagnostics)"
+            d=$(python -c "import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec('gpu_memory_service.common.vmm').origin).parent / '_sycl_vmm')" 2>/dev/null)
+            for so in "$d"/_sycl_vmm*.so; do [ -f "$so" ] && { echo "ldd $so"; ldd "$so"; }; done > /workspace/test-results/sycl-vmm-ldd.txt 2>&1 || true
+          fi
+          if [ "$rc" -eq 0 ]; then
+            echo "== pytest -m \"${PYTEST_MARKS}\""
+            pytest -n 0 --dist=loadscope --continue-on-collection-errors -v --tb=short \
+              --basetemp=/tmp/pytest_temp -o cache_dir=/tmp/.pytest_cache \
+              --junitxml=/workspace/test-results/pytest_test_report.xml \
+              --alluredir=/workspace/test-results/allure-results \
+              --durations=10 -m "${PYTEST_MARKS}"
+            rc=$?
+          fi
+          echo "XPU_CI_DONE rc=${rc}"
+          i=0
+          while [ ! -f /tmp/xpu-ci-collected ] && [ "$i" -lt 120 ]; do sleep 5; i=$((i + 1)); done
+          exit "$rc"
+          EOF
+
+          # Built with jq so every value reaches the manifest as a JSON string.
+          # Labels and placement are the heterogeneous tests' own:
+          # kueue.x-k8s.io/queue-name is mandatory on this cluster, a
+          # single-member pod group lets Kueue admit the claim, and
+          # dynamo.intel.com/node=xpu_node pins it to the XPU node.
+          jq -n \
+            --arg pod "${POD}" --arg image "${TEST_IMAGE}" --arg script "${SCRIPT}" \
+            --arg queue "${KUEUE_QUEUE}" --arg node "${XPU_NODE_LABEL}" \
+            --arg claim "${CLAIM_TEMPLATE}" --arg run "${GITHUB_RUN_ID}" \
+            --arg stage "${STAGE}" --arg marks "${PYTEST_MARKS}" \
+            --arg fw "${FRAMEWORK}" --arg wf "${GITHUB_WORKFLOW}" \
+            '{
+              apiVersion: "v1", kind: "Pod",
+              metadata: {
+                name: $pod,
+                labels: {
+                  "app.kubernetes.io/name": "xpu-ci-pytest",
+                  "github-run-id": $run,
+                  "xpu-ci-stage": $stage,
+                  "kueue.x-k8s.io/queue-name": $queue,
+                  "kueue.x-k8s.io/pod-group-name": $pod
+                },
+                annotations: {"kueue.x-k8s.io/pod-group-total-count": "1"}
+              },
+              spec: {
+                restartPolicy: "Never",
+                nodeSelector: {"dynamo.intel.com/node": $node},
+                imagePullSecrets: [{name: "amr-caas-registry"}],
+                resourceClaims: [{name: "xpu", resourceClaimTemplateName: $claim}],
+                containers: [{
+                  name: "pytest",
+                  image: $image,
+                  workingDir: "/workspace",
+                  command: ["/bin/sh", "-c", $script],
+                  env: [
+                    {name: "STAGE", value: $stage},
+                    {name: "PYTEST_MARKS", value: $marks},
+                    {name: "HF_HOME", value: "/models/huggingface"},
+                    {name: "HF_XET_HIGH_PERFORMANCE", value: "1"},
+                    {name: "HF_HUB_OFFLINE", value: "0"},
+                    {name: "DYNAMO_TEST_FRAMEWORK", value: $fw},
+                    {name: "DYNAMO_TEST_PLATFORM", value: "amd64"},
+                    {name: "DYNAMO_TEST_TYPE", value: "e2e"},
+                    {name: "DYNAMO_TEST_WORKFLOW", value: $wf}
+                  ],
+                  securityContext: {
+                    runAsUser: 0,
+                    capabilities: {add: ["IPC_LOCK", "SYS_PTRACE", "SYS_ADMIN", "SYS_RAWIO"]}
+                  },
+                  resources: {claims: [{name: "xpu"}]},
+                  volumeMounts: [
+                    {name: "pytorch-models", mountPath: "/models"},
+                    {name: "dshm", mountPath: "/dev/shm"}
+                  ]
+                }],
+                volumes: [
+                  {name: "pytorch-models", hostPath: {path: "/software/data/pytorch", type: "Directory"}},
+                  {name: "dshm", emptyDir: {medium: "Memory", sizeLimit: "1Gi"}}
+                ]
+              }
+            }' > out/pod.json
+
+          # Leftover Pod of an earlier attempt of THIS run only.
+          kubectl delete pod -n "${NS}" "${POD}" --ignore-not-found=true --wait=true || true
+          kubectl apply -n "${NS}" -f out/pod.json || { echo "::error::could not create ${POD}"; exit 1; }
+
+          # Kueue admission + image pull + the tests. Upstream's per-test
+          # timeout is 600 s; 135 min bounds the whole stage below the job's
+          # 150-minute timeout so the cleanup below always runs.
+          deadline=$(( $(date +%s) + 135 * 60 ))
+          done_line=""
+          phase=""
+          while (( $(date +%s) < deadline )); do
+            phase=$(kubectl get pod -n "${NS}" "${POD}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            done_line=$(kubectl logs -n "${NS}" "${POD}" 2>/dev/null | grep -m1 '^XPU_CI_DONE rc=' || true)
+            [[ -n "${done_line}" ]] && break
+            if [[ "${phase}" == "Failed" || "${phase}" == "Succeeded" ]]; then
+              break
+            fi
+            sleep 15
+          done
+          echo "pod phase: ${phase:-unknown}; ${done_line:-no XPU_CI_DONE line}"
+
+          if [[ -n "${done_line}" ]]; then
+            kubectl cp -n "${NS}" "${POD}:/workspace/test-results" out/test-results || echo "::warning::kubectl cp of test-results failed"
+            kubectl exec -n "${NS}" "${POD}" -- touch /tmp/xpu-ci-collected || true
+            kubectl wait -n "${NS}" --for=jsonpath='{.status.phase}'=Succeeded "pod/${POD}" --timeout=120s >/dev/null 2>&1 || true
+          fi
+          kubectl logs -n "${NS}" "${POD}" > out/pod.log 2>&1 || true
+          kubectl describe pod -n "${NS}" "${POD}" > out/pod-describe.txt 2>&1 || true
+
+          RC=1
+          if [[ "${done_line}" =~ rc=([0-9]+) ]]; then
+            RC="${BASH_REMATCH[1]}"
+          else
+            echo "::error::${POD} did not finish (phase ${phase:-unknown}); see pod-describe.txt and pod.log in the artifact"
+          fi
+
+          # Upstream's verdict: pytest's exit code, and no JUnit XML is a failure.
+          JUNIT="out/test-results/pytest_test_report.xml"
+          if [[ -f "${JUNIT}" ]]; then
+            TOTAL=$(grep -o 'tests="[0-9]*"' "${JUNIT}" | grep -o '[0-9]*' | head -1 || echo 0)
+            FAILED=$(grep -o 'failures="[0-9]*"' "${JUNIT}" | grep -o '[0-9]*' | head -1 || echo 0)
+            ERRORS=$(grep -o 'errors="[0-9]*"' "${JUNIT}" | grep -o '[0-9]*' | head -1 || echo 0)
+            echo "📊 ${STAGE}: ${TOTAL} tests (${FAILED} failed, ${ERRORS} errors), pytest rc=${RC}"
+            echo "| ${STAGE} | \`${PYTEST_MARKS}\` | ${TOTAL} | ${FAILED} | ${ERRORS} | ${RC} |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::${STAGE}: no JUnit XML produced"
+            [[ "${RC}" == "0" ]] && RC=1
+          fi
+          echo "rc=${RC}" >> "$GITHUB_OUTPUT"
+
+      - name: Delete the Pod
+        if: always() && steps.pod.outputs.pod != ''
+        shell: bash
+        run: kubectl delete pod -n "${NS}" "${{ steps.pod.outputs.pod }}" --ignore-not-found=true --wait=false || true
+
+      - name: Upload test results and Pod logs
+        if: always() && steps.pod.outputs.pod != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpu-ci-${{ matrix.stage }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Verdict
+        if: always() && steps.pod.outputs.pod != ''
+        shell: bash
+        run: exit "${{ steps.pod.outputs.rc || 1 }}"
+
+  # ==========================================================================
+  # IMAGE CLEANUP – XPU node
+  # ==========================================================================
+  # Same mechanism as xpu-heterogeneous-run.yml's cleanup-images: one short
+  # privileged pod on each XPU node removes the test image with the node's own
+  # crictl. The registry copy stays for "Re-run failed jobs" and is deleted by
+  # xpu-image-retention.yaml. Every failure is a ::warning::, never a red job.
+  cleanup-images:
+    name: Clean up XPU-CI test image
+    needs: [build, test]
+    if: always() && needs.build.outputs.test_image != ''
+    runs-on: xpu-heterogeneous-ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMAGE: ${{ needs.build.outputs.test_image }}
+      XPU_NODE_LABEL: xpu_node
+      KUEUE_QUEUE: dynamo-queue
+      CLEANUP_IMAGE: docker.io/library/busybox:1.36
+    steps:
+      - name: Remove the test image from the XPU node
+        shell: bash
+        run: |
+          set -uo pipefail
+          read -r -d '' NODE_SCRIPT <<'EOF' || true
+          set -u
+          if ! chroot /host /bin/sh -c 'command -v crictl' >/dev/null 2>&1; then
+            echo "crictl not found on the node"
+            exit 2
+          fi
+          i=0
+          while :; do
+            ids=$(chroot /host crictl images --quiet "$IMAGE") || { echo "crictl images failed"; exit 2; }
+            if [ -z "$ids" ]; then echo "absent: $IMAGE"; exit 0; fi
+            if chroot /host crictl rmi "$IMAGE"; then echo "removed: $IMAGE"; exit 0; fi
+            i=$((i + 1))
+            if [ "$i" -ge 6 ]; then echo "still in use after $i attempts: $IMAGE"; exit 1; fi
+            sleep 10
+          done
+          EOF
+
+          nodes=$(kubectl get nodes -l "dynamo.intel.com/node=${XPU_NODE_LABEL}" -o jsonpath='{.items[*].metadata.name}' 2>&1) || {
+            echo "::warning::could not list XPU nodes: ${nodes}"; exit 0; }
+          idx=0
+          for node in ${nodes}; do
+            idx=$((idx + 1))
+            pod="image-cleanup-xpuci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${idx}"
+            jq -n \
+              --arg pod "${pod}" --arg node "${node}" --arg image "${IMAGE}" \
+              --arg helper "${CLEANUP_IMAGE}" --arg script "${NODE_SCRIPT}" \
+              --arg run "${GITHUB_RUN_ID}" --arg queue "${KUEUE_QUEUE}" \
+              '{
+                apiVersion: "v1", kind: "Pod",
+                metadata: {name: $pod, labels: {
+                  "app.kubernetes.io/name": "xpu-heterog-image-cleanup",
+                  "github-run-id": $run,
+                  "kueue.x-k8s.io/queue-name": $queue}},
+                spec: {
+                  nodeSelector: {"kubernetes.io/hostname": $node},
+                  restartPolicy: "Never",
+                  tolerations: [{operator: "Exists"}],
+                  containers: [{
+                    name: "rmi", image: $helper,
+                    command: ["/bin/sh", "-c", $script],
+                    env: [{name: "IMAGE", value: $image},
+                          {name: "PATH", value: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}],
+                    securityContext: {privileged: true},
+                    resources: {requests: {cpu: "10m", memory: "16Mi"}},
+                    volumeMounts: [{name: "host", mountPath: "/host"}]}],
+                  volumes: [{name: "host", hostPath: {path: "/", type: "Directory"}}]}
+              }' | kubectl apply -n "${NS}" -f - || { echo "::warning::could not create cleanup pod on ${node}"; continue; }
+            phase=""
+            for _ in $(seq 1 60); do
+              phase=$(kubectl get pod "${pod}" -n "${NS}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+              [[ "${phase}" == "Succeeded" || "${phase}" == "Failed" ]] && break
+              sleep 5
+            done
+            kubectl logs -n "${NS}" "${pod}" 2>&1 || true
+            [[ "${phase}" == "Succeeded" ]] || echo "::warning::could not remove ${IMAGE} from ${node} (phase ${phase:-timed out})"
+            kubectl delete pod "${pod}" -n "${NS}" --ignore-not-found=true --wait=false || true
+          done
