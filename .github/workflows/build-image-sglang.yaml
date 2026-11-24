@@ -1,0 +1,169 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Image - SGLang
+
+# Build-only: the SGLang runtime images (XPU and/or NVIDIA), pushed to the
+# registry. No tests. The work is done by xpu-image-build.yml.
+#
+# Any branch, tag or commit can be built:
+#   Manual   Actions tab -> "Build Image - SGLang" -> Run workflow, or
+#              gh workflow run build-image-sglang.yaml -f ref=<branch|tag|sha> -f devices=both
+#            `ref` empty = the branch the run was started from.
+#   Comment  on a PR, by an owner/member/collaborator:
+#              /build_sglang                     both images from the PR head
+#              /build_sglang xpu                 XPU only   (nvidia = NVIDIA only)
+#              /build_sglang ref=7606273852      any branch/tag/SHA instead of the PR head
+#              /build_sglang nvidia push=false   build, do not push
+#
+# Workflows triggered by a comment always run from the default branch, so the
+# slash command works once this file is on main.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, SHA or refs/pull/N/head to build (empty = the selected branch)"
+        required: false
+        type: string
+        default: ""
+      devices:
+        description: "Which SGLang images"
+        required: false
+        type: choice
+        options: [both, xpu, nvidia]
+        default: both
+      push:
+        description: "Push to the registry"
+        required: false
+        type: boolean
+        default: true
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  resolve:
+    name: Resolve request
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/build_sglang') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ steps.r.outputs.ref }}
+      xpu: ${{ steps.r.outputs.xpu }}
+      cuda: ${{ steps.r.outputs.cuda }}
+      push: ${{ steps.r.outputs.push }}
+    steps:
+      - name: Resolve ref, devices and push
+        id: r
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_REF: ${{ inputs.ref }}
+          IN_DEVICES: ${{ inputs.devices }}
+          IN_PUSH: ${{ inputs.push }}
+          COMMENT: ${{ github.event.comment.body }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT}" == "workflow_dispatch" ]]; then
+            REF="${IN_REF:-${GITHUB_REF}}"; DEVICES="${IN_DEVICES:-both}"; PUSH="${IN_PUSH:-true}"
+          else
+            # First line only, so a long comment cannot smuggle in options.
+            LINE="$(printf '%s\n' "${COMMENT}" | head -n1)"
+            REF="refs/pull/${PR_NUMBER}/head"; DEVICES=both; PUSH=true
+            set -f  # split the line into words, but never expand a '*' as a filename
+            for tok in ${LINE#/build_sglang}; do
+              case "${tok}" in
+                xpu|nvidia|both) DEVICES="${tok}" ;;
+                ref=?*) REF="${tok#ref=}" ;;
+                push=true|push=false) PUSH="${tok#push=}" ;;
+                *) echo "::error::Unknown option '${tok}' (use xpu|nvidia|both, ref=<ref>, push=true|false)"; exit 1 ;;
+              esac
+            done
+          fi
+          case "${DEVICES}" in
+            both) XPU=true; CUDA=true ;; xpu) XPU=true; CUDA=false ;; nvidia) XPU=false; CUDA=true ;;
+            *) echo "::error::Unknown devices '${DEVICES}'"; exit 1 ;;
+          esac
+          { echo "ref=${REF}"; echo "xpu=${XPU}"; echo "cuda=${CUDA}"; echo "push=${PUSH}"; } | tee -a "$GITHUB_OUTPUT"
+
+      - name: Acknowledge the slash command
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        env:
+          REF: ${{ steps.r.outputs.ref }}
+          DEVICES: ${{ steps.r.outputs.xpu == 'true' && 'XPU' || '' }} ${{ steps.r.outputs.cuda == 'true' && 'NVIDIA' || '' }}
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              comment_id: context.payload.comment.id, content: 'eyes'
+            }).catch(e => core.warning(`reaction failed: ${e.message}`));
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
+              body: `🔨 Building SGLang image(s): **${process.env.DEVICES.trim()}** from \`${process.env.REF}\` (no tests).\n[View workflow run →](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`
+            });
+
+  build-xpu:
+    needs: [resolve]
+    if: needs.resolve.outputs.xpu == 'true'
+    uses: ./.github/workflows/xpu-image-build.yml
+    secrets: inherit
+    with:
+      framework: sglang
+      device: xpu
+      ref: ${{ needs.resolve.outputs.ref }}
+      push: ${{ needs.resolve.outputs.push == 'true' }}
+
+  build-cuda:
+    needs: [resolve]
+    if: needs.resolve.outputs.cuda == 'true'
+    uses: ./.github/workflows/xpu-image-build.yml
+    secrets: inherit
+    with:
+      framework: sglang
+      device: cuda
+      ref: ${{ needs.resolve.outputs.ref }}
+      push: ${{ needs.resolve.outputs.push == 'true' }}
+
+  report:
+    name: Report
+    needs: [resolve, build-xpu, build-cuda]
+    if: always() && needs.resolve.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Summarize
+        uses: actions/github-script@v7
+        env:
+          REF: ${{ needs.resolve.outputs.ref }}
+          XPU_RESULT: ${{ needs.build-xpu.result }}
+          XPU_IMAGE: ${{ needs.build-xpu.outputs.image }}
+          CUDA_RESULT: ${{ needs.build-cuda.result }}
+          CUDA_IMAGE: ${{ needs.build-cuda.outputs.image }}
+        with:
+          script: |
+            const icon = r => r === 'success' ? '✅' : (r === 'skipped' ? '⏭️' : '❌');
+            const row = (name, r, img) => `| ${name} | ${icon(r)} ${r} | ${img ? '`' + img + '`' : '-'} |`;
+            const body = [
+              `### SGLang image build from \`${process.env.REF}\``, '',
+              '| Image | Result | Registry image |', '|---|---|---|',
+              row('SGLang XPU', process.env.XPU_RESULT, process.env.XPU_IMAGE),
+              row('SGLang NVIDIA', process.env.CUDA_RESULT, process.env.CUDA_IMAGE), '',
+              `[View workflow run →](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`
+            ].join('\n');
+            await core.summary.addRaw(body).write();
+            if (context.eventName === 'issue_comment') {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body
+              });
+            }
+            const bad = [process.env.XPU_RESULT, process.env.CUDA_RESULT].filter(r => r !== 'success' && r !== 'skipped');
+            if (bad.length) core.setFailed(`build result(s): ${bad.join(', ')}`);
