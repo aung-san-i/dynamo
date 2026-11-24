@@ -1,0 +1,278 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: XPU-Image-Retention
+
+# ============================================================================
+# Deletes XPU CI images from the registry once they are older than 14 days.
+# ============================================================================
+# xpu-heterogeneous-run.yml no longer deletes its images from the registry at
+# the end of a run, so "Re-run failed jobs" can still pull them. Instead each
+# build job (build-xpu, build-nvidia) uploads one artifact per pushed image:
+#
+#   name:     image-record-<device>-<run_id>-<run_attempt>
+#   file:     image-record.json
+#   fields:   image, digest, device, pushed_at, pr_number, phase, repository,
+#             sha, run_id, run_number, run_attempt, run_url
+#   kept:     30 days (retention-days in the build job)
+#
+# This workflow is the only reader. Daily it:
+#   1. lists every image-record-* artifact in the repo,
+#   2. for each one created before the cutoff, downloads it and deletes the
+#      recorded image through the Harbor API,
+#   3. deletes the artifact once the image is gone, so it is not read again.
+#
+# A record whose image could not be deleted is KEPT, so the next day retries
+# it. Records live 30 days and the cutoff is 14, which gives 16 daily retries
+# before a record expires and its image leaks.
+#
+# Harbor keeps the blobs until its own garbage collection runs, so a deletion
+# frees the space at the next GC, not immediately.
+#
+# Not in the xpu-heterog-hardware concurrency group: this touches only the
+# registry and the artifact store, never the cluster.
+
+on:
+  schedule:
+    # 03:00 UTC daily, clear of the 23:00 UTC nightly pipeline.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      max_age_days:
+        description: 'Delete images whose record is older than this many days. Must stay below 30, the record retention.'
+        required: false
+        type: string
+        default: '14'
+      dry_run:
+        description: 'List what would be deleted; delete nothing.'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  # List, download and delete the image-record-* artifacts.
+  actions: write
+
+concurrency:
+  group: xpu-image-retention
+  cancel-in-progress: false
+
+jobs:
+  delete-old-images:
+    # Self-hosted: the registry is internal, and the docker login this runner
+    # pushes with is the fallback credential below.
+    runs-on: xpu-heterogeneous-ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Credential: HARBOR_USERNAME / HARBOR_PASSWORD secrets if both are set,
+      # otherwise the login the runner's docker client already pushes with. The
+      # account needs delete permission on the project; a push-only robot
+      # account gets a 403.
+      #
+      # A tag is deleted, not blindly the artifact behind it: two runs on the
+      # same commit with a warm build cache can produce the same digest under
+      # two tags. The Harbor artifact itself goes only when the recorded tag
+      # is its last.
+      #
+      # Unlike the old per-run cleanup, a failed deletion turns this job red:
+      # nothing depends on it, and a red run is the only signal that images
+      # are piling up.
+      - name: Delete registry images older than the cutoff
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAX_AGE_DAYS: ${{ inputs.max_age_days || '14' }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -uo pipefail
+
+          if ! [[ "${MAX_AGE_DAYS}" =~ ^[0-9]+$ ]] || (( MAX_AGE_DAYS < 1 )); then
+            echo "::error::max_age_days must be a whole number of days, 1 or more (got '${MAX_AGE_DAYS}')"
+            exit 1
+          fi
+          if (( MAX_AGE_DAYS >= 30 )); then
+            echo "::warning::max_age_days=${MAX_AGE_DAYS} is not below the 30-day record retention; records expire before they are read, and their images are never deleted"
+          fi
+          cutoff=$(date -u -d "-${MAX_AGE_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Cutoff: records created before ${cutoff} (${MAX_AGE_DAYS} days); dry_run=${DRY_RUN}"
+
+          basic_auth() {
+            local host="$1" config="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+            if [[ -n "${HARBOR_USERNAME}" && -n "${HARBOR_PASSWORD}" ]]; then
+              printf '%s:%s' "${HARBOR_USERNAME}" "${HARBOR_PASSWORD}" | base64 -w0
+            elif [[ -f "${config}" ]]; then
+              jq -r --arg h "${host}" '(.auths[$h].auth // .auths["https://" + $h].auth) // empty' "${config}"
+            fi
+          }
+
+          # api METHOD URL OUTFILE -> prints the HTTP status, 000 if unreachable.
+          # The Authorization header goes in through a file descriptor so the
+          # credential never appears in the runner's process list.
+          #
+          # -r, not -f: the docker daemon reads certs.d as root, so the file can
+          # exist yet be unreadable by the runner user, and curl then fails with
+          # error 77 before sending anything. Fall back to the system store.
+          api() {
+            local cacert=() ca="/etc/docker/certs.d/${host}/ca.crt"
+            [[ -r "${ca}" ]] && cacert=(--cacert "${ca}")
+            curl -sS --max-time 60 -o "$3" -w '%{http_code}' -X "$1" \
+              ${cacert+"${cacert[@]}"} \
+              -H @<(printf 'Authorization: Basic %s\n' "${auth}") \
+              "$2" || true
+          }
+
+          # delete_ref REF -> sets RESULT to a summary cell. Returns 0 when the
+          # image is gone from the registry (deleted now or already absent),
+          # 1 when it is still there.
+          body=$(mktemp)
+          delete_ref() {
+            local ref="$1" rest project repo_tag repo tag base code digest others url what
+            # sc09super01-srv.intel.com/dynamo/dynamo-vllm-runtime-xpu:<run_id>-<sha>
+            host="${ref%%/*}"
+            rest="${ref#*/}"
+            project="${rest%%/*}"
+            repo_tag="${rest#*/}"
+            repo="${repo_tag%:*}"
+            tag="${repo_tag##*:}"
+
+            auth="$(basic_auth "${host}" || true)"
+            if [[ -z "${auth}" ]]; then
+              RESULT="❌ no credential for ${host}"
+              return 1
+            fi
+            echo "::add-mask::${auth}"
+
+            # Harbor wants a nested repository name with its slashes encoded
+            # twice; a flat one like dynamo-vllm-runtime-xpu is unchanged.
+            base="https://${host}/api/v2.0/projects/${project}/repositories/${repo//\//%252F}/artifacts"
+
+            code=$(api GET "${base}/${tag}?with_tag=true" "${body}")
+            case "${code}" in
+              200) ;;
+              404) RESULT="✅ already absent"; return 0 ;;
+              *)
+                echo "::warning::Could not look up ${ref} (HTTP ${code:-000}): $(head -c 500 "${body}" 2>/dev/null)"
+                RESULT="❌ lookup HTTP ${code:-000}"
+                return 1
+                ;;
+            esac
+
+            digest=$(jq -r '.digest // empty' "${body}" || true)
+            others=$(jq -r --arg t "${tag}" '[.tags[]?.name | select(. != $t)] | length' "${body}" || true)
+            if [[ -z "${digest}" ]]; then
+              RESULT="❌ no digest in response"
+              return 1
+            fi
+
+            if [[ "${others}" == "0" ]]; then
+              url="${base}/${digest}"
+              what="artifact ${digest}"
+            else
+              url="${base}/${digest}/tags/${tag}"
+              what="tag only; ${others} other tag(s) still reference ${digest}"
+            fi
+
+            code=$(api DELETE "${url}" "${body}")
+            if [[ "${code}" == "200" ]]; then
+              RESULT="✅ deleted (${what})"
+              return 0
+            fi
+            echo "::warning::Could not delete ${ref} (HTTP ${code:-000}): $(head -c 500 "${body}" 2>/dev/null)"
+            RESULT="❌ delete HTTP ${code:-000}"
+            return 1
+          }
+
+          # The artifacts API filters by exact name only, so list everything
+          # and keep the image-record-* ones here.
+          records=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name | startswith("image-record-"))
+                  | [.id, .name, .created_at, .expired, .workflow_run.id] | @tsv') || {
+            echo "::error::Could not list the repository's artifacts"
+            exit 1
+          }
+          mapfile -t LINES <<< "${records}"
+
+          ROWS=()
+          kept=0 failed=0
+          for line in ${LINES+"${LINES[@]}"}; do
+            [[ -z "${line}" ]] && continue
+            IFS=$'\t' read -r id name created expired run_id <<< "${line}"
+
+            if [[ ! "${created}" < "${cutoff}" ]]; then
+              kept=$((kept + 1))
+              continue
+            fi
+            # A warning, not a failure: the record failed every day for 16 days
+            # before it expired, and those runs were already red. Counting it
+            # again would keep this job red until GitHub drops the listing.
+            if [[ "${expired}" == "true" ]]; then
+              echo "::warning::${name} (run ${run_id}) expired before it was processed; its image stays in the registry"
+              ROWS+=("| \`${name}\` | - | - | ${created} | ⚠️ record expired |")
+              continue
+            fi
+
+            dir=$(mktemp -d)
+            if ! gh run download "${run_id}" -R "${GITHUB_REPOSITORY}" --name "${name}" --dir "${dir}" </dev/null; then
+              echo "::warning::Could not download ${name} (run ${run_id})"
+              ROWS+=("| \`${name}\` | - | - | ${created} | ❌ download failed |")
+              failed=$((failed + 1))
+              rm -rf "${dir}"
+              continue
+            fi
+            image=$(jq -r '.image // empty' "${dir}/image-record.json" 2>/dev/null || true)
+            pr=$(jq -r '.pr_number // empty' "${dir}/image-record.json" 2>/dev/null || true)
+            pushed=$(jq -r '.pushed_at // empty' "${dir}/image-record.json" 2>/dev/null || true)
+            run_url=$(jq -r '.run_url // empty' "${dir}/image-record.json" 2>/dev/null || true)
+            rm -rf "${dir}"
+
+            pr_cell="${pr:+#${pr}}"
+            run_cell="[${run_id}](${run_url:-${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run_id}})"
+            if [[ -z "${image}" ]]; then
+              echo "::warning::${name} holds no image ref; left in place"
+              ROWS+=("| \`${name}\` | ${pr_cell:--} | ${run_cell} | ${pushed:-${created}} | ❌ no image in record |")
+              failed=$((failed + 1))
+              continue
+            fi
+
+            if [[ "${DRY_RUN}" == "true" ]]; then
+              ROWS+=("| \`${image}\` | ${pr_cell:--} | ${run_cell} | ${pushed:-${created}} | 🔍 would delete |")
+              continue
+            fi
+
+            if delete_ref "${image}"; then
+              echo "${image}: ${RESULT}"
+              # The image is gone, so the record has done its job. If this
+              # delete fails the record is read again tomorrow, finds the tag
+              # absent, and retries.
+              if ! gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}" </dev/null >/dev/null; then
+                echo "::warning::Deleted ${image} but could not delete its record ${name}"
+                RESULT="${RESULT}; record kept"
+              fi
+            else
+              echo "${image}: ${RESULT}"
+              failed=$((failed + 1))
+            fi
+            ROWS+=("| \`${image}\` | ${pr_cell:--} | ${run_cell} | ${pushed:-${created}} | ${RESULT} |")
+          done
+          rm -f "${body}"
+
+          {
+            echo "### 🧹 Registry image retention"
+            echo "Cutoff: older than ${MAX_AGE_DAYS} days (before ${cutoff}). Dry run: ${DRY_RUN}."
+            echo "Records newer than the cutoff, left alone: ${kept}."
+            echo ""
+            echo "| Image | PR | Run | Pushed | Result |"
+            echo "|-------|----|-----|--------|--------|"
+            for row in ${ROWS+"${ROWS[@]}"}; do
+              echo "${row}"
+            done
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( failed > 0 )); then
+            echo "::error::${failed} record(s) could not be processed; see the job summary"
+            exit 1
+          fi
