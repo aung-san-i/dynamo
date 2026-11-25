@@ -62,9 +62,6 @@ VLLM_MULTIMODAL_PROFILES: list[MultimodalModelProfile] = [
         topologies={
             "agg": TopologyConfig(
                 marks=[
-                    pytest.mark.skip(
-                        reason="vLLM XPU v0.29.0 lacks paged decode kernel 8,128,16,false,false,false; see #15417"
-                    ),
                     pytest.mark.post_merge,
                     pytest.mark.xpu_1,
                 ],
@@ -123,9 +120,6 @@ VLLM_MULTIMODAL_PROFILES: list[MultimodalModelProfile] = [
             "agg_router": TopologyConfig(
                 health_check_workers=True,
                 marks=[
-                    pytest.mark.skip(
-                        reason="vLLM XPU v0.29.0 lacks paged decode kernel 8,128,16,false,false,false; see #15417"
-                    ),
                     pytest.mark.pre_merge,
                     pytest.mark.xpu_2,
                 ],
