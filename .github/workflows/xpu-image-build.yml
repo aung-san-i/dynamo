@@ -1,0 +1,214 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: XPU-Image-Build
+
+# ============================================================================
+# REUSABLE: build ONE runtime image, push it, record it. No tests.
+# ============================================================================
+# Called by the three build-only trigger workflows:
+#
+#   Caller                    Manual (Actions tab)          Slash command (PR comment)
+#   ------------------------  ----------------------------  --------------------------
+#   build-image-sglang.yaml   "Build Image - SGLang"        /build_sglang [xpu|nvidia]
+#   build-image-xpu.yaml      "Build Image - XPU (vLLM)"    /build_xpu
+#   build-image-nvidia.yaml   "Build Image - NVIDIA (vLLM)" /build_nvidia
+#
+# The steps are the ones xpu-heterogeneous-run.yml's build jobs use (render with
+# container/render.py, docker build, push to the same registry, image record),
+# so an image built here is the image a heterog run would test. What this does
+# NOT do: the Dockerfile.test image, any test, any cluster access.
+#
+# Every pushed image gets an image-record-<framework>-<device>-<run>-<attempt>
+# artifact; xpu-image-retention.yaml lists every image-record-* artifact and
+# deletes the registry copy once it is older than 14 days.
+
+on:
+  workflow_call:
+    inputs:
+      framework:
+        description: "render.py --framework: vllm | sglang"
+        required: true
+        type: string
+      device:
+        description: "render.py --device: xpu | cuda"
+        required: true
+        type: string
+      ref:
+        description: "Git ref to build: branch, tag, SHA or refs/pull/N/head."
+        required: true
+        type: string
+      push:
+        description: "Push the image to the registry (and record it for retention)."
+        required: false
+        type: boolean
+        default: true
+      runner:
+        description: "Runner label for the build."
+        required: false
+        type: string
+        default: "xpu-heterogeneous-ubuntu-latest"
+    outputs:
+      image:
+        description: "Registry image ref, empty when push is false."
+        value: ${{ jobs.build.outputs.image }}
+      local_tag:
+        description: "Local image tag on the runner (removed after the job)."
+        value: ${{ jobs.build.outputs.local_tag }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "build ${{ inputs.framework }}-${{ inputs.device }}"
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 240
+    outputs:
+      image: ${{ steps.push.outputs.registry_image_tag }}
+      local_tag: ${{ steps.build.outputs.image_tag }}
+    env:
+      FRAMEWORK: ${{ inputs.framework }}
+      DEVICE: ${{ inputs.device }}
+      TARGET: runtime
+      PLATFORM: linux/amd64
+      # render.py accepts only 13.0 for vllm/sglang on cuda; ignored for xpu.
+      CUDA_VERSION: "13.0"
+      REGISTRY: sc09super01-srv.intel.com/dynamo
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${FRAMEWORK}/${DEVICE}" in
+            vllm/xpu|vllm/cuda|sglang/xpu|sglang/cuda) ;;
+            *) echo "::error::Unsupported framework/device '${FRAMEWORK}/${DEVICE}'"; exit 1 ;;
+          esac
+
+      - name: Checkout code
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955  # v4.3.0
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Generate Dockerfile
+        id: render
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=(--target="${TARGET}" --framework="${FRAMEWORK}" --device="${DEVICE}" --platform="${PLATFORM}" --show-result)
+          SUFFIX="${DEVICE}"
+          if [[ "${DEVICE}" == "cuda" ]]; then
+            ARGS+=(--cuda-version="${CUDA_VERSION}")
+            SUFFIX="cuda${CUDA_VERSION}"
+          fi
+          echo "::group::Generating ${FRAMEWORK} ${DEVICE} Dockerfile"
+          python3 ./container/render.py "${ARGS[@]}"
+          echo "::endgroup::"
+          # render.py names the file <framework>-<target>-<device><cuda_version>-<arch>-rendered.Dockerfile;
+          # cuda_version is cleared for non-cuda devices.
+          RENDERED="container/${FRAMEWORK}-${TARGET}-${SUFFIX}-${PLATFORM##*/}-rendered.Dockerfile"
+          if [[ ! -f "${RENDERED}" ]]; then
+            echo "::error::Expected rendered Dockerfile not found at ${RENDERED}"
+            ls -la container/*rendered.Dockerfile || true
+            exit 1
+          fi
+          echo "rendered=${RENDERED}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE_NAME="dynamo-${FRAMEWORK}-${TARGET}-${DEVICE}"
+          SHORT_SHA="$(git rev-parse HEAD | cut -c1-7)"
+          IMAGE_TAG="${IMAGE_NAME}:${GITHUB_RUN_ID}-${SHORT_SHA}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          docker build \
+            --progress=plain \
+            --tag "${IMAGE_TAG}" \
+            -f "${{ steps.render.outputs.rendered }}" \
+            . 2>&1 | tee "build-${FRAMEWORK}-${DEVICE}.log"
+          {
+            echo "### 🐳 Image built"
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Local tag | \`${IMAGE_TAG}\` |"
+            echo "| Framework / device | ${FRAMEWORK} / ${DEVICE} |"
+            echo "| Ref | \`${{ inputs.ref }}\` (\`$(git rev-parse HEAD)\`) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push image to registry
+        id: push
+        if: inputs.push
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="${{ steps.build.outputs.image_tag }}"
+          REGISTRY_IMAGE_TAG="${REGISTRY}/${IMAGE_TAG}"
+          docker tag "${IMAGE_TAG}" "${REGISTRY_IMAGE_TAG}"
+          docker push "${REGISTRY_IMAGE_TAG}"
+          echo "registry_image_tag=${REGISTRY_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "| Registry image | \`${REGISTRY_IMAGE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      # Same record as xpu-heterogeneous-run.yml's build jobs; without it the
+      # registry copy would never be expired by xpu-image-retention.yaml.
+      - name: Record pushed image
+        id: record
+        if: inputs.push
+        shell: bash
+        env:
+          IMAGE: ${{ steps.push.outputs.registry_image_tag }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE}" \
+            | grep -m1 "^${IMAGE%:*}@" | cut -d@ -f2 || true)
+          pr_number=""
+          if [[ "${REF}" =~ ^refs/pull/([0-9]+)/ ]]; then pr_number="${BASH_REMATCH[1]}"; fi
+          name="image-record-${FRAMEWORK}-${DEVICE}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          jq -n \
+            --arg image "${IMAGE}" --arg digest "${digest}" --arg device "${DEVICE}" \
+            --arg pushed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg pr_number "${pr_number}" --arg phase "manual-build" \
+            --arg repository "${GITHUB_REPOSITORY}" --arg sha "$(git rev-parse HEAD)" \
+            --arg run_id "${GITHUB_RUN_ID}" --arg run_number "${GITHUB_RUN_NUMBER}" \
+            --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '$ARGS.named' > image-record.json
+          cat image-record.json
+          echo "artifact_name=${name}" >> "$GITHUB_OUTPUT"
+          echo "| Image record | artifact \`${name}\` (registry copy deleted after 14 days) |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image record
+        if: inputs.push
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.record.outputs.artifact_name }}
+          path: image-record.json
+          if-no-files-found: error
+          retention-days: 30
+
+      # Only this run's own tags: a broad prune would drop the build cache other
+      # runs on this runner reuse. A cleanup failure never fails a green build.
+      - name: Clean up local images
+        if: always()
+        shell: bash
+        run: |
+          IMAGE_TAG="${{ steps.build.outputs.image_tag }}"
+          REGISTRY_IMAGE_TAG="${{ steps.push.outputs.registry_image_tag }}"
+          for ref in ${IMAGE_TAG:+"$IMAGE_TAG"} ${REGISTRY_IMAGE_TAG:+"$REGISTRY_IMAGE_TAG"}; do
+            echo "Removing ${ref}"
+            docker rmi "${ref}" || true
+          done
+          docker image prune --force || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ inputs.framework }}-${{ inputs.device }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build-${{ inputs.framework }}-${{ inputs.device }}.log
+            container/*rendered.Dockerfile
+          retention-days: 7
+          if-no-files-found: warn
